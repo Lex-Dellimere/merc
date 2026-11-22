@@ -1,0 +1,4736 @@
+// the window. the trie is drawn as text, one row per expression, with the
+// zipper as a caret in it. commands come from the console, from files, from a
+// file being appended to, or from stdin. alph actors read those on other
+// threads and only the window thread touches the trie.
+
+import "std/io";
+import "std/mem";
+import "std/time";
+import "std/env";
+import "mythic/mythic";
+import "alph/actor/actor";
+import "alph/time/time";
+import "alph/sys/thread";
+import "alph/sys/atomic";
+import "merc/merc";
+
+const C_BG: uint32 = 0xFF131217;
+const C_RAISED: uint32 = 0xFF1A1920;
+const C_BORDER: uint32 = 0xFF2A2833;
+const C_TEXT: uint32 = 0xFFECEAF2;
+const C_TEXT2: uint32 = 0xFFA8A4B5;
+const C_MUTED: uint32 = 0xFF76728A;
+const C_VIOLET: uint32 = 0xFFA78BFA;
+const C_GREEN: uint32 = 0xFF34D399;
+const C_AMBER: uint32 = 0xFFF59E0B;
+const C_RED: uint32 = 0xFFEF4444;
+
+const CELL_H: float32 = 22.0;
+const CELL_GAP: float32 = 4.0;
+const CELL_PAD: float32 = 7.0;
+const LEVEL_GAP: float32 = 26.0;
+const SIB_GAP: float32 = 10.0;
+const CELL_SOFT: int64 = 3000;
+const CELL_HARD: int64 = 4000;
+const MAX_V: int64 = 6000;
+const MAX_KIDS: int32 = 10;
+const MAX_KEY: int64 = 4096;
+const COUNT_CAP: int64 = 10000;
+const COUNT_WORK: int64 = 100000;
+const ANIM_S: float64 = 0.3;
+const DEL_FLASH_S: float64 = 0.45;
+const BATCH_MAX: int64 = 400;
+const LOG_CAP: int64 = 4000;
+
+const VK_NODE: int32 = 0;
+const VK_STUB: int32 = 1;
+const VK_MORE: int32 = 2;
+
+const CK_ARITY: int32 = 0;
+const CK_SYM: int32 = 1;
+const CK_SYMC: int32 = 2;
+const CK_VAR: int32 = 3;
+const CK_REF: int32 = 4;
+const CK_RAW: int32 = 5;
+
+const AN_NONE: int32 = 0;
+const AN_ADD: int32 = 1;
+const AN_LOOKUP: int32 = 2;
+const AN_MISS: int32 = 3;
+const AN_REMOVE: int32 = 4;
+
+const LL_CMD: int32 = 0;
+const LL_OUT: int32 = 1;
+const LL_ERR: int32 = 2;
+const LL_NOTE: int32 = 3;
+
+const T_LINE: Word = 1;
+const T_TICK: Word = 2;
+
+struct HMap {
+  keys: uint64*;
+  vals: int64*;
+  cap: int64;
+  n: int64;
+}
+
+fn hm_key(k: uint64) -> uint64 {
+  if (k == (uint64)0) { return (uint64)1; }
+  return k;
+}
+
+fn hm_clear(m: HMap*) {
+  if (m->keys != 0) {
+    memset((rawptr)m->keys, 0, m->cap * 8);
+  }
+  m->n = 0;
+}
+
+fn hm_grow(m: HMap*) {
+  var old_k: uint64* = m->keys;
+  var old_v: int64* = m->vals;
+  var old_cap: int64 = m->cap;
+  var cap: int64 = old_cap * 2;
+  if (cap < 256) { cap = 256; }
+  m->keys = (uint64*)calloc(cap, 8);
+  m->vals = (int64*)calloc(cap, 8);
+  m->cap = cap;
+  m->n = 0;
+  for i: int64 in 0..old_cap {
+    if (old_k[i] != (uint64)0) {
+      hm_put(m, old_k[i], old_v[i]);
+    }
+  }
+  if (old_k != 0) { free(old_k); free(old_v); }
+}
+
+fn hm_put(m: HMap*, k0: uint64, v: int64) {
+  if ((m->n + 1) * 2 > m->cap) { hm_grow(m); }
+  var k: uint64 = hm_key(k0);
+  var mask: int64 = m->cap - 1;
+  var i: int64 = (int64)(k & (uint64)mask);
+  while (true) {
+    if (m->keys[i] == (uint64)0) {
+      m->keys[i] = k;
+      m->vals[i] = v;
+      m->n = m->n + 1;
+      return;
+    }
+    if (m->keys[i] == k) {
+      m->vals[i] = v;
+      return;
+    }
+    i = (i + 1) & mask;
+  }
+}
+
+fn hm_get(m: HMap*, k0: uint64, v: int64*) -> bool {
+  if (m->cap == 0) { return false; }
+  var k: uint64 = hm_key(k0);
+  var mask: int64 = m->cap - 1;
+  var i: int64 = (int64)(k & (uint64)mask);
+  while (m->keys[i] != (uint64)0) {
+    if (m->keys[i] == k) {
+      *v = m->vals[i];
+      return true;
+    }
+    i = (i + 1) & mask;
+  }
+  return false;
+}
+
+const FNV0: uint64 = 0xcbf29ce484222325;
+const FNVP: uint64 = 0x100000001b3;
+
+fn hstep(h: uint64, b: uint8) -> uint64 {
+  return (h ^ (uint64)b) * FNVP;
+}
+
+struct KeyH {
+  key: MercBuf;
+  h: uint64*;
+}
+
+fn keyh_set(k: KeyH*, s: string) {
+  var tmp: MercBuf;
+  merc_buf_text(&tmp, s);
+  merc_buf_clear(&k->key);
+  merc_buf_add(&k->key, tmp.data, tmp.len);
+  merc_buf_free(&tmp);
+  if (k->h == 0) { k->h = (uint64*)malloc((MAX_KEY + 1) * 8); }
+  var n: int64 = k->key.len;
+  if (n > MAX_KEY) { n = MAX_KEY; k->key.len = MAX_KEY; }
+  k->h[0] = FNV0;
+  for i: int64 in 0..n {
+    k->h[i + 1] = hstep(k->h[i], k->key.data[i]);
+  }
+}
+
+fn keyh_clear(k: KeyH*) { merc_buf_clear(&k->key); }
+
+fn keyh_has(k: KeyH*, d: int64, h: uint64) -> bool {
+  if (k->h == 0 || d > k->key.len) { return false; }
+  return k->h[d] == h;
+}
+
+var g_fmt: MercBuf;
+
+fn fmt_reset() { merc_buf_clear(&g_fmt); }
+fn fmt_s(s: string) { merc_buf_text(&g_fmt, s); }
+fn fmt_c(c: int32) { merc_buf_push(&g_fmt, (uint8)c); }
+
+fn fmt_i(v: int64) {
+  var digits: uint8[24];
+  var n: int32 = 0;
+  var u: int64 = v;
+  if (u < 0) { fmt_c(45); u = 0 - u; }
+  if (u == 0) { digits[0] = 48; n = 1; }
+  while (u > 0) {
+    digits[n] = (uint8)(48 + (int32)(u % 10));
+    n = n + 1;
+    u = u / 10;
+  }
+  while (n > 0) { n = n - 1; merc_buf_push(&g_fmt, digits[n]); }
+}
+
+fn fmt_group(v: int64) {
+  if (v < 1000) { fmt_i(v); return; }
+  fmt_group(v / 1000);
+  fmt_c(44);
+  var r: int64 = v % 1000;
+  if (r < 100) { fmt_c(48); }
+  if (r < 10) { fmt_c(48); }
+  fmt_i(r);
+}
+
+fn fmt_tenths(v10: int64) {
+  fmt_i(v10 / 10);
+  fmt_c(46);
+  fmt_i(v10 % 10);
+}
+
+fn fmt_view() -> string { return merc_buf_view(&g_fmt); }
+
+fn bview(b: MercBuf*, off: int64, n: int64) -> string {
+  var s: string;
+  s.chars = b->data + off;
+  s.length = (uint64)n;
+  return s;
+}
+
+fn has_prefix(s: string, w: string) -> bool {
+  if (s.length < w.length) { return false; }
+  for i: int64 in 0..(int64)w.length {
+    if (s.chars[i] != w.chars[i]) { return false; }
+  }
+  return true;
+}
+
+fn ends_with(s: string, w: string) -> bool {
+  if (s.length < w.length) { return false; }
+  var off: int64 = (int64)s.length - (int64)w.length;
+  for i: int64 in 0..(int64)w.length {
+    if (s.chars[off + i] != w.chars[i]) { return false; }
+  }
+  return true;
+}
+
+fn trim(s: string) -> string {
+  var p: uint8* = s.chars;
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  while (i < n && (p[i] == 32 || p[i] == 9 || p[i] == 13 || p[i] == 10)) { i = i + 1; }
+  while (n > i && (p[n - 1] == 32 || p[n - 1] == 9 || p[n - 1] == 13 || p[n - 1] == 10)) { n = n - 1; }
+  var r: string;
+  r.chars = p + i;
+  r.length = (uint64)(n - i);
+  return r;
+}
+
+fn cut(s: string, from: int64) -> string {
+  var r: string;
+  r.chars = s.chars + from;
+  r.length = (uint64)((int64)s.length - from);
+  return r;
+}
+
+fn fmt_partial(key: string, out: MercBuf*) {
+  var p: uint8* = key.chars;
+  var n: int64 = (int64)key.length;
+  var left: int32[64];
+  var depth: int32 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var tag: uint8 = p[i];
+    i = i + 1;
+    if (out->len > 0 && out->data[out->len - 1] != 40) { merc_buf_push(out, 32); }
+    if (depth > 0) {
+      left[depth - 1] = left[depth - 1] - 1;
+    }
+    if (tag < 64) {
+      merc_buf_push(out, 40);
+      if (tag == 0) {
+        merc_buf_push(out, 41);
+      } else if (depth < 64) {
+        left[depth] = (int32)tag;
+        depth = depth + 1;
+        continue;
+      }
+    } else if (tag > 0xC0) {
+      var len: int64 = (int64)(tag & 63);
+      var k: int64 = len;
+      if (i + k > n) { k = n - i; }
+      for j: int64 in 0..k {
+        var c: uint8 = p[i + j];
+        if (c < 33 || c > 126) { c = 63; }
+        merc_buf_push(out, c);
+      }
+      i = i + k;
+      if (k < len) {
+        merc_buf_text(out, "..");
+        return;
+      }
+    } else if (tag == 0xC0) {
+      merc_buf_push(out, 36);
+    } else if (tag >= 0x80) {
+      merc_buf_push(out, 36);
+      var r: int32 = (int32)(tag & 63);
+      if (r >= 10) { merc_buf_push(out, (uint8)(48 + r / 10)); }
+      merc_buf_push(out, (uint8)(48 + r % 10));
+    } else {
+      merc_buf_push(out, 63);
+    }
+    while (depth > 0 && left[depth - 1] == 0) {
+      merc_buf_push(out, 41);
+      depth = depth - 1;
+    }
+  }
+  if (depth > 0) {
+    if (out->len > 0 && out->data[out->len - 1] != 40) { merc_buf_push(out, 32); }
+    merc_buf_text(out, "..");
+  }
+}
+
+fn line_new(p: uint8*, n: int64) -> uint8* {
+  var r: uint8* = (uint8*)malloc(n + 9);
+  var len: int64* = (int64*)r;
+  *len = n;
+  if (n > 0) { memcpy((rawptr)(r + 8), (rawptr)p, n); }
+  r[n + 8] = 0;
+  return r;
+}
+
+fn line_view(r: uint8*) -> string {
+  var len: int64* = (int64*)r;
+  var s: string;
+  s.chars = r + 8;
+  s.length = (uint64)*len;
+  return s;
+}
+
+var g_q: int64*;
+var g_q_head: int64 = 0;
+var g_q_len: int64 = 0;
+var g_q_cap: int64 = 0;
+var g_q_total: int64 = 0;
+
+fn q_push(r: uint8*) {
+  if (g_q_head + g_q_len == g_q_cap) {
+    if (g_q_head > 0) {
+      for i: int64 in 0..g_q_len { g_q[i] = g_q[g_q_head + i]; }
+      g_q_head = 0;
+    }
+    if (g_q_len == g_q_cap) {
+      var cap: int64 = g_q_cap * 2;
+      if (cap < 64) { cap = 64; }
+      g_q = (int64*)realloc((rawptr)g_q, cap * 8);
+      g_q_cap = cap;
+    }
+  }
+  g_q[g_q_head + g_q_len] = (int64)r;
+  g_q_len = g_q_len + 1;
+  g_q_total = g_q_total + 1;
+}
+
+fn q_pop() -> uint8* {
+  if (g_q_len == 0) { return (uint8*)0; }
+  var r: uint8* = (uint8*)g_q[g_q_head];
+  g_q_head = g_q_head + 1;
+  g_q_len = g_q_len - 1;
+  if (g_q_len == 0) { g_q_head = 0; }
+  return r;
+}
+
+fn q_peek() -> uint8* {
+  if (g_q_len == 0) { return (uint8*)0; }
+  return (uint8*)g_q[g_q_head];
+}
+
+fn q_text(s: string) {
+  q_push(line_new(s.chars, (int64)s.length));
+}
+
+var g_ui_node: AlphNode;
+var g_ui_actors: AlphActor[2];
+var g_ui_mail: AlphMsg[2048];
+var g_keeper: Word = 0;
+
+var g_io_node: AlphNode;
+var g_io_actors: AlphActor[4];
+var g_io_mail: AlphMsg[64];
+var g_io_time: AlphTime;
+var g_io_timers: AlphTimer[4];
+var g_io_thread: AlphThread;
+var g_io_handle: int64 = 0;
+var g_io_running: bool = false;
+
+var g_lines_in: int64 = 0;
+
+fn keeper(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == T_LINE && m->arg != 0) {
+    q_push((uint8*)m->arg);
+    g_lines_in = g_lines_in + 1;
+  }
+  return 0;
+}
+
+const RD_TAIL: int32 = 1;
+const RD_STDIN: int32 = 2;
+
+struct Reader {
+  kind: int32;
+  fd: int64;
+  pos: int64;
+  eof: bool;
+  path: uint8[512];
+  line: MercBuf;
+  held: int64*;
+  held_n: int64;
+  held_cap: int64;
+  buf: uint8[4096];
+}
+
+var g_tail: Reader;
+var g_stdin: Reader;
+var g_watch_name: string;
+var g_use_stdin: bool = false;
+
+fn rd_hold(r: Reader*, rec: uint8*) {
+  if (r->held_n == r->held_cap) {
+    var cap: int64 = r->held_cap * 2;
+    if (cap < 64) { cap = 64; }
+    r->held = (int64*)realloc((rawptr)r->held, cap * 8);
+    r->held_cap = cap;
+  }
+  r->held[r->held_n] = (int64)rec;
+  r->held_n = r->held_n + 1;
+}
+
+fn rd_flush(r: Reader*) -> bool {
+  var sent: int64 = 0;
+  while (sent < r->held_n) {
+    if (g_ui_node.send(g_keeper, T_LINE, (Word)r->held[sent]) != ALPH_OK) { break; }
+    sent = sent + 1;
+  }
+  if (sent > 0) {
+    var left: int64 = r->held_n - sent;
+    for i: int64 in 0..left { r->held[i] = r->held[sent + i]; }
+    r->held_n = left;
+  }
+  return r->held_n == 0;
+}
+
+fn rd_bytes(r: Reader*, p: uint8*, n: int64) {
+  for i: int64 in 0..n {
+    var c: uint8 = p[i];
+    if (c == 10) {
+      rd_hold(r, line_new(r->line.data, r->line.len));
+      merc_buf_clear(&r->line);
+    } else {
+      merc_buf_push(&r->line, c);
+    }
+  }
+}
+
+fn rd_tail_tick(r: Reader*) {
+  if (r->fd < 0) {
+    r->fd = syscall(2, (int64)&r->path[0], 0, 0);
+    if (r->fd < 0) { return; }
+    r->pos = syscall(8, r->fd, 0, 2);
+    if (r->pos < 0) { r->pos = 0; }
+  }
+  var size: int64 = syscall(8, r->fd, 0, 2);
+  if (size < 0) { return; }
+  if (size < r->pos) {
+    r->pos = 0;
+    merc_buf_clear(&r->line);
+  }
+  var rounds: int32 = 0;
+  while (r->pos < size && rounds < 64) {
+    var want: int64 = size - r->pos;
+    if (want > 4096) { want = 4096; }
+    var got: int64 = syscall(17, r->fd, (int64)&r->buf[0], want, r->pos);
+    if (got <= 0) { break; }
+    rd_bytes(r, &r->buf[0], got);
+    r->pos = r->pos + got;
+    rounds = rounds + 1;
+  }
+}
+
+fn rd_stdin_tick(r: Reader*) {
+  var rounds: int32 = 0;
+  while (!r->eof && rounds < 64) {
+    var got: int64 = syscall(0, 0, (int64)&r->buf[0], 4096);
+    if (got == 0) {
+      r->eof = true;
+      if (r->line.len > 0) {
+        rd_hold(r, line_new(r->line.data, r->line.len));
+        merc_buf_clear(&r->line);
+      }
+      break;
+    }
+    if (got < 0) { break; }
+    rd_bytes(r, &r->buf[0], got);
+    rounds = rounds + 1;
+  }
+}
+
+fn reader(a: AlphActor*, m: AlphMsg*) -> Word {
+  var r: Reader* = (Reader*)a->state;
+  if (m->tag != T_TICK) { return 0; }
+  if (rd_flush(r)) {
+    if (r->kind == RD_TAIL) {
+      rd_tail_tick(r);
+    } else if (r->kind == RD_STDIN) {
+      rd_stdin_tick(r);
+    }
+    rd_flush(r);
+  }
+  if (r->kind == RD_STDIN && r->eof && r->held_n == 0) {
+    return 0;
+  }
+  g_io_time.after(40, a->pid, T_TICK, 0);
+  return 0;
+}
+
+const T_RUN: Word = 3;
+var g_engine_pid: Word = 0;
+var g_engine_done: int64 = 0;
+var g_engine_busy: bool = false;
+var g_engine_t0: float64 = 0.0;
+var g_engine_line: MercBuf;
+var g_engine_animate: bool = false;
+
+fn engine(a: AlphActor*, m: AlphMsg*) -> Word {
+  if (m->tag == T_RUN) {
+    merc_shell_run(&g_sh, merc_buf_view(&g_engine_line));
+    alph_atomic_store(&g_engine_done, 1);
+  }
+  return 0;
+}
+
+fn io_main(arg: int64) -> int64 {
+  g_io_node.run();
+  return 0;
+}
+
+fn io_start() {
+  g_ui_node.init(&g_ui_actors[0], 2, &g_ui_mail[0], 1024);
+  g_keeper = g_ui_node.spawn(&keeper, (rawptr)0);
+  g_io_node.init(&g_io_actors[0], 4, &g_io_mail[0], 16);
+  g_io_time.init(&g_io_node, &g_io_timers[0], 4);
+  g_engine_pid = g_io_node.spawn(&engine, (rawptr)0);
+  if (g_watch_name.length > (uint64)0) {
+    g_tail.kind = RD_TAIL;
+    g_tail.fd = -1;
+    var n: int64 = (int64)g_watch_name.length;
+    if (n > 510) { n = 510; }
+    memcpy((rawptr)&g_tail.path[0], (rawptr)g_watch_name.chars, n);
+    g_tail.path[n] = 0;
+    rd_tail_tick(&g_tail);
+    var pid: Word = g_io_node.spawn(&reader, (rawptr)&g_tail);
+    g_io_node.send(pid, T_TICK, 0);
+  }
+  if (g_use_stdin) {
+    g_stdin.kind = RD_STDIN;
+    var fl: int64 = syscall(72, 0, 3, 0);
+    if (fl >= 0) { syscall(72, 0, 4, fl | 2048); }
+    var pid2: Word = g_io_node.spawn(&reader, (rawptr)&g_stdin);
+    g_io_node.send(pid2, T_TICK, 0);
+  }
+  g_io_handle = alph_thread_start(&g_io_thread, &io_main, 0, 1048576);
+  g_io_running = true;
+}
+
+fn io_stop() {
+  if (!g_io_running) { return; }
+  g_io_time.stop();
+  g_io_node.stop();
+  alph_thread_join(g_io_handle, &g_io_thread);
+  g_io_running = false;
+}
+
+struct LogLine {
+  chars: uint8*;
+  len: int64;
+  kind: int32;
+  took: uint8[16];
+  took_len: int32;
+}
+
+var g_log: LogLine*;
+var g_log_head: int64 = 0;
+var g_log_n: int64 = 0;
+var g_log_off: int64 = 0;
+
+fn log_add(p: uint8*, n: int64, kind: int32) {
+  if (g_log == 0) { g_log = (LogLine*)calloc(LOG_CAP, (int64)sizeof(LogLine)); }
+  var slot: int64 = (g_log_head + g_log_n) % LOG_CAP;
+  if (g_log_n == LOG_CAP) {
+    slot = g_log_head;
+    free((rawptr)g_log[slot].chars);
+    g_log_head = (g_log_head + 1) % LOG_CAP;
+  } else {
+    g_log_n = g_log_n + 1;
+  }
+  var m: int64 = n;
+  if (m > 400) { m = 400; }
+  var c: uint8* = (uint8*)malloc(m + 1);
+  if (m > 0) { memcpy((rawptr)c, (rawptr)p, m); }
+  c[m] = 0;
+  g_log[slot].chars = c;
+  g_log[slot].len = m;
+  g_log[slot].kind = kind;
+  g_log[slot].took_len = 0;
+  g_last_slot = slot;
+}
+
+var g_last_slot: int64 = 0;
+
+fn log_s(s: string, kind: int32) { log_add(s.chars, (int64)s.length, kind); }
+
+fn log_get(i: int64) -> LogLine* {
+  return &g_log[(g_log_head + i) % LOG_CAP];
+}
+
+fn log_out(b: MercBuf*) {
+  var p: uint8* = b->data;
+  var n: int64 = b->len;
+  if (n == 0) { return; }
+  var lines: int64 = 0;
+  for i: int64 in 0..n {
+    if (p[i] == 10) { lines = lines + 1; }
+  }
+  if (p[n - 1] != 10) { lines = lines + 1; }
+  var skip: int64 = 0;
+  if (lines > 200) {
+    skip = lines - 200;
+    fmt_reset();
+    fmt_s("(");
+    fmt_group(skip);
+    fmt_s(" earlier lines not shown)");
+    log_s(fmt_view(), LL_NOTE);
+  }
+  var from: int64 = 0;
+  var k: int64 = 0;
+  for i: int64 in 0..n + 1 {
+    if (i == n || p[i] == 10) {
+      if (i > from || i < n) {
+        if (k >= skip) {
+          var s: string = bview(b, from, i - from);
+          var kind: int32 = LL_OUT;
+          if (has_prefix(s, "error")) { kind = LL_ERR; }
+          log_add(p + from, i - from, kind);
+        }
+        k = k + 1;
+      }
+      from = i + 1;
+      if (i == n - 1) { break; }
+    }
+  }
+}
+
+var g_sh: MercShell;
+var g_now: float64 = 0.0;
+var g_follow: bool = true;
+
+var g_focus: KeyH;
+var g_focus_new: bool = false;
+var g_anim: KeyH;
+var g_anim_kind: int32 = AN_NONE;
+var g_anim_t0: float64 = 0.0;
+var g_anim_new_from: int64 = 0;
+var g_anim_match: int64 = 0;
+var g_del: KeyH;
+var g_del_t0: float64 = -1.0;
+var g_del_line: uint8*;
+var g_zip: KeyH;
+var g_hits_set: HMap;
+var g_hit_n: int64 = 0;
+var g_hit_t0: float64 = -10.0;
+var g_hit_pattern: MercBuf;
+var g_hit_serial: int64 = -1;
+var g_hitvar_set: HMap;
+var g_hit_fixed: int64 = 0;
+var g_serial_seen: int64 = -1;
+var g_was_empty: bool = true;
+var g_fit_wanted: bool = false;
+var g_last_kind: int32 = 0;
+var g_cmds_run: int64 = 0;
+
+var g_pbuf: MercBuf;
+var g_pnames: MercNames;
+
+fn trie() -> MercTrie* { return &g_sh.trie; }
+
+var g_res: MercTrie;
+var g_results: bool = false;
+var g_vt: MercTrie*;
+
+fn vtrie() -> MercTrie* {
+  if (g_results) { return &g_res; }
+  return &g_sh.trie;
+}
+
+fn walk_match(key: string) -> int64 {
+  var t: MercTrie* = trie();
+  var root: int64 = merc_node_root(t);
+  if (root < 0) { return 0; }
+  var n: int64 = (int64)key.length;
+  var ni: int64 = root;
+  var lab: string = merc_node_label(t, (uint32)ni);
+  var j: int64 = 0;
+  var m: int64 = 0;
+  while (m < n) {
+    if (j < (int64)lab.length) {
+      if (lab.chars[j] != key.chars[m]) { return m; }
+      j = j + 1;
+      m = m + 1;
+    } else {
+      var c: int64 = merc_node_child(t, (uint32)ni, key.chars[m]);
+      if (c < 0) { return m; }
+      ni = c;
+      lab = merc_node_label(t, (uint32)ni);
+      j = 0;
+      m = m + 1;
+    }
+  }
+  return m;
+}
+
+fn pre_parse(line: string, verb: int32*) -> bool {
+  var s: string = trim(line);
+  *verb = 0;
+  if (s.length == (uint64)0) { return false; }
+  var rest: string = s;
+  if (s.chars[0] == 40) {
+    *verb = 1;
+  } else if (has_prefix(s, "add ")) {
+    *verb = 1;
+    rest = cut(s, 4);
+  } else if (has_prefix(s, "del ")) {
+    *verb = 2;
+    rest = cut(s, 4);
+  } else if (has_prefix(s, "has ")) {
+    *verb = 3;
+    rest = cut(s, 4);
+  } else {
+    return false;
+  }
+  merc_buf_clear(&g_pbuf);
+  merc_names_clear(&g_pnames);
+  var used: int64 = merc_parse(trim(rest), &g_pbuf, &g_pnames);
+  return used > 0;
+}
+
+fn build_hits() {
+  hm_clear(&g_hits_set);
+  g_hit_n = g_sh.hit_count;
+  var p: uint8* = g_sh.hits.data;
+  var n: int64 = g_sh.hits.len;
+  var i: int64 = 0;
+  var keys: int64 = 0;
+  while (i + 4 <= n && keys < 4000) {
+    var len32: uint32 = 0;
+    memcpy((rawptr)&len32, (rawptr)(p + i), 4);
+    var len: int64 = (int64)len32;
+    i = i + 4;
+    var h: uint64 = FNV0;
+    for j: int64 in 0..len {
+      h = hstep(h, p[i + j]);
+      hm_put(&g_hits_set, h, 1);
+    }
+    i = i + len;
+    keys = keys + 1;
+  }
+  g_hit_t0 = g_now;
+  g_hit_serial = g_sh.serial;
+  mark_vars();
+}
+
+fn mark_vars() {
+  hm_clear(&g_hitvar_set);
+  var pat: uint8* = g_sh.touched.data;
+  var pn: int64 = g_sh.touched.len;
+  g_hit_fixed = 0;
+  while (g_hit_fixed < pn) {
+    var t0: uint8 = pat[g_hit_fixed];
+    if (t0 >= 0x80 && t0 <= 0xC0) { break; }
+    if (t0 > 0xC0) { g_hit_fixed = g_hit_fixed + (int64)(t0 & 63); }
+    g_hit_fixed = g_hit_fixed + 1;
+  }
+  var p: uint8* = g_sh.hits.data;
+  var n: int64 = g_sh.hits.len;
+  var at: int64 = 0;
+  var keys: int64 = 0;
+  while (at + 4 <= n && keys < 4000) {
+    var len32: uint32 = 0;
+    memcpy((rawptr)&len32, (rawptr)(p + at), 4);
+    var kn: int64 = (int64)len32;
+    var key: uint8* = p + at + 4;
+    var i: int64 = 0;
+    var j: int64 = 0;
+    var h: uint64 = FNV0;
+    while (i < pn && j < kn) {
+      var t: uint8 = pat[i];
+      var kt: uint8 = key[j];
+      if (t >= 0x80 && t <= 0xC0) {
+        var span: int64 = merc_span(key + j, kn - j);
+        if (span <= 0) { break; }
+        for q: int64 in 0..span {
+          h = hstep(h, key[j + q]);
+          hm_put(&g_hitvar_set, h, 1);
+        }
+        j = j + span;
+        i = i + 1;
+      } else if (kt >= 0x80 && kt <= 0xC0) {
+        var ps: int64 = merc_span(pat + i, pn - i);
+        if (ps <= 0) { break; }
+        h = hstep(h, kt);
+        j = j + 1;
+        i = i + ps;
+      } else {
+        var step: int64 = 1;
+        if (t > 0xC0) { step = 1 + (int64)(t & 63); }
+        if (j + step > kn) { break; }
+        for q2: int64 in 0..step { h = hstep(h, key[j + q2]); }
+        i = i + step;
+        j = j + step;
+      }
+    }
+    at = at + 4 + kn;
+    keys = keys + 1;
+  }
+}
+
+var g_rows_off: int64*;
+var g_rows_len: int64*;
+var g_rows_n: int64 = 0;
+var g_rows_cap: int64 = 0;
+var g_lv_mode: int32 = 0;
+var g_lv_var: int32 = 0;
+var g_lv_entry: int64 = 0;
+var g_lv_top: float32 = 0.0;
+var g_lv_x: float32 = 0.0;
+var g_list: int64*;
+var g_list_n: int64 = 0;
+var g_list_cap: int64 = 0;
+
+fn rows_index() {
+  g_rows_n = 0;
+  var p: uint8* = g_sh.hits.data;
+  var n: int64 = g_sh.hits.len;
+  var i: int64 = 0;
+  while (i + 4 <= n) {
+    var len32: uint32 = 0;
+    memcpy((rawptr)&len32, (rawptr)(p + i), 4);
+    if (g_rows_n == g_rows_cap) {
+      var cap: int64 = g_rows_cap * 2;
+      if (cap < 1024) { cap = 1024; }
+      g_rows_off = (int64*)realloc((rawptr)g_rows_off, cap * 8);
+      g_rows_len = (int64*)realloc((rawptr)g_rows_len, cap * 8);
+      g_rows_cap = cap;
+    }
+    g_rows_off[g_rows_n] = i + 4;
+    g_rows_len[g_rows_n] = (int64)len32;
+    g_rows_n = g_rows_n + 1;
+    i = i + 4 + (int64)len32;
+  }
+}
+
+fn list_push(v: int64) {
+  if (g_list_n == g_list_cap) {
+    var cap: int64 = g_list_cap * 2;
+    if (cap < 1024) { cap = 1024; }
+    g_list = (int64*)realloc((rawptr)g_list, cap * 8);
+    g_list_cap = cap;
+  }
+  g_list[g_list_n] = v;
+  g_list_n = g_list_n + 1;
+}
+
+fn sort_by_count(a: int64*, lo: int64, hi: int64) {
+  var l: int64 = lo;
+  var h: int64 = hi;
+  while (l < h) {
+    var pivot: int64 = g_ve[a[(l + h) / 2]].count;
+    var i: int64 = l;
+    var j: int64 = h;
+    while (i <= j) {
+      while (g_ve[a[i]].count > pivot) { i = i + 1; }
+      while (g_ve[a[j]].count < pivot) { j = j - 1; }
+      if (i <= j) {
+        var t: int64 = a[i];
+        a[i] = a[j];
+        a[j] = t;
+        i = i + 1;
+        j = j - 1;
+      }
+    }
+    if (j - l < h - i) {
+      if (l < j) { sort_by_count(a, l, j); }
+      l = i;
+    } else {
+      if (i < h) { sort_by_count(a, i, h); }
+      h = j;
+    }
+  }
+}
+
+fn lv_set(mode: int32, v: int32, entry: int64) {
+  g_lv_mode = mode;
+  g_lv_var = v;
+  g_lv_entry = entry;
+  g_lv_top = 0.0;
+  g_lv_x = 0.0;
+  g_list_n = 0;
+  if (mode == 1) {
+    for i: int64 in 0..g_ve_n {
+      if (g_ve[i].v == v) { list_push(i); }
+    }
+    if (g_list_n > 1) { sort_by_count(g_list, 0, g_list_n - 1); }
+  } else if (mode == 2) {
+    for r: int64 in 0..g_vt_rows {
+      if (g_row_entry[r * (int64)VT_MAX + (int64)v] == entry) { list_push(r); }
+    }
+  }
+}
+
+fn lv_count() -> int64 {
+  if (g_lv_mode == 0) { return g_rows_n; }
+  return g_list_n;
+}
+
+fn build_results() {
+  merc_clear(&g_res);
+  var p: uint8* = g_sh.hits.data;
+  var n: int64 = g_sh.hits.len;
+  var i: int64 = 0;
+  while (i + 4 <= n) {
+    var len32: uint32 = 0;
+    memcpy((rawptr)&len32, (rawptr)(p + i), 4);
+    var k: string;
+    k.chars = p + i + 4;
+    k.length = (uint64)len32;
+    merc_put(&g_res, k, 1);
+    i = i + 4 + (int64)len32;
+  }
+  g_results = merc_count(&g_res) > 0;
+  rows_index();
+  g_lv_mode = 0;
+  g_lv_top = 0.0;
+  g_lv_x = 0.0;
+  g_results_serial = g_sh.serial;
+  hm_clear(&g_user);
+  hm_clear(&g_more);
+  g_fit_all = true;
+  var_table();
+}
+
+var g_results_serial: int64 = -1;
+
+struct VEntry {
+  v: int32;
+  count: int64;
+  off: int64;
+  len: int64;
+}
+
+const VT_MAX: int32 = 8;
+const VT_CAP: int64 = 20000;
+
+var g_vmap: HMap[8];
+var g_ve: VEntry*;
+var g_ve_n: int64 = 0;
+var g_ve_cap: int64 = 0;
+var g_vtext: MercBuf;
+var g_vars: int32 = 0;
+var g_vdistinct: int64[8];
+var g_vname: MercBuf;
+var g_vname_off: int64[8];
+var g_vname_len: int64[8];
+var g_vtop: int64[24];
+var g_vtop_n: int32[8];
+var g_vt_rows: int64 = 0;
+var g_vt_capped: bool = false;
+
+var g_row_entry: int64*;
+
+fn var_table() {
+  if (g_row_entry == 0) { g_row_entry = (int64*)malloc(VT_CAP * (int64)VT_MAX * 8); }
+  for v: int32 in 0..VT_MAX {
+    hm_clear(&g_vmap[v]);
+    g_vdistinct[v] = 0;
+  }
+  g_ve_n = 0;
+  g_vars = 0;
+  g_vt_rows = 0;
+  g_vt_capped = false;
+  merc_buf_clear(&g_vtext);
+  merc_buf_clear(&g_vname);
+  var pat_text: string = trim(merc_buf_view(&g_hit_pattern));
+  var pb: MercBuf;
+  var names: MercNames;
+  if (merc_parse(pat_text, &pb, &names) <= 0) {
+    merc_buf_free(&pb);
+    return;
+  }
+  var q: MercQuery = merc_query(trie(), merc_buf_view(&pb));
+  g_vars = merc_query_vars(&q);
+  if (g_vars > VT_MAX) { g_vars = VT_MAX; }
+  for v2: int32 in 0..g_vars {
+    g_vname_off[v2] = g_vname.len;
+    merc_buf_push(&g_vname, 36);
+    merc_buf_text(&g_vname, merc_name(&names, v2));
+    g_vname_len[v2] = g_vname.len - g_vname_off[v2];
+  }
+  var bind: MercBuf;
+  while (merc_query_next(&q)) {
+    if (g_vt_rows >= VT_CAP) {
+      g_vt_capped = true;
+      break;
+    }
+    g_vt_rows = g_vt_rows + 1;
+    for v3: int32 in 0..g_vars {
+      merc_buf_clear(&bind);
+      if (!merc_query_bind(&q, v3, &bind)) { continue; }
+      var h: uint64 = FNV0;
+      for b: int64 in 0..bind.len { h = hstep(h, bind.data[b]); }
+      var idx: int64 = 0;
+      if (hm_get(&g_vmap[v3], h, &idx)) {
+        g_ve[idx].count = g_ve[idx].count + 1;
+        g_row_entry[(g_vt_rows - 1) * (int64)VT_MAX + (int64)v3] = idx;
+      } else {
+        if (g_ve_n == g_ve_cap) {
+          var cap: int64 = g_ve_cap * 2;
+          if (cap < 1024) { cap = 1024; }
+          g_ve = (VEntry*)realloc((rawptr)g_ve, cap * (int64)sizeof(VEntry));
+          g_ve_cap = cap;
+        }
+        var e: VEntry* = &g_ve[g_ve_n];
+        e->v = v3;
+        e->count = 1;
+        e->off = g_vtext.len;
+        if (!merc_format(merc_buf_view(&bind), &g_vtext, (MercNames*)0)) { fmt_partial(merc_buf_view(&bind), &g_vtext); }
+        if (g_vtext.len - e->off > 160) { g_vtext.len = e->off + 160; }
+        e->len = g_vtext.len - e->off;
+        hm_put(&g_vmap[v3], h, g_ve_n);
+        g_row_entry[(g_vt_rows - 1) * (int64)VT_MAX + (int64)v3] = g_ve_n;
+        g_ve_n = g_ve_n + 1;
+        g_vdistinct[v3] = g_vdistinct[v3] + 1;
+      }
+    }
+  }
+  merc_buf_free(&bind);
+  merc_query_free(&q);
+  merc_buf_free(&pb);
+  for v4: int32 in 0..g_vars {
+    var used: int64[3];
+    var nused: int32 = 0;
+    while (nused < 3) {
+      var best: int64 = -1;
+      for i: int64 in 0..g_ve_n {
+        if (g_ve[i].v != v4) { continue; }
+        var taken: bool = false;
+        for u: int32 in 0..nused { if (used[u] == i) { taken = true; } }
+        if (taken) { continue; }
+        if (best < 0 || g_ve[i].count > g_ve[best].count) { best = i; }
+      }
+      if (best < 0) { break; }
+      used[nused] = best;
+      g_vtop[v4 * 3 + nused] = best;
+      nused = nused + 1;
+    }
+    g_vtop_n[v4] = nused;
+  }
+}
+
+fn first_hit() -> string {
+  var s: string;
+  s.chars = g_sh.hits.data;
+  s.length = (uint64)0;
+  if (g_sh.hits.len < 4) { return s; }
+  var len32: uint32 = 0;
+  memcpy((rawptr)&len32, (rawptr)g_sh.hits.data, 4);
+  s.chars = g_sh.hits.data + 4;
+  s.length = (uint64)len32;
+  return s;
+}
+
+fn set_focus(s: string) {
+  keyh_set(&g_focus, s);
+  g_focus_new = true;
+}
+
+var g_took: MercBuf;
+var g_load_took: MercBuf;
+var g_step_line: MercBuf;
+var g_step_took: MercBuf;
+var g_find_took: MercBuf;
+var g_find_found: int64 = 0;
+var g_find_walked: int64 = 0;
+var g_save_line: MercBuf;
+
+fn out_line_with(word: string, out: MercBuf*) -> bool {
+  var p: uint8* = g_sh.out.data;
+  var n: int64 = g_sh.out.len;
+  var from: int64 = 0;
+  var found: bool = false;
+  for i: int64 in 0..n + 1 {
+    if (i == n || p[i] == 10) {
+      var ln: string = bview(&g_sh.out, from, i - from);
+      var k: int64 = 0;
+      while (k + (int64)word.length <= (int64)ln.length) {
+        if (has_prefix(cut(ln, k), word)) {
+          merc_buf_clear(out);
+          merc_buf_text(out, trim(ln));
+          found = true;
+          break;
+        }
+        k = k + 1;
+      }
+      from = i + 1;
+    }
+  }
+  return found;
+}
+
+fn first_num(s: string, at: int64*) -> int64 {
+  var i: int64 = *at;
+  var n: int64 = (int64)s.length;
+  while (i < n && (s.chars[i] < 48 || s.chars[i] > 57)) { i = i + 1; }
+  var v: int64 = 0;
+  while (i < n && s.chars[i] >= 48 && s.chars[i] <= 57) {
+    v = v * 10 + (int64)(s.chars[i] - 48);
+    i = i + 1;
+  }
+  *at = i;
+  return v;
+}
+
+fn note_result(tl: string) {
+  var kind: int32 = g_sh.kind;
+  var tmp: MercBuf;
+  if (has_prefix(tl, "load ") && kind == MERC_DID_BULK) {
+    merc_buf_clear(&g_load_took);
+    merc_buf_text(&g_load_took, merc_buf_view(&g_took));
+  } else if (tl == "step" && out_line_with(" writes, ", &tmp)) {
+    merc_buf_clear(&g_step_line);
+    merc_buf_text(&g_step_line, merc_buf_view(&tmp));
+    merc_buf_clear(&g_step_took);
+    merc_buf_text(&g_step_took, merc_buf_view(&g_took));
+  } else if (kind == MERC_DID_SEARCH && out_line_with(" bytes walked", &tmp)) {
+    var at: int64 = 0;
+    var v: string = merc_buf_view(&tmp);
+    g_find_found = first_num(v, &at);
+    g_find_walked = first_num(v, &at);
+    merc_buf_clear(&g_find_took);
+    merc_buf_text(&g_find_took, merc_buf_view(&g_took));
+  } else if (has_prefix(tl, "save ") && out_line_with("", &tmp)) {
+    merc_buf_clear(&g_save_line);
+    merc_buf_text(&g_save_line, merc_buf_view(&tmp));
+  }
+  merc_buf_free(&tmp);
+}
+
+var g_rl_verb: int32 = 0;
+var g_rl_quiet: bool = false;
+var g_rl_parsed: bool = false;
+var g_rl_pre_m: int64 = 0;
+var g_rl_echo: int64 = 0;
+var g_rl_was: int64 = 0;
+var g_rl_t: int64 = 0;
+
+fn run_line(line: string, animate: bool) {
+  run_begin(line);
+  merc_shell_run(&g_sh, line);
+  run_end(line, animate);
+}
+
+fn run_async(line: string, animate: bool) {
+  merc_buf_clear(&g_engine_line);
+  merc_buf_text(&g_engine_line, line);
+  run_begin(line);
+  g_engine_animate = animate;
+  g_engine_busy = true;
+  g_engine_t0 = g_now;
+  alph_atomic_store(&g_engine_done, 0);
+  g_io_node.send(g_engine_pid, T_RUN, 0);
+}
+
+fn engine_check() {
+  if (!g_engine_busy || alph_atomic_load(&g_engine_done) == 0) { return; }
+  g_engine_busy = false;
+  run_end(merc_buf_view(&g_engine_line), g_engine_animate);
+  if (g_go) {
+    if (g_last_kind == MERC_DID_BULK) {
+      g_go_ran = g_go_ran + 1;
+    } else {
+      go_done();
+    }
+  }
+}
+
+fn run_begin(line: string) {
+  var verb: int32 = 0;
+  var parsed: bool = pre_parse(line, &verb);
+  var pre_m: int64 = 0;
+  if (parsed) { pre_m = walk_match(merc_buf_view(&g_pbuf)); }
+  if (!g_quiet) {
+    fmt_reset();
+    fmt_s("> ");
+    fmt_s(trim(line));
+    log_s(fmt_view(), LL_CMD);
+  }
+  g_rl_echo = g_last_slot;
+  g_rl_was = merc_count(trie());
+  g_rl_t = time_mono_ns();
+  g_rl_verb = verb;
+  g_rl_quiet = g_quiet;
+  g_rl_parsed = parsed;
+  g_rl_pre_m = pre_m;
+}
+
+fn run_end(line: string, animate: bool) {
+  var verb: int32 = g_rl_verb;
+  var parsed: bool = g_rl_parsed;
+  var pre_m: int64 = g_rl_pre_m;
+  var echo_slot: int64 = g_rl_echo;
+  var was_count: int64 = g_rl_was;
+  var lt: int64 = g_rl_t;
+  g_cmds_run = g_cmds_run + 1;
+  var tl: string = trim(line);
+  merc_buf_clear(&g_took);
+  merc_shell_took(&g_sh, &g_took);
+  if (!g_rl_quiet) {
+    var tn: int64 = g_took.len;
+    if (tn > 15) { tn = 15; }
+    if (tn > 0) { memcpy((rawptr)&g_log[echo_slot].took[0], (rawptr)g_took.data, tn); }
+    g_log[echo_slot].took_len = (int32)tn;
+  }
+  note_result(tl);
+  if (has_prefix(tl, "load ") && g_sh.kind == MERC_DID_BULK) {
+    var path: string = trim(cut(tl, 5));
+    var base: int64 = 0;
+    for bi: int64 in 0..(int64)path.length {
+      if (path.chars[bi] == 47) { base = bi + 1; }
+    }
+    var ms: int64 = (time_mono_ns() - lt) / 1000000;
+    fmt_reset();
+    fmt_group(merc_count(trie()) - was_count);
+    fmt_s(" stored from ");
+    fmt_s(cut(path, base));
+    fmt_s(" in ");
+    fmt_group(ms);
+    fmt_s(" ms");
+    log_s(fmt_view(), LL_OUT);
+    g_fit_all = true;
+  } else {
+    log_out(&g_sh.out);
+  }
+  merc_buf_clear(&g_sh.out);
+  if (has_prefix(trim(line), "help")) {
+    log_s("in this window", LL_NOTE);
+    log_s("  esc leaves the line, enter or i comes back to it", LL_NOTE);
+    log_s("  f fits the tree, h goes home, t turns follow on or off", LL_NOTE);
+    log_s("  s runs one rule, g runs them all, esc stops", LL_NOTE);
+    log_s("  ctrl+l makes the log tall, then closed, then back", LL_NOTE);
+    log_s("  b hides the panel, shift+b moves it to the other side", LL_NOTE);
+    log_s("  drag the lines between parts to resize, double click resets", LL_NOTE);
+    log_s("  drag or shift+wheel moves the tree sideways", LL_NOTE);
+    log_s("  click a folded count to open it, click a word to fold it", LL_NOTE);
+  }
+  var kind: int32 = g_sh.kind;
+  g_last_kind = kind;
+  var touched: string = merc_buf_view(&g_sh.touched);
+  g_anim_kind = AN_NONE;
+  if (kind == MERC_DID_ADD) {
+    keyh_set(&g_anim, touched);
+    g_anim_kind = AN_ADD;
+    g_anim_new_from = (int64)touched.length;
+    if (parsed && verb == 1) { g_anim_new_from = pre_m; }
+    set_focus(touched);
+  } else if (kind == MERC_DID_LOOKUP) {
+    keyh_set(&g_anim, touched);
+    g_anim_kind = AN_LOOKUP;
+    set_focus(touched);
+  } else if (kind == MERC_DID_MISS) {
+    keyh_set(&g_anim, touched);
+    g_anim_kind = AN_MISS;
+    g_anim_match = walk_match(touched);
+    set_focus(bview(&g_sh.touched, 0, g_anim_match));
+  } else if (kind == MERC_DID_REMOVE) {
+    keyh_set(&g_anim, touched);
+    g_anim_kind = AN_REMOVE;
+    g_anim_match = walk_match(touched);
+    set_focus(bview(&g_sh.touched, 0, g_anim_match));
+  } else if (kind == MERC_DID_SEARCH) {
+    merc_buf_clear(&g_hit_pattern);
+    var pt: string = trim(line);
+    var sp: int64 = 0;
+    while (sp < (int64)pt.length && pt.chars[sp] != 32) { sp = sp + 1; }
+    merc_buf_text(&g_hit_pattern, trim(cut(pt, sp)));
+    build_hits();
+    build_results();
+    var fh: string = first_hit();
+    if (fh.length > (uint64)0 && !g_results) { set_focus(fh); }
+    if (g_results) {
+      keyh_clear(&g_focus);
+      g_focus_new = false;
+    }
+  } else if (kind == MERC_DID_ZIP) {
+    set_focus(merc_zip_path(&g_sh.zip));
+  } else if (kind == MERC_DID_BULK) {
+    if (was_count == 0) { g_fit_wanted = true; }
+  }
+  if (g_anim_kind != AN_NONE) {
+    g_anim_t0 = g_now;
+    if (!animate) { g_anim_t0 = g_now - 10.0; }
+  }
+  if (was_count == 0 && merc_count(trie()) > 0) { g_fit_wanted = true; }
+}
+
+var g_rules_serial: int64 = -1;
+var g_rules_n: int64 = 0;
+var g_rules_more: bool = false;
+var g_rule_txt: MercBuf;
+var g_rule_off: int64[6];
+var g_rule_len: int64[6];
+var g_rule_shown: int32 = 0;
+var g_first_rule: MercBuf;
+var g_go: bool = false;
+var g_quiet: bool = false;
+var g_go_ran: int64 = 0;
+
+fn rule_head(z: MercZip*) -> bool {
+  var head: uint8[6] = [4, 0xC4, 101, 120, 101, 99];
+  for i in 0..6 {
+    if (!merc_zip_step(z, head[i])) { return false; }
+  }
+  return merc_zip_next_value(z, 6);
+}
+
+fn rules_scan() {
+  if (g_rules_serial == g_sh.serial) { return; }
+  g_rules_serial = g_sh.serial;
+  g_rules_n = 0;
+  g_rules_more = false;
+  g_rule_shown = 0;
+  merc_buf_clear(&g_rule_txt);
+  merc_buf_clear(&g_first_rule);
+  var z: MercZip = merc_zip(trie());
+  var more: bool = rule_head(&z);
+  while (more) {
+    if (g_rules_n == 0) { merc_buf_text(&g_first_rule, merc_zip_path(&z)); }
+    if (g_rule_shown < 6) {
+      var off: int64 = g_rule_txt.len;
+      if (!merc_format(merc_zip_path(&z), &g_rule_txt, (MercNames*)0)) { fmt_partial(merc_zip_path(&z), &g_rule_txt); }
+      if (g_rule_txt.len - off > 200) { g_rule_txt.len = off + 200; }
+      g_rule_off[g_rule_shown] = off;
+      g_rule_len[g_rule_shown] = g_rule_txt.len - off;
+      g_rule_shown = g_rule_shown + 1;
+    }
+    g_rules_n = g_rules_n + 1;
+    if (g_rules_n >= 10000) {
+      g_rules_more = true;
+      break;
+    }
+    more = merc_zip_next_value(&z, 6);
+  }
+  merc_zip_free(&z);
+}
+
+fn go_done() {
+  g_go = false;
+  fmt_reset();
+  fmt_group(g_go_ran);
+  if (g_go_ran == 1) { fmt_s(" rule ran"); } else { fmt_s(" rules ran"); }
+  log_s(fmt_view(), LL_NOTE);
+}
+
+fn go_pump() {
+  if (!g_go || g_engine_busy || g_q_len > 0 || g_del_t0 >= 0.0) { return; }
+  rules_scan();
+  if (g_rules_n == 0) {
+    go_done();
+    return;
+  }
+  g_quiet = true;
+  run_async("step", false);
+  g_quiet = false;
+}
+
+fn pump_queue() {
+  if (g_engine_busy) { return; }
+  if (g_del_t0 >= 0.0) {
+    if (g_now - g_del_t0 < DEL_FLASH_S) { return; }
+    g_del_t0 = -1.0;
+    keyh_clear(&g_del);
+    var r: uint8* = g_del_line;
+    g_del_line = (uint8*)0;
+    if (trim(line_view(r)) == "step") {
+      run_async(line_view(r), true);
+      free((rawptr)r);
+      return;
+    }
+    run_line(line_view(r), true);
+    free((rawptr)r);
+  }
+  if (g_q_len == 0) { return; }
+  var t0: int64 = time_mono_ns();
+  var done: int64 = 0;
+  while (g_q_len > 0 && done < BATCH_MAX) {
+    var one: uint8* = q_pop();
+    var line: string = line_view(one);
+    var last: bool = g_q_len == 0;
+    var verb: int32 = 0;
+    if (trim(line) == "go") {
+      log_s("> go", LL_CMD);
+      g_go = true;
+      g_go_ran = 0;
+      free((rawptr)one);
+      done = done + 1;
+      continue;
+    }
+    if (last && !g_go && trim(line) == "step") {
+      rules_scan();
+      if (g_first_rule.len > 0) {
+        keyh_set(&g_del, merc_buf_view(&g_first_rule));
+        g_del_t0 = g_now;
+        g_del_line = one;
+        set_focus(merc_buf_view(&g_first_rule));
+        return;
+      }
+    }
+    if (last && pre_parse(line, &verb) && verb == 2 && merc_has(trie(), merc_buf_view(&g_pbuf))) {
+      keyh_set(&g_del, merc_buf_view(&g_pbuf));
+      g_del_t0 = g_now;
+      g_del_line = one;
+      set_focus(merc_buf_view(&g_pbuf));
+      return;
+    }
+    if (trim(line) == "step") {
+      run_async(line, last);
+      free((rawptr)one);
+      return;
+    }
+    var c0: int64 = time_mono_ns();
+    run_line(line, last);
+    var cms: float64 = (float64)(time_mono_ns() - c0) / 1000000.0;
+    if (cms > g_cmd_max) { g_cmd_max = cms; }
+    free((rawptr)one);
+    done = done + 1;
+    if (time_mono_ns() - t0 > 6000000) { break; }
+  }
+}
+
+struct VNode {
+  kind: int32;
+  ni: int64;
+  parent: int32;
+  first: int32;
+  last: int32;
+  next: int32;
+  level: int32;
+  start: int64;
+  end: int64;
+  h_in: uint64;
+  h_end: uint64;
+  cell0: int32;
+  ncells: int32;
+  nkids: int32;
+  hidden: int32;
+  veiled: bool;
+  vkids: int32;
+  expanded: bool;
+  has_value: bool;
+  value: uint64;
+  count: int64;
+  capped: bool;
+  est: int64;
+  step: int32;
+  x: float32;
+  y: float32;
+  w: float32;
+  rows: int32;
+  dx: float32;
+  dy: float32;
+  fade: float32;
+  born: float64;
+  g0: int64;
+  gtext: int64;
+  glen: int64;
+}
+
+struct VCell {
+  vn: int32;
+  kind: int32;
+  d0: int64;
+  d1: int64;
+  h0: uint64;
+  h1: uint64;
+  toff: int64;
+  tlen: int64;
+  closers: int32;
+  head: bool;
+  ox: float32;
+  tw: float32;
+}
+
+const VK_GHOST: int32 = 3;
+const ROW_H: float32 = 26.0;
+const LEFT_PAD: float32 = 104.0;
+
+var g_vn: VNode*;
+var g_nv: int64 = 0;
+var g_cells: VCell*;
+var g_nc: int64 = 0;
+var g_txt: MercBuf;
+var g_walk: MercBuf;
+var g_user: HMap;
+var g_more: HMap;
+var g_counts: HMap;
+var g_count_serial: int64 = -1;
+var g_count_res: bool = false;
+var g_count_work: int64 = 0;
+var g_count_pending: bool = false;
+var g_stack: int64*;
+var g_stack_cap: int64 = 0;
+var g_adv: float32 = 7.2;
+var g_truncated: bool = false;
+var g_layout_ms: float64 = 0.0;
+var g_small_trie: bool = false;
+var g_prefix_vn: int64 = -1;
+var g_prefix: MercBuf;
+var g_left: int32[64];
+var g_pd: int32 = 0;
+var g_alt_first: bool = false;
+var g_zip_m: int64 = 0;
+var g_ghost_vn: int64 = -1;
+
+fn stack_push(sp: int64, v: int64) -> int64 {
+  if (sp == g_stack_cap) {
+    var cap: int64 = g_stack_cap * 2;
+    if (cap < 1024) { cap = 1024; }
+    g_stack = (int64*)realloc((rawptr)g_stack, cap * 8);
+    g_stack_cap = cap;
+  }
+  g_stack[sp] = v;
+  return sp + 1;
+}
+
+fn count_below(ni: int64, h_end: uint64, cap: int64, capped: bool*) -> int64 {
+  var cached: int64 = 0;
+  if (hm_get(&g_counts, h_end, &cached)) {
+    var n0: int64 = cached / 2;
+    var c0: bool = (cached % 2) == 1;
+    if (!c0 || n0 >= cap) {
+      *capped = c0 || n0 > cap;
+      if (n0 > cap) { return cap; }
+      return n0;
+    }
+  }
+  var budget: int64 = COUNT_WORK;
+  if (g_q_len > 0) { budget = COUNT_WORK / 4; }
+  if (g_count_work > budget) {
+    g_count_pending = true;
+    return -1;
+  }
+  var t: MercTrie* = vtrie();
+  var n: int64 = 0;
+  var sp: int64 = stack_push(0, ni);
+  var cut_off: bool = false;
+  while (sp > 0) {
+    sp = sp - 1;
+    var x: int64 = g_stack[sp];
+    g_count_work = g_count_work + 1;
+    if (merc_node_value(t, (uint32)x, (uint64*)0)) {
+      n = n + 1;
+      if (n >= cap) {
+        cut_off = sp > 0 || merc_node_children(t, (uint32)x) > 0;
+        break;
+      }
+    }
+    var b: int32 = merc_node_next(t, (uint32)x, 0);
+    while (b >= 0) {
+      var c: int64 = merc_node_child(t, (uint32)x, (uint8)b);
+      if (c >= 0) { sp = stack_push(sp, c); }
+      b = merc_node_next(t, (uint32)x, b + 1);
+    }
+  }
+  var enc: int64 = n * 2;
+  if (cut_off) { enc = enc + 1; }
+  hm_put(&g_counts, h_end, enc);
+  *capped = cut_off;
+  return n;
+}
+
+fn new_vnode(kind: int32, parent: int32, level: int32) -> int32 {
+  var i: int64 = g_nv;
+  g_nv = g_nv + 1;
+  var v: VNode* = &g_vn[i];
+  var blank: VNode;
+  *v = blank;
+  v->kind = kind;
+  v->parent = parent;
+  v->first = -1;
+  v->last = -1;
+  v->next = -1;
+  v->level = level;
+  v->ni = -1;
+  v->g0 = -1;
+  if (parent >= 0) {
+    var pv: VNode* = &g_vn[parent];
+    if (pv->last >= 0) {
+      g_vn[pv->last].next = (int32)i;
+    } else {
+      pv->first = (int32)i;
+    }
+    pv->last = (int32)i;
+  }
+  return (int32)i;
+}
+
+fn txt_byte(c: uint8) {
+  var k: uint8 = c;
+  if (k < 33 || k > 126) { k = 63; }
+  merc_buf_push(&g_txt, k);
+}
+
+fn paren_start() {
+  if (g_pd > 0) { g_left[g_pd - 1] = g_left[g_pd - 1] - 1; }
+}
+
+fn paren_push(n: int32) {
+  if (g_pd < 64) {
+    g_left[g_pd] = n;
+    g_pd = g_pd + 1;
+  }
+}
+
+fn paren_close() -> int32 {
+  var n: int32 = 0;
+  while (g_pd > 0 && g_left[g_pd - 1] <= 0) {
+    n = n + 1;
+    g_pd = g_pd - 1;
+  }
+  return n;
+}
+
+var g_nvars: int32 = 0;
+
+fn var_letter(i: int32) {
+  merc_buf_push(&g_txt, 36);
+  merc_buf_push(&g_txt, (uint8)(97 + i % 26));
+}
+
+var g_next_head: bool = false;
+var g_cell_head: bool = false;
+var g_pend_head: bool = false;
+
+fn paren_scan(p: uint8*, n: int64) {
+  g_pd = 0;
+  g_next_head = false;
+  g_nvars = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var tag: uint8 = p[i];
+    i = i + 1;
+    paren_start();
+    var hs: bool = g_next_head;
+    g_next_head = false;
+    if (tag < 64) {
+      if (tag == 0) { paren_close(); } else { paren_push((int32)tag); g_next_head = true; }
+    } else if (tag > 0xC0) {
+      var len: int64 = (int64)(tag & 63);
+      if (i + len > n) {
+        g_pend_head = hs;
+        return;
+      }
+      i = i + len;
+      paren_close();
+    } else {
+      if (tag == 0xC0) { g_nvars = g_nvars + 1; }
+      paren_close();
+    }
+  }
+}
+
+fn add_cell(vn: int32, kind: int32, d0: int64, d1: int64, h0: uint64, h1: uint64, toff: int64) {
+  var c: VCell* = &g_cells[g_nc];
+  c->vn = vn;
+  c->kind = kind;
+  c->d0 = d0;
+  c->d1 = d1;
+  c->h0 = h0;
+  c->h1 = h1;
+  c->toff = toff;
+  c->tlen = g_txt.len - toff;
+  c->closers = paren_close();
+  c->head = g_cell_head;
+  g_nc = g_nc + 1;
+}
+
+fn prefix_hash(upto: int64) -> uint64 {
+  var h: uint64 = FNV0;
+  for i: int64 in 0..upto { h = hstep(h, g_walk.data[i]); }
+  return h;
+}
+
+fn tokenize(vn: int32, seg: uint8*, n: int64, start: int64, raw_in: int32, pend_in: int64, h_in: uint64, h_out: uint64*, pend_out: int64*) -> int32 {
+  var raw: int32 = raw_in;
+  var pend: int64 = pend_in;
+  var pend_h: uint64 = 0;
+  if (pend >= 0) { pend_h = prefix_hash(pend); }
+  var h: uint64 = h_in;
+  var i: int64 = 0;
+  var first: bool = true;
+  while (i < n) {
+    if (g_nc >= CELL_HARD) {
+      g_truncated = true;
+      while (i < n) { h = hstep(h, seg[i]); merc_buf_push(&g_walk, seg[i]); i = i + 1; }
+      break;
+    }
+    var d0: int64 = start + i;
+    var h0: uint64 = h;
+    var toff: int64 = g_txt.len;
+    if (raw > 0) {
+      var k: int64 = (int64)raw;
+      if (k > n - i) { k = n - i; }
+      for j: int64 in 0..k {
+        h = hstep(h, seg[i + j]);
+        merc_buf_push(&g_walk, seg[i + j]);
+      }
+      raw = raw - (int32)k;
+      i = i + k;
+      if (raw == 0) {
+        for j2: int64 in pend + 1..start + i { txt_byte(g_walk.data[j2]); }
+        g_cell_head = g_pend_head;
+        add_cell(vn, CK_SYM, pend, start + i, pend_h, h, toff);
+        pend = -1;
+      }
+      first = false;
+      continue;
+    }
+    var tag: uint8 = seg[i];
+    h = hstep(h, tag);
+    merc_buf_push(&g_walk, tag);
+    i = i + 1;
+    paren_start();
+    g_cell_head = g_next_head;
+    g_next_head = tag < 64 && tag > 0;
+    if (tag < 64) {
+      if (tag == 0) {
+        merc_buf_push(&g_txt, 40);
+        merc_buf_push(&g_txt, 41);
+        add_cell(vn, CK_ARITY, d0, start + i, h0, h, toff);
+      } else {
+        paren_push((int32)tag);
+        if (first && g_alt_first) {
+          merc_buf_push(&g_txt, 40);
+          if (tag >= 10) { merc_buf_push(&g_txt, (uint8)(48 + (int32)tag / 10)); }
+          merc_buf_push(&g_txt, (uint8)(48 + (int32)tag % 10));
+          add_cell(vn, CK_ARITY, d0, start + i, h0, h, toff);
+        }
+      }
+    } else if (tag > 0xC0) {
+      var len: int64 = (int64)(tag & 63);
+      var k2: int64 = len;
+      if (k2 > n - i) { k2 = n - i; }
+      for j3: int64 in 0..k2 {
+        h = hstep(h, seg[i + j3]);
+        merc_buf_push(&g_walk, seg[i + j3]);
+      }
+      i = i + k2;
+      raw = (int32)(len - k2);
+      if (raw == 0) {
+        for j4: int64 in d0 + 1..start + i { txt_byte(g_walk.data[j4]); }
+        add_cell(vn, CK_SYM, d0, start + i, h0, h, toff);
+      } else {
+        pend = d0;
+        pend_h = h0;
+        g_pend_head = g_cell_head;
+      }
+    } else if (tag == 0xC0) {
+      var_letter(g_nvars);
+      g_nvars = g_nvars + 1;
+      add_cell(vn, CK_VAR, d0, start + i, h0, h, toff);
+    } else if (tag >= 0x80) {
+      var_letter((int32)(tag & 63));
+      add_cell(vn, CK_REF, d0, start + i, h0, h, toff);
+    } else {
+      merc_buf_push(&g_txt, 35);
+      add_cell(vn, CK_RAW, d0, start + i, h0, h, toff);
+    }
+    first = false;
+  }
+  *h_out = h;
+  *pend_out = pend;
+  return raw;
+}
+
+fn focus_on() -> bool { return g_follow && g_focus.key.len > 0; }
+
+fn want_open(ni: int64, h_end: uint64, on_focus: bool, level: int32) -> bool {
+  var u: int64 = 0;
+  if (hm_get(&g_user, h_end, &u)) { return u != 0; }
+  if (on_focus && focus_on()) { return true; }
+  if (g_small_trie || g_open_all) { return true; }
+  if (g_results && g_nc < CELL_SOFT) { return true; }
+  if (g_nc > CELL_SOFT || g_nv > MAX_V - 200) { return false; }
+  if (level == 0) { return true; }
+  if (merc_node_children(vtrie(), (uint32)ni) == 1 && g_nc < CELL_SOFT / 2) { return true; }
+  var small: int64 = 40;
+  if (focus_on()) {
+    small = 6;
+  } else if (level < 2) {
+    return true;
+  }
+  var capped: bool = false;
+  var n: int64 = count_below(ni, h_end, small + 1, &capped);
+  return n >= 0 && n <= small && !capped;
+}
+
+fn add_ghost(vi: int32, level: int32) {
+  if (g_nv >= MAX_V - 1) { return; }
+  var gi: int32 = new_vnode(VK_GHOST, vi, level + 1);
+  var v: VNode* = &g_vn[vi];
+  var g0: int64 = g_zip_m;
+  for k: int32 in 0..v->ncells {
+    var c: VCell* = &g_cells[v->cell0 + k];
+    if (c->d0 < g_zip_m && g_zip_m < c->d1) { g0 = c->d0; }
+  }
+  g_vn[gi].g0 = g0;
+  g_vn[gi].start = g0;
+  g_vn[gi].end = g_zip.key.len;
+  g_vn[gi].h_end = hstep(v->h_end, 0x5A);
+  g_ghost_vn = (int64)gi;
+}
+
+fn build(ni: int64, edge: int32, parent: int32, start: int64, raw_in: int32, pend_in: int64, h_in: uint64, on_focus_in: bool, level: int32) {
+  if (g_nv >= MAX_V - 3) { g_truncated = true; return; }
+  var t: MercTrie* = vtrie();
+  var vi: int32 = new_vnode(VK_NODE, parent, level);
+  g_vn[vi].ni = ni;
+  g_vn[vi].start = start;
+  g_vn[vi].h_in = h_in;
+  g_vn[vi].cell0 = (int32)g_nc;
+  var lab: string = merc_node_label(t, (uint32)ni);
+  var seg: MercBuf;
+  if (edge >= 0) { merc_buf_push(&seg, (uint8)edge); }
+  merc_buf_text(&seg, lab);
+  var walk0: int64 = g_walk.len;
+  paren_scan(g_walk.data, g_walk.len);
+  g_alt_first = parent >= 0 && g_vn[parent].nkids > 1;
+  var h_end: uint64 = h_in;
+  var pend: int64 = -1;
+  var raw: int32 = tokenize(vi, seg.data, seg.len, start, raw_in, pend_in, h_in, &h_end, &pend);
+  var end: int64 = start + seg.len;
+  merc_buf_free(&seg);
+  var v: VNode* = &g_vn[vi];
+  v->ncells = (int32)(g_nc - (int64)v->cell0);
+  v->end = end;
+  v->h_end = h_end;
+  var val: uint64 = 0;
+  v->has_value = merc_node_value(t, (uint32)ni, &val);
+  v->value = val;
+  v->nkids = merc_node_children(t, (uint32)ni);
+  var on_focus: bool = on_focus_in && keyh_has(&g_focus, end, h_end);
+  var zip_here: bool = g_ghost_vn < 0 && g_zip_m < g_zip.key.len && start <= g_zip_m && g_zip_m <= end && keyh_has(&g_zip, start, h_in);
+  if (zip_here && edge >= 0 && (int32)g_zip.key.data[start] != edge) { zip_here = false; }
+  if (zip_here && g_zip_m == end && g_zip_m < g_zip.key.len) {
+    var nb: int32 = (int32)g_zip.key.data[g_zip_m];
+    if (v->nkids > 0 && merc_node_child(t, (uint32)ni, (uint8)nb) >= 0) { zip_here = false; }
+  }
+  if (v->nkids > 0) {
+    v->expanded = want_open(ni, h_end, on_focus, level);
+    if (v->ncells == 0 && parent >= 0 && g_nc < CELL_HARD - 64) {
+      var uo: int64 = 0;
+      if (!hm_get(&g_user, h_end, &uo)) { v->expanded = true; }
+    }
+    if (g_nc >= CELL_HARD) { v->expanded = false; }
+    if (v->expanded) {
+      var limit: int64 = (int64)MAX_KIDS;
+      var extra: int64 = 0;
+      if (hm_get(&g_more, h_end, &extra)) { limit = limit + extra; }
+      var fb: int32 = -1;
+      if (on_focus && g_focus.key.len > end) { fb = (int32)g_focus.key.data[end]; }
+      var zb: int32 = -1;
+      if (keyh_has(&g_zip, end, h_end) && g_zip.key.len > end) { zb = (int32)g_zip.key.data[end]; }
+      var shown: int64 = 0;
+      var b: int32 = merc_node_next(t, (uint32)ni, 0);
+      var fb_seen: bool = false;
+      while (b >= 0) {
+        var take: bool = shown < limit;
+        if (b == fb || b == zb) { take = true; }
+        if (b == fb) { fb_seen = true; }
+        if (take && g_nc < CELL_HARD && g_nv < MAX_V - 6) {
+          var c: int64 = merc_node_child(t, (uint32)ni, (uint8)b);
+          if (c >= 0) {
+            var nl: int32 = level;
+            if (g_vn[vi].nkids > 1 && g_vn[vi].ncells > 0) { nl = level + 1; }
+            build(c, b, vi, end, raw, pend, h_end, on_focus, nl);
+            shown = shown + 1;
+          }
+        }
+        if (shown >= limit && (fb < 0 || fb_seen) && (zb < 0 || b >= zb)) { break; }
+        b = merc_node_next(t, (uint32)ni, b + 1);
+      }
+      var hidden: int64 = (int64)g_vn[vi].nkids - shown;
+      if (hidden > 0 && g_nv < MAX_V - 2) {
+        var mi: int32 = new_vnode(VK_MORE, vi, level + 1);
+        g_vn[mi].count = hidden;
+        g_vn[mi].start = end;
+        g_vn[mi].end = end;
+        g_vn[mi].h_end = hstep(h_end, 0x4D);
+        g_vn[vi].hidden = (int32)hidden;
+      }
+    } else if (g_nv < MAX_V - 2) {
+      if (pend >= 0 && end - pend > 1 && g_nc < CELL_HARD) {
+        var toff: int64 = g_txt.len;
+        for j: int64 in pend + 1..end { txt_byte(g_walk.data[j]); }
+        var miss: int32 = raw;
+        if (miss > 8) { miss = 8; }
+        for j2: int32 in 0..miss { merc_buf_push(&g_txt, 95); }
+        add_cell(vi, CK_SYM, pend, end, prefix_hash(pend), h_end, toff);
+        g_cells[g_nc - 1].closers = 0;
+        g_vn[vi].ncells = (int32)(g_nc - (int64)g_vn[vi].cell0);
+      }
+      var si: int32 = new_vnode(VK_STUB, vi, level + 1);
+      var capped: bool = false;
+      var cnt: int64 = count_below(ni, h_end, COUNT_CAP, &capped);
+      if (cnt >= 0 && g_vn[vi].has_value && !capped) { cnt = cnt - 1; }
+      g_vn[si].count = cnt;
+      g_vn[si].capped = capped;
+      g_vn[si].start = end;
+      g_vn[si].end = end;
+      g_vn[si].h_end = hstep(h_end, 0x53);
+    }
+  }
+  if (zip_here && g_ghost_vn < 0) { add_ghost(vi, level); }
+  g_walk.len = walk0;
+}
+
+fn fold_text(v: VNode*) {
+  fmt_reset();
+  if (v->kind == VK_STUB) {
+    fmt_s("…");
+    return;
+  }
+  fmt_s("… ");
+  if (v->kind == VK_MORE) {
+    fmt_group(v->count);
+    fmt_s(" more");
+    return;
+  }
+  if (v->count < 0) {
+    fmt_s("?");
+    return;
+  }
+  if (v->capped) {
+    fmt_i(v->count / 1000);
+    fmt_s("k+");
+    return;
+  }
+  fmt_group(v->count);
+}
+
+fn step_size(step: int32) -> float32 {
+  if (step >= 2) { return 16.0; }
+  return 15.0;
+}
+
+fn is_junction(v: VNode*) -> bool { return v->kind == VK_NODE && v->ncells == 0 && v->parent >= 0; }
+
+fn adv_of(size: float32) -> float32 { return g_adv * size / 12.0; }
+
+fn ghost_text(v: VNode*, out: MercBuf*) {
+  var p: uint8* = g_zip.key.data;
+  var d: int64 = g_zip.key.len;
+  var i: int64 = v->g0;
+  var raw: int32 = merc_path_raw(bview(&g_zip.key, 0, v->g0));
+  var n: int32 = 0;
+  while (i < d && n < 16) {
+    if (out->len > 0) { merc_buf_push(out, 32); }
+    if (raw > 0) {
+      var k: int64 = (int64)raw;
+      if (k > d - i) { k = d - i; }
+      for j: int64 in 0..k {
+        var ch: uint8 = p[i + j];
+        if (ch < 33 || ch > 126) { ch = 63; }
+        merc_buf_push(out, ch);
+      }
+      raw = raw - (int32)k;
+      i = i + k;
+    } else {
+      var tag: int32 = (int32)p[i];
+      i = i + 1;
+      if (tag < 64) {
+        merc_buf_push(out, 40);
+      } else if (tag > 0xC0) {
+        var len: int64 = (int64)(tag & 63);
+        var k2: int64 = len;
+        if (k2 > d - i) { k2 = d - i; }
+        for j2: int64 in 0..k2 {
+          var ch2: uint8 = p[i + j2];
+          if (ch2 < 33 || ch2 > 126) { ch2 = 63; }
+          merc_buf_push(out, ch2);
+        }
+        i = i + k2;
+        raw = (int32)(len - k2);
+        if (k2 == 0) { merc_buf_push(out, 34); }
+      } else {
+        merc_buf_push(out, 36);
+      }
+    }
+    n = n + 1;
+  }
+}
+
+var g_gbuf: MercBuf;
+
+fn value_w(v: VNode*) -> float32 {
+  if (!v->has_value) { return 0.0; }
+  var w: float32 = 12.0;
+  if (v->value != (uint64)1) {
+    fmt_reset();
+    fmt_i((int64)v->value);
+    w = w + (float32)g_fmt.len * adv_of(12.0) + 4.0;
+  }
+  return w;
+}
+
+fn kid_rank(c: VNode*) -> int64 {
+  if (c->kind == VK_MORE || c->kind == VK_GHOST) { return -1; }
+  return c->est;
+}
+
+fn sort_kids(vi: int32) {
+  var v: VNode* = &g_vn[vi];
+  var sorted: int32 = -1;
+  var c: int32 = v->first;
+  while (c >= 0) {
+    var nx: int32 = g_vn[c].next;
+    var rk: int64 = kid_rank(&g_vn[c]);
+    if (sorted < 0 || kid_rank(&g_vn[sorted]) < rk) {
+      g_vn[c].next = sorted;
+      sorted = c;
+    } else {
+      var at: int32 = sorted;
+      while (g_vn[at].next >= 0 && kid_rank(&g_vn[g_vn[at].next]) >= rk) { at = g_vn[at].next; }
+      g_vn[c].next = g_vn[at].next;
+      g_vn[at].next = c;
+    }
+    c = nx;
+  }
+  v->first = sorted;
+  var last: int32 = sorted;
+  while (last >= 0 && g_vn[last].next >= 0) { last = g_vn[last].next; }
+  v->last = last;
+}
+
+fn measure(vi: int32) {
+  var v: VNode* = &g_vn[vi];
+  var est: int64 = 0;
+  var rows: int32 = 0;
+  var vk: int32 = 0;
+  var c2: int32 = v->first;
+  while (c2 >= 0) {
+    measure(c2);
+    est = est + g_vn[c2].est;
+    rows = rows + g_vn[c2].rows;
+    if (is_junction(&g_vn[c2])) {
+      vk = vk + g_vn[c2].vkids;
+    } else if (g_vn[c2].kind != VK_GHOST) {
+      vk = vk + 1;
+    }
+    c2 = g_vn[c2].next;
+  }
+  v->vkids = vk;
+  sort_kids(vi);
+  if (v->kind == VK_STUB) {
+    est = v->count;
+    if (v->capped || est < 0) { est = 10000; }
+    fold_text(v);
+    v->w = (float32)g_fmt.len * adv_of(13.0);
+  } else if (v->kind == VK_MORE) {
+    est = v->count * 10;
+    fold_text(v);
+    v->w = (float32)g_fmt.len * adv_of(13.0);
+  } else if (v->kind == VK_GHOST) {
+    est = 0;
+    merc_buf_clear(&g_gbuf);
+    ghost_text(v, &g_gbuf);
+    v->w = (float32)g_gbuf.len * adv_of(13.0);
+  } else {
+    if (v->has_value) { est = est + 1; }
+  }
+  v->est = est;
+  v->step = 0;
+  if (est >= 2) { v->step = 1; }
+  if (est >= 1000) { v->step = 2; }
+  if (rows < 1) { rows = 1; }
+  v->rows = rows;
+  if (v->kind != VK_NODE) { return; }
+  var size: float32 = step_size(v->step);
+  var adv: float32 = adv_of(size);
+  var x: float32 = 0.0;
+  for k: int32 in 0..v->ncells {
+    var c: VCell* = &g_cells[v->cell0 + k];
+    if (k > 0 && !bare_open(&g_cells[v->cell0 + k - 1])) { x = x + adv; }
+    c->ox = x;
+    c->tw = (float32)c->tlen * adv;
+    x = x + c->tw;
+    c->closers = 0;
+  }
+  v->w = x + value_w(v);
+}
+
+fn bare_open(c: VCell*) -> bool { return c->kind == CK_ARITY && c->tlen == 1; }
+
+fn child_gap(v: VNode*) -> float32 {
+  if (is_junction(v)) { return 0.0; }
+  if (v->vkids > 1) { return 26.0; }
+  if (v->ncells > 0 && v->vkids == 1 && bare_open(&g_cells[v->cell0 + v->ncells - 1])) { return 0.0; }
+  if (v->ncells == 0) { return 0.0; }
+  return adv_of(step_size(v->step));
+}
+
+fn ghost_x(v: VNode*, g0: int64) -> float32 {
+  for k: int32 in 0..v->ncells {
+    var c: VCell* = &g_cells[v->cell0 + k];
+    if (c->d0 >= g0) { return v->x + c->ox; }
+  }
+  return v->x + v->w + 26.0;
+}
+
+fn place(vi: int32, x: float32, row: int32) {
+  var v: VNode* = &g_vn[vi];
+  v->x = x;
+  v->y = (float32)row * ROW_H;
+  var cx: float32 = x + v->w + child_gap(v);
+  var r: int32 = row;
+  var c: int32 = v->first;
+  while (c >= 0) {
+    if (g_vn[c].kind == VK_GHOST) {
+      var gr: int32 = r;
+      if (gr == row && v->vkids > 0) { gr = row + 1; }
+      place(c, ghost_x(v, g_vn[c].g0), gr);
+      r = gr + 1;
+    } else {
+      place(c, cx, r);
+      r = r + g_vn[c].rows;
+    }
+    c = g_vn[c].next;
+  }
+}
+
+var g_pos: HMap;
+var g_pos2: HMap;
+var g_born: HMap;
+var g_born2: HMap;
+var g_last_serial: int64 = -1;
+var g_reduced: bool = false;
+
+fn pack_xy(x: float32, y: float32) -> int64 {
+  var xx: float32 = x;
+  var yy: float32 = y;
+  var a: uint32 = *(uint32*)&xx;
+  var b: uint32 = *(uint32*)&yy;
+  return (int64)(((uint64)a << (uint64)32) | (uint64)b);
+}
+
+fn unpack_x(p: int64) -> float32 {
+  var a: uint32 = (uint32)((uint64)p >> (uint64)32);
+  return *(float32*)&a;
+}
+
+fn unpack_y(p: int64) -> float32 {
+  var b: uint32 = (uint32)((uint64)p & (uint64)0xFFFFFFFF);
+  return *(float32*)&b;
+}
+
+fn ease_positions(dt: float32) {
+  var changed: bool = g_sh.serial != g_last_serial;
+  var k: float32 = mythic_clampf(dt * 14.0, 0.0, 1.0);
+  if (g_reduced) { k = 1.0; }
+  hm_clear(&g_pos2);
+  hm_clear(&g_born2);
+  for i: int64 in 0..g_nv {
+    var v: VNode* = &g_vn[i];
+    var key: uint64 = v->h_end ^ ((uint64)v->kind * (uint64)0x9E3779B97F4A7C15);
+    var old: int64 = 0;
+    if (hm_get(&g_pos, key, &old)) {
+      var ox: float32 = unpack_x(old);
+      var oy: float32 = unpack_y(old);
+      v->dx = ox + (v->x - ox) * k;
+      v->dy = oy + (v->y - oy) * k;
+      if (mythic_absf(v->dx - v->x) < 0.3) { v->dx = v->x; }
+      if (mythic_absf(v->dy - v->y) < 0.3) { v->dy = v->y; }
+      var bt: int64 = 0;
+      if (hm_get(&g_born, key, &bt)) { v->born = (float64)bt / 1000.0; } else { v->born = -100.0; }
+    } else {
+      v->dx = v->x;
+      v->dy = v->y;
+      if (v->parent >= 0 && !g_reduced && g_cam_set) { v->dy = g_vn[v->parent].dy; }
+      v->born = -100.0;
+      if (g_cam_set) { v->born = g_now; }
+      if (!changed && g_cam_set) { v->born = g_now - 50.0; }
+      if (g_cam_set && !changed) { v->born = 0.0 - g_now; }
+    }
+    v->fade = 1.0;
+    if (v->born < 0.0 && v->born > -99.0) {
+      var age: float32 = (float32)(g_now + v->born);
+      v->fade = mythic_clampf(age / 0.18, 0.0, 1.0);
+    } else if (v->born >= 0.0) {
+      var age2: float32 = (float32)(g_now - v->born);
+      v->fade = mythic_clampf(age2 / 0.18, 0.0, 1.0);
+    }
+    if (g_reduced) { v->fade = 1.0; }
+    hm_put(&g_pos2, key, pack_xy(v->dx, v->dy));
+    hm_put(&g_born2, key, (int64)(v->born * 1000.0));
+  }
+  var tp: HMap = g_pos;
+  g_pos = g_pos2;
+  g_pos2 = tp;
+  var tb: HMap = g_born;
+  g_born = g_born2;
+  g_born2 = tb;
+  g_last_serial = g_sh.serial;
+}
+
+fn moving() -> bool {
+  for i: int64 in 0..g_nv {
+    var v: VNode* = &g_vn[i];
+    if (v->dx != v->x || v->dy != v->y || v->fade < 1.0) { return true; }
+  }
+  return false;
+}
+
+fn layout() {
+  var t0: int64 = time_mono_ns();
+  if (g_vn == 0) {
+    g_vn = (VNode*)malloc(MAX_V * (int64)sizeof(VNode));
+    g_cells = (VCell*)malloc((CELL_HARD + 64) * (int64)sizeof(VCell));
+  }
+  if (g_sh.serial != g_count_serial || g_results != g_count_res) {
+    hm_clear(&g_counts);
+    g_count_serial = g_sh.serial;
+    g_count_res = g_results;
+  }
+  g_nv = 0;
+  g_nc = 0;
+  g_truncated = false;
+  g_count_work = 0;
+  g_count_pending = false;
+  g_ghost_vn = -1;
+  merc_buf_clear(&g_txt);
+  merc_buf_clear(&g_walk);
+  keyh_set(&g_zip, merc_zip_path(&g_sh.zip));
+  if (g_results) { keyh_set(&g_zip, ""); }
+  g_zip_m = walk_match(merc_buf_view(&g_zip.key));
+  var root: int64 = merc_node_root(vtrie());
+  if (root < 0 || merc_count(vtrie()) == 0) {
+    g_layout_ms = (float64)(time_mono_ns() - t0) / 1000000.0;
+    return;
+  }
+  g_small_trie = merc_count(vtrie()) <= 80;
+  build(root, -1, -1, 0, 0, -1, FNV0, true, 0);
+  measure(0);
+  g_prefix_vn = -1;
+  merc_buf_clear(&g_prefix);
+  var pv: int32 = 0;
+  var syms: int32 = 0;
+  while (pv >= 0) {
+    var v: VNode* = &g_vn[pv];
+    if (v->kind != VK_NODE || v->has_value) { break; }
+    for k: int32 in 0..v->ncells {
+      var c: VCell* = &g_cells[v->cell0 + k];
+      if (c->kind == CK_SYM) {
+        if (g_prefix.len > 0) { merc_buf_text(&g_prefix, "  ›  "); }
+        merc_buf_add(&g_prefix, g_txt.data + c->toff, c->tlen);
+        syms = syms + 1;
+      }
+    }
+    v->veiled = true;
+    g_prefix_vn = (int64)pv;
+    if (v->first >= 0 && v->first == v->last && g_vn[v->first].kind == VK_NODE) {
+      pv = v->first;
+    } else {
+      break;
+    }
+  }
+  if (syms == 0 || g_vn[g_prefix_vn].vkids < 2) {
+    var u: int32 = 0;
+    while (u >= 0 && (int64)u <= g_prefix_vn) {
+      g_vn[u].veiled = false;
+      if (g_vn[u].first < 0) { break; }
+      u = g_vn[u].first;
+    }
+    g_prefix_vn = -1;
+    merc_buf_clear(&g_prefix);
+    place(0, 0.0, 0);
+  } else {
+    var r: int32 = 1;
+    var c2: int32 = g_vn[g_prefix_vn].first;
+    while (c2 >= 0) {
+      place(c2, 0.0, r);
+      r = r + g_vn[c2].rows;
+      c2 = g_vn[c2].next;
+    }
+    var q: int32 = 0;
+    while ((int64)q <= g_prefix_vn && q >= 0) {
+      g_vn[q].x = 0.0;
+      g_vn[q].y = 0.0;
+      if (q == (int32)g_prefix_vn) { break; }
+      q = g_vn[q].first;
+    }
+  }
+  g_layout_ms = (float64)(time_mono_ns() - t0) / 1000000.0;
+  if (g_layout_ms > g_layout_max) { g_layout_max = g_layout_ms; }
+}
+
+var g_cam_x: float32 = 0.0;
+var g_cam_y: float32 = 0.0;
+var g_zoom: float32 = 1.0;
+var g_cam_tx: float32 = 0.0;
+var g_cam_ty: float32 = 0.0;
+var g_cam_moving: bool = false;
+var g_canvas: MythicRect;
+var g_cam_set: bool = false;
+var g_fit_all: bool = false;
+var g_debug: bool = false;
+var g_open_all: bool = false;
+var g_drag: bool = false;
+var g_drag_dist: float32 = 0.0;
+var g_last_mouse: MythicVec2;
+
+const MIN_ZOOM: float32 = 0.86;
+
+fn sx(wx: float32) -> float32 { return g_canvas.x + (wx - g_cam_x) * g_zoom; }
+fn sy(wy: float32) -> float32 { return g_canvas.y + (wy - g_cam_y) * g_zoom; }
+
+fn cam_home() {
+  g_zoom = 1.0;
+  g_cam_x = -LEFT_PAD;
+  g_cam_y = -36.0;
+  g_cam_moving = false;
+}
+
+fn tree_extent(w: float32*, h: float32*) {
+  var x1: float32 = 0.0;
+  var y1: float32 = 0.0;
+  for i: int64 in 0..g_nv {
+    var v: VNode* = &g_vn[i];
+    x1 = mythic_maxf(x1, v->x + v->w);
+    y1 = mythic_maxf(y1, v->y + ROW_H);
+  }
+  *w = x1;
+  *h = y1;
+}
+
+fn cam_fit() {
+  var w: float32 = 0.0;
+  var h: float32 = 0.0;
+  tree_extent(&w, &h);
+  var z: float32 = mythic_minf(g_canvas.w / (w + 60.0), g_canvas.h / (h + 40.0));
+  g_zoom = mythic_clampf(z, MIN_ZOOM, 1.25);
+  if (z < MIN_ZOOM) { g_zoom = 1.0; }
+  g_cam_x = -LEFT_PAD / g_zoom;
+  g_cam_y = -36.0 / g_zoom;
+  g_cam_moving = false;
+}
+
+fn zoom_at(f: float32, mx: float32, my: float32) {
+  var wx: float32 = g_cam_x + (mx - g_canvas.x) / g_zoom;
+  var wy: float32 = g_cam_y + (my - g_canvas.y) / g_zoom;
+  g_zoom = mythic_clampf(g_zoom * f, MIN_ZOOM, 2.5);
+  g_cam_x = wx - (mx - g_canvas.x) / g_zoom;
+  g_cam_y = wy - (my - g_canvas.y) / g_zoom;
+  g_cam_moving = false;
+}
+
+fn deepest_on(k: KeyH*, upto: int64) -> int64 {
+  var best: int64 = -1;
+  var bd: int64 = -1;
+  for i: int64 in 0..g_nc {
+    var c: VCell* = &g_cells[i];
+    if (c->d1 <= upto && c->d1 > bd && keyh_has(k, c->d1, c->h1)) {
+      best = i;
+      bd = c->d1;
+    }
+  }
+  return best;
+}
+
+fn cam_focus() {
+  var ci: int64 = deepest_on(&g_focus, g_focus.key.len);
+  if (ci < 0) { return; }
+  var c: VCell* = &g_cells[ci];
+  var v: VNode* = &g_vn[c->vn];
+  var wx: float32 = v->x;
+  var wend: float32 = v->x + c->ox + c->tw;
+  var wy: float32 = v->y;
+  var vw: float32 = g_canvas.w / g_zoom;
+  var vh: float32 = g_canvas.h / g_zoom;
+  var tx: float32 = g_cam_x;
+  var ty: float32 = g_cam_y;
+  if (wx > g_cam_x + vw - 160.0 / g_zoom || wx < g_cam_x + 40.0 / g_zoom) { tx = wx - vw * 0.5; }
+  if (wend > tx + vw - 60.0 / g_zoom) { tx = wend - vw + 80.0 / g_zoom; }
+  if (wy < g_cam_y + ROW_H || wy > g_cam_y + vh - ROW_H * 2.0) { ty = wy - vh * 0.35; }
+  if (tx < -LEFT_PAD / g_zoom) { tx = -LEFT_PAD / g_zoom; }
+  if (ty < -36.0 / g_zoom) { ty = -36.0 / g_zoom; }
+  g_cam_tx = tx;
+  g_cam_ty = ty;
+  g_cam_moving = true;
+}
+
+fn cam_step(dt: float32) {
+  if (!g_cam_moving) { return; }
+  var k: float32 = mythic_clampf(dt * 9.0, 0.0, 1.0);
+  if (g_reduced) { k = 1.0; }
+  g_cam_x = g_cam_x + (g_cam_tx - g_cam_x) * k;
+  g_cam_y = g_cam_y + (g_cam_ty - g_cam_y) * k;
+  if (mythic_absf(g_cam_tx - g_cam_x) < 0.5 && mythic_absf(g_cam_ty - g_cam_y) < 0.5) {
+    g_cam_x = g_cam_tx;
+    g_cam_y = g_cam_ty;
+    g_cam_moving = false;
+  }
+}
+
+fn click_at(mx: float32, my: float32) {
+  var wx: float32 = g_cam_x + (mx - g_canvas.x) / g_zoom;
+  var wy: float32 = g_cam_y + (my - g_canvas.y) / g_zoom;
+  for i: int64 in 0..g_nv {
+    var v: VNode* = &g_vn[i];
+    if (wy < v->dy || wy > v->dy + ROW_H || wx < v->dx - 4.0 || wx > v->dx + v->w + 4.0) { continue; }
+    if (v->kind == VK_STUB) {
+      hm_put(&g_user, g_vn[v->parent].h_end, 1);
+      return;
+    }
+    if (v->kind == VK_MORE) {
+      var extra: int64 = 0;
+      hm_get(&g_more, g_vn[v->parent].h_end, &extra);
+      hm_put(&g_more, g_vn[v->parent].h_end, extra + 16);
+      return;
+    }
+    if (v->kind == VK_NODE && v->nkids > 0) {
+      if (v->expanded) {
+        hm_put(&g_user, v->h_end, 0);
+      } else {
+        hm_put(&g_user, v->h_end, 1);
+      }
+      return;
+    }
+  }
+}
+
+fn alpha(c: uint32, a: float32) -> uint32 {
+  var x: int32 = mythic_iround(mythic_clampf(a, 0.0, 1.0) * (float32)(c >> 24));
+  return ((uint32)x << 24) | (c & (uint32)0x00FFFFFF);
+}
+
+fn mono(size: float32) -> MythicTextStyle {
+  var lh: float32 = 16.0;
+  if (size > 12.0) { lh = mythic_roundf(size * 1.4); }
+  var st: MythicTextStyle = { font: MYTHIC_FONT_MONO, size: size, line_height: lh, tracking: 0.0, flags: 0 };
+  return st;
+}
+
+fn rect(x: float32, y: float32, w: float32, h: float32) -> MythicRect {
+  var r: MythicRect = { x: x, y: y, w: w, h: h };
+  return r;
+}
+
+fn vec(x: float32, y: float32) -> MythicVec2 {
+  var v: MythicVec2 = { x: x, y: y };
+  return v;
+}
+
+fn hline(p: MythicPainter*, x0: float32, x1: float32, y: float32, col: uint32) {
+  if (x1 <= x0) { return; }
+  mythic_paint_fill(p, rect(x0, y, x1 - x0, 1.0), mythic_radius(0.0), col);
+}
+
+fn vline(p: MythicPainter*, x: float32, y0: float32, y1: float32, col: uint32) {
+  if (y1 <= y0) { return; }
+  mythic_paint_fill(p, rect(x, y0, 1.0, y1 - y0), mythic_radius(0.0), col);
+}
+
+fn text_at(p: MythicPainter*, s: string, st: MythicTextStyle, x: float32, top: float32, h: float32, col: uint32) {
+  var bl: float32 = mythic_paint_control_baseline(p, st, top, h);
+  mythic_paint_text_baseline(p, s, st, x, bl, col);
+}
+
+fn anim_p() -> float32 {
+  if (g_anim_kind == AN_NONE) { return 1.0; }
+  return (float32)mythic_clampf((float32)((g_now - g_anim_t0) / ANIM_S), 0.0, 1.0);
+}
+
+fn anim_age() -> float64 { return g_now - g_anim_t0; }
+
+fn anim_live() -> bool { return g_anim_kind != AN_NONE && anim_age() < 2.2; }
+
+fn reveal_depth() -> float32 {
+  var n: float32 = (float32)g_anim.key.len;
+  if (g_anim_kind == AN_MISS || g_anim_kind == AN_REMOVE) { n = (float32)g_anim_match; }
+  return anim_p() * n;
+}
+
+fn hits_live() -> bool {
+  return g_hit_serial == g_sh.serial && g_hit_n > 0;
+}
+
+fn hm_has(m: HMap*, k: uint64) -> bool {
+  var v: int64 = 0;
+  return hm_get(m, k, &v);
+}
+
+fn row_mid(v: VNode*) -> float32 { return sy(v->dy + ROW_H / 2.0); }
+
+fn word_color(v: VNode*, c: VCell*) -> uint32 {
+  if (c->kind == CK_ARITY) { return C_MUTED; }
+  if (c->head) { return C_MUTED; }
+  if (c->kind == CK_VAR || c->kind == CK_REF || c->kind == CK_RAW) { return C_TEXT2; }
+  if (v->step == 0) { return C_TEXT2; }
+  return C_TEXT;
+}
+
+var g_del_excl: int64 = 0;
+
+fn del_exclusive() {
+  g_del_excl = 0;
+  if (g_del_t0 < 0.0) { return; }
+  for i: int64 in 0..g_nv {
+    var v: VNode* = &g_vn[i];
+    if (v->kind != VK_NODE || v->end >= g_del.key.len) { continue; }
+    if (!keyh_has(&g_del, v->end, v->h_end)) { continue; }
+    if (v->nkids > 1 || v->has_value) { g_del_excl = mythic_maxi64(g_del_excl, v->end); }
+  }
+}
+
+fn mythic_maxi64(a: int64, b: int64) -> int64 {
+  if (a > b) { return a; }
+  return b;
+}
+
+fn draw_node(p: MythicPainter*, v: VNode*, lab: bool) {
+  var top: float32 = sy(v->dy);
+  var h: float32 = ROW_H * g_zoom;
+  if (top > g_canvas.y + g_canvas.h || top + h < g_canvas.y) { return; }
+  var size: float32 = step_size(v->step) * g_zoom;
+  var st: MythicTextStyle = mono(size);
+  var adv: float32 = adv_of(size);
+  var fade: float32 = v->fade;
+  var bulk: float32 = 0.0;
+  if (g_last_kind == MERC_DID_BULK && v->born >= 0.0) {
+    bulk = mythic_clampf(1.0 - (float32)(g_now - v->born) / 0.9, 0.0, 1.0);
+  }
+  var rd: float32 = reveal_depth();
+  var live: bool = anim_live();
+  var age: float32 = (float32)anim_age();
+  var zd: int64 = g_zip.key.len;
+  var hits: bool = hits_live();
+  var fixed: int64 = g_hit_fixed;
+  for k: int32 in 0..v->ncells {
+    var c: VCell* = &g_cells[v->cell0 + k];
+    var x: float32 = sx(v->dx + c->ox);
+    if (x > g_canvas.x + g_canvas.w) { break; }
+    var col: uint32 = word_color(v, c);
+    var a: float32 = fade;
+    var under: uint32 = 0;
+    var strike: bool = false;
+    if (g_results) {
+      if (hm_has(&g_hitvar_set, c->h1)) {
+        col = C_TEXT;
+        if (c->kind != CK_ARITY) { under = alpha(C_AMBER, 0.5); }
+      } else if (c->kind == CK_SYM && v->step > 0) {
+        col = C_TEXT2;
+      } else {
+        col = C_MUTED;
+      }
+    } else if (hits) {
+      if (hm_has(&g_hits_set, c->h1)) {
+        if (c->kind == CK_SYM) { col = C_TEXT; }
+        if (hm_has(&g_hitvar_set, c->h1) || (g_hitvar_set.n == 0 && c->d0 >= fixed)) { under = C_AMBER; }
+      } else {
+        col = mythic_color_lerp(col, C_BG, 0.45);
+      }
+    }
+    if (live && keyh_has(&g_anim, c->d1, c->h1)) {
+      if (g_anim_kind == AN_ADD) {
+        if (c->d1 > g_anim_new_from) {
+          var appear: float32 = mythic_clampf((rd - (float32)c->d0) / 2.0, 0.0, 1.0);
+          a = a * appear;
+          var settle: float32 = mythic_clampf((age - (float32)ANIM_S) / 1.2, 0.0, 1.0);
+          col = mythic_color_lerp(C_GREEN, col, settle);
+        }
+      } else if ((float32)c->d1 <= rd + 0.01 && g_anim_kind != AN_REMOVE) {
+        under = alpha(C_AMBER, mythic_clampf(2.2 - age, 0.0, 1.0));
+      }
+    }
+    if (g_del_t0 >= 0.0 && keyh_has(&g_del, c->d1, c->h1) && c->d1 > g_del_excl) {
+      col = C_RED;
+      strike = true;
+    }
+    if (bulk > 0.0) { col = mythic_color_lerp(col, C_GREEN, bulk); }
+    if (c->d0 == zd && keyh_has(&g_zip, c->d0, c->h0)) { col = mythic_color_lerp(col, C_VIOLET, 0.45); }
+    var focus_under: bool = false;
+    if (under == 0 && !hits && g_follow && keyh_has(&g_focus, c->d1, c->h1) && c->d1 <= g_focus.key.len) {
+      under = alpha(C_VIOLET, 0.4);
+      focus_under = true;
+    }
+    if (lab && c->tlen > 0) {
+      text_at(p, bview(&g_txt, c->toff, c->tlen), st, x, top, h, alpha(col, a));
+    }
+    if (c->closers > 0 && lab) {
+      fmt_reset();
+      for j: int32 in 0..c->closers { fmt_c(41); }
+      text_at(p, fmt_view(), st, x + c->tw * g_zoom, top, h, alpha(C_MUTED, a));
+    }
+    var uw: float32 = c->tw * g_zoom;
+    if (c->closers > 0) { uw = uw + adv * (float32)c->closers; }
+    if (focus_under && k + 1 < v->ncells) { uw = uw + adv; }
+    if (under != 0) {
+      hline(p, x, x + uw, top + h - 3.0 * g_zoom, alpha(under, a));
+    }
+    if (strike) {
+      hline(p, x - 1.0, x + uw + 1.0, top + h / 2.0, C_RED);
+    }
+  }
+  if (v->has_value && v->ncells > 0) {
+    var ex: float32 = sx(v->dx + v->w - value_w(v));
+    var cy: float32 = top + h / 2.0;
+    mythic_paint_circle(p, vec(ex + 6.0 * g_zoom, cy), 2.5 * g_zoom, alpha(C_GREEN, fade));
+    if (lab && v->value != (uint64)1) {
+      fmt_reset();
+      fmt_i((int64)v->value);
+      text_at(p, fmt_view(), mono(12.0 * g_zoom), ex + 12.0 * g_zoom, top, h, alpha(C_MUTED, fade));
+    }
+  }
+}
+
+fn draw_fold(p: MythicPainter*, v: VNode*, lab: bool) {
+  var top: float32 = sy(v->dy);
+  var h: float32 = ROW_H * g_zoom;
+  if (top > g_canvas.y + g_canvas.h || top + h < g_canvas.y || !lab) { return; }
+  fold_text(v);
+  text_at(p, fmt_view(), mono(13.0 * g_zoom), sx(v->dx), top, h, alpha(C_MUTED, v->fade));
+}
+
+fn draw_lines(p: MythicPainter*) {
+  var right: float32 = g_canvas.x + g_canvas.w;
+  for i: int64 in 0..g_nv {
+    var v: VNode* = &g_vn[i];
+    if (v->vkids < 2 || is_junction(v) || v->veiled) { continue; }
+    var y0: float32 = row_mid(v);
+    var y1: float32 = last_row_mid(v);
+    if (y1 < g_canvas.y || y0 > g_canvas.y + g_canvas.h) { continue; }
+    var xe: float32 = sx(v->dx + v->w) + 5.0 * g_zoom;
+    var spine: float32 = sx(v->dx + v->w + 13.0);
+    if (spine > right) { continue; }
+    if (v->ncells > 0) { hline(p, xe, spine, y0, C_BORDER); }
+    vline(p, spine, y0, y1 + 1.0, C_BORDER);
+    stubs(p, v, spine);
+  }
+}
+
+fn last_row_mid(v: VNode*) -> float32 {
+  var y: float32 = row_mid(v);
+  var c: int32 = v->first;
+  while (c >= 0) {
+    var ch: VNode* = &g_vn[c];
+    if (is_junction(ch)) {
+      y = last_row_mid(ch);
+    } else if (ch->kind != VK_GHOST) {
+      y = row_mid(ch);
+    }
+    c = ch->next;
+  }
+  return y;
+}
+
+fn stubs(p: MythicPainter*, v: VNode*, spine: float32) {
+  var c: int32 = v->first;
+  while (c >= 0) {
+    var ch: VNode* = &g_vn[c];
+    if (is_junction(ch)) {
+      stubs(p, ch, spine);
+    } else if (ch->kind != VK_GHOST) {
+      var cy: float32 = row_mid(ch);
+      if (cy > g_canvas.y - 4.0 && cy < g_canvas.y + g_canvas.h + 4.0) {
+        hline(p, spine, sx(ch->dx) - 5.0 * g_zoom, cy, C_BORDER);
+      }
+    }
+    c = ch->next;
+  }
+}
+
+fn blink() -> float32 {
+  if (g_reduced) { return 1.0; }
+  var t: float32 = (float32)g_now;
+  var ph: float32 = t - mythic_floorf(t / 1.4) * 1.4;
+  if (ph < 0.9) { return 1.0; }
+  return 0.25;
+}
+
+fn caret(p: MythicPainter*, x: float32, top: float32, col: uint32) {
+  var h: float32 = ROW_H * g_zoom;
+  mythic_paint_fill(p, rect(x, top + h * 0.14, 2.0, h * 0.72), mythic_radius(0.0), col);
+}
+
+fn caret_x_for(c: VCell*, v: VNode*, d: int64) -> float32 {
+  var size: float32 = step_size(v->step) * g_zoom;
+  var adv: float32 = adv_of(size);
+  var x: float32 = sx(v->dx + c->ox);
+  if (d >= c->d1) { return x + c->tw * g_zoom + 1.0; }
+  var chars: int64 = d - c->d0 - 1;
+  if (chars < 0) { chars = 0; }
+  return x + (float32)chars * adv;
+}
+
+fn draw_zipper(p: MythicPainter*, lab: bool) {
+  if (g_results) { return; }
+  var d: int64 = g_zip.key.len;
+  var col: uint32 = alpha(C_VIOLET, blink());
+  if (g_ghost_vn >= 0) {
+    var gv: VNode* = &g_vn[g_ghost_vn];
+    var pv: VNode* = &g_vn[gv->parent];
+    var top: float32 = sy(gv->dy);
+    var h: float32 = ROW_H * g_zoom;
+    var gx: float32 = sx(gv->dx);
+    var sp: float32 = gx - 13.0 * g_zoom;
+    vline(p, sp, row_mid(pv), top + h / 2.0, alpha(C_VIOLET, 0.45));
+    hline(p, sp, gx - 4.0, top + h / 2.0, alpha(C_VIOLET, 0.45));
+    caret(p, gx - 1.0, top, col);
+    if (lab) {
+      merc_buf_clear(&g_gbuf);
+      ghost_text(gv, &g_gbuf);
+      var st: MythicTextStyle = mono(13.0 * g_zoom);
+      text_at(p, merc_buf_view(&g_gbuf), st, gx + 4.0, top, h, alpha(C_VIOLET, 0.6));
+    }
+    return;
+  }
+  if (d == 0) {
+    if (g_nv > 0) { caret(p, sx(g_vn[0].dx) - 7.0, sy(g_vn[0].dy), col); }
+    return;
+  }
+  for i: int64 in 0..g_nc {
+    var c: VCell* = &g_cells[i];
+    if (c->d0 >= d || c->d1 < d) { continue; }
+    if (!keyh_has(&g_zip, c->d0, c->h0)) { continue; }
+    if (d == c->d1 && !keyh_has(&g_zip, c->d1, c->h1)) { continue; }
+    if (d < c->d1 && c->kind == CK_SYM) {
+      var same: bool = true;
+      for q: int64 in c->d0 + 1..d {
+        var want: uint8 = g_zip.key.data[q];
+        if (want < 33 || want > 126) { want = 63; }
+        if (q - c->d0 - 1 >= c->tlen || g_txt.data[c->toff + q - c->d0 - 1] != want) { same = false; }
+      }
+      if (!same) { continue; }
+    }
+    var v: VNode* = &g_vn[c->vn];
+    caret(p, caret_x_for(c, v, d), sy(v->dy), col);
+    return;
+  }
+}
+
+fn draw_miss(p: MythicPainter*) {
+  if (g_anim_kind != AN_MISS || anim_p() < 1.0 || anim_age() > 2.6) { return; }
+  var f: float32 = mythic_clampf((float32)(2.6 - anim_age()), 0.0, 1.0);
+  var ci: int64 = deepest_on(&g_anim, g_anim_match);
+  var x: float32 = 0.0;
+  var top: float32 = 0.0;
+  if (ci >= 0) {
+    var c: VCell* = &g_cells[ci];
+    var v: VNode* = &g_vn[c->vn];
+    x = sx(v->dx + c->ox) + c->tw * g_zoom + 3.0;
+    top = sy(v->dy);
+  } else if (g_nv > 0) {
+    x = sx(g_vn[0].dx) - 7.0;
+    top = sy(g_vn[0].dy);
+  } else {
+    return;
+  }
+  var h: float32 = ROW_H * g_zoom;
+  mythic_paint_fill(p, rect(x, top + h * 0.1, 2.0, h * 0.8), mythic_radius(0.0), alpha(C_RED, f));
+  hline(p, x + 2.0, x + 12.0, top + h - 3.0 * g_zoom, alpha(C_RED, f));
+}
+
+fn eyebrow_style() -> MythicTextStyle {
+  var st: MythicTextStyle = { font: MYTHIC_FONT_SEMIBOLD, size: 11.5, line_height: 16.0, tracking: 1.6, flags: 0 };
+  return st;
+}
+
+fn serif(size: float32) -> MythicTextStyle {
+  var st: MythicTextStyle = { font: MYTHIC_FONT_REGULAR, size: size, line_height: mythic_roundf(size * 1.25), tracking: 0.0, flags: 0 };
+  return st;
+}
+
+fn sans(size: float32) -> MythicTextStyle {
+  var st: MythicTextStyle = { font: MYTHIC_FONT_MEDIUM, size: size, line_height: mythic_roundf(size * 1.6), tracking: 0.0, flags: 0 };
+  return st;
+}
+
+fn draw_empty(p: MythicPainter*, box: MythicRect) {
+  var x: float32 = box.x + 48.0;
+  var y: float32 = box.y + 56.0;
+  text_at(p, "AN EMPTY TRIE", eyebrow_style(), x, y, 16.0, C_MUTED);
+  text_at(p, "Nothing stored yet.", serif(32.0), x, y + 28.0, 40.0, C_TEXT);
+  text_at(p, "Type an expression in the console below to store it, or open a file of them. Help lists the commands.", sans(15.0), x, y + 84.0, 24.0, C_TEXT2);
+  text_at(p, "add (parent tom bob)", mono(14.0), x, y + 132.0, 22.0, C_TEXT);
+  text_at(p, "load test_data/scholarly_tree.mm2", mono(14.0), x, y + 160.0, 22.0, C_TEXT);
+}
+
+fn draw_gutter(p: MythicPainter*, box: MythicRect) {
+  var gw: float32 = 88.0;
+  if (sx(0.0) < box.x + gw) {
+    mythic_paint_fill(p, rect(box.x, box.y, gw, box.h), mythic_radius(0.0), C_BG);
+  }
+  var st: MythicTextStyle = mono(13.0 * g_zoom);
+  if (g_prefix.len > 0) {
+    var px: float32 = mythic_maxf(sx(0.0), box.x + gw);
+    text_at(p, merc_buf_view(&g_prefix), st, px, sy(0.0), ROW_H * g_zoom, C_MUTED);
+  }
+  for i: int64 in 0..g_nv {
+    var v: VNode* = &g_vn[i];
+    if (v->kind != VK_STUB || v->veiled) { continue; }
+    var top: float32 = sy(v->dy);
+    if (top > box.y + box.h || top + ROW_H * g_zoom < box.y) { continue; }
+    fmt_reset();
+    if (v->count < 0) {
+      fmt_s("?");
+    } else if (v->capped) {
+      fmt_i(v->count / 1000);
+      fmt_s("k+");
+    } else {
+      fmt_group(v->count);
+    }
+    var tw: float32 = mythic_text_width(p->fonts, mythic_paint_text_spec(p->scale, st), fmt_view()) / p->scale;
+    text_at(p, fmt_view(), st, box.x + gw - 20.0 - tw, top, ROW_H * g_zoom, alpha(C_MUTED, v->fade));
+  }
+}
+
+fn draw_edges_hint(p: MythicPainter*, box: MythicRect) {
+  var w: float32 = 0.0;
+  var h: float32 = 0.0;
+  tree_extent(&w, &h);
+  var content: float32 = (w + 96.0) * g_zoom;
+  var right_world: float32 = g_cam_x + box.w / g_zoom;
+  if (w > right_world) {
+    var fp0: MythicVec2 = { x: box.x + box.w - 28.0, y: 0.0 };
+    var fp1: MythicVec2 = { x: box.x + box.w, y: 0.0 };
+    mythic_paint_gradient(p, rect(box.x + box.w - 28.0, box.y, 28.0, box.h), mythic_radius(0.0), fp0, fp1, 0x00131217, C_BG);
+  }
+  if (g_cam_x > -40.0 / g_zoom) {
+    var gp0: MythicVec2 = { x: box.x, y: 0.0 };
+    var gp1: MythicVec2 = { x: box.x + 20.0, y: 0.0 };
+    mythic_paint_gradient(p, rect(box.x, box.y, 20.0, box.h), mythic_radius(0.0), gp0, gp1, C_BG, 0x00131217);
+  }
+  if (content > box.w + 2.0) {
+    var frac_w: float32 = mythic_clampf(box.w / content, 0.04, 1.0);
+    var pos: float32 = mythic_clampf((g_cam_x + 48.0) * g_zoom / content, 0.0, 1.0 - frac_w);
+    var bx: float32 = box.x + 8.0 + pos * (box.w - 16.0);
+    mythic_paint_fill(p, rect(bx, box.y + box.h - 5.0, frac_w * (box.w - 16.0), 2.0), mythic_radius(1.0), alpha(C_MUTED, 0.7));
+  }
+}
+
+var g_rb: uint8[8192];
+var g_rt: MercBuf;
+var g_rf: MercBuf;
+var g_lpre: MercBuf;
+const LV_TOP: float32 = 46.0;
+const LV_ROW: float32 = 28.0;
+const LV_GUT: float32 = 88.0;
+
+fn row_flags(key: uint8*, kn: int64) {
+  var pat: uint8* = g_sh.touched.data;
+  var pn: int64 = g_sh.touched.len;
+  var n: int64 = kn;
+  if (n > 8192) { n = 8192; }
+  memset((rawptr)&g_rb[0], 0, n);
+  var i: int64 = 0;
+  var j: int64 = 0;
+  var vno: int32 = 0;
+  while (i < pn && j < kn) {
+    var t: uint8 = pat[i];
+    var kt: uint8 = key[j];
+    if (t >= 0x80 && t <= 0xC0) {
+      var span: int64 = merc_span(key + j, kn - j);
+      if (span <= 0) { return; }
+      var vid: int32 = vno;
+      if (t < 0xC0) { vid = (int32)(t & 63); } else { vno = vno + 1; }
+      for q: int64 in 0..span { if (j + q < n) { g_rb[j + q] = (uint8)(1 + vid % 8); } }
+      j = j + span;
+      i = i + 1;
+    } else if (kt >= 0x80 && kt <= 0xC0) {
+      var ps: int64 = merc_span(pat + i, pn - i);
+      if (ps <= 0) { return; }
+      j = j + 1;
+      i = i + ps;
+    } else {
+      var st: int64 = 1;
+      if (t > 0xC0) { st = 1 + (int64)(t & 63); }
+      i = i + st;
+      j = j + st;
+    }
+  }
+}
+
+fn flat_put(c: uint8, f: uint8) {
+  merc_buf_push(&g_rt, c);
+  merc_buf_push(&g_rf, f);
+}
+
+fn flat_row(key: uint8*, kn: int64, skip: int64) {
+  merc_buf_clear(&g_rt);
+  merc_buf_clear(&g_rf);
+  row_flags(key, kn);
+  var left: int32[64];
+  var hid: bool[64];
+  var depth: int32 = 0;
+  var i: int64 = 0;
+  var nvar: int32 = 0;
+  var head: bool = false;
+  while (i < kn && g_rt.len < 600) {
+    var at: int64 = i;
+    var tag: uint8 = key[i];
+    i = i + 1;
+    var show: bool = at >= skip;
+    var f: uint8 = 0;
+    if (at < 8192) { f = g_rb[at]; }
+    var hf: uint8 = f;
+    if (head) { hf = f | 0x40; }
+    head = false;
+    if (depth > 0) { left[depth - 1] = left[depth - 1] - 1; }
+    if (show && g_rt.len > 0 && g_rt.data[g_rt.len - 1] != 40) { flat_put(32, 0); }
+    if (tag < 64) {
+      if (tag == 0) {
+        if (show) {
+          flat_put(40, f | 0x40);
+          flat_put(41, f | 0x40);
+        }
+      } else {
+        if (show) { flat_put(40, f | 0x40); }
+        if (depth < 64) {
+          left[depth] = (int32)tag;
+          hid[depth] = !show;
+          depth = depth + 1;
+        }
+        head = true;
+        continue;
+      }
+    } else if (tag > 0xC0) {
+      var len: int64 = (int64)(tag & 63);
+      for k: int64 in 0..len {
+        if (i + k < kn && show) {
+          var ch: uint8 = key[i + k];
+          if (ch < 32 || ch > 126) { ch = 63; }
+          flat_put(ch, hf);
+        }
+      }
+      i = i + len;
+    } else if (tag == 0xC0) {
+      if (show) {
+        flat_put(36, hf);
+        flat_put((uint8)(97 + nvar % 26), hf);
+      }
+      nvar = nvar + 1;
+    } else if (tag >= 0x80) {
+      if (show) {
+        flat_put(36, hf);
+        flat_put((uint8)(97 + (int32)(tag & 63) % 26), hf);
+      }
+    }
+    while (depth > 0 && left[depth - 1] == 0) {
+      depth = depth - 1;
+      if (!hid[depth]) { flat_put(41, f | 0x40); }
+    }
+  }
+}
+
+fn list_prefix() {
+  merc_buf_clear(&g_lpre);
+  var pat: uint8* = g_sh.touched.data;
+  var i: int64 = 0;
+  while (i < g_hit_fixed) {
+    var t: uint8 = pat[i];
+    i = i + 1;
+    if (t > 0xC0) {
+      var len: int64 = (int64)(t & 63);
+      if (g_lpre.len > 0) { merc_buf_text(&g_lpre, "  ›  "); }
+      for k: int64 in 0..len { if (i + k < g_hit_fixed) { merc_buf_push(&g_lpre, pat[i + k]); } }
+      i = i + len;
+    }
+  }
+}
+
+fn lv_rows_visible() -> int64 {
+  return (int64)((g_canvas.h - LV_TOP) / LV_ROW);
+}
+
+fn lv_clamp() {
+  var maxtop: float32 = (float32)(lv_count() - lv_rows_visible() + 1);
+  if (maxtop < 0.0) { maxtop = 0.0; }
+  g_lv_top = mythic_clampf(g_lv_top, 0.0, maxtop);
+  if (g_lv_x < 0.0) { g_lv_x = 0.0; }
+}
+
+fn run_color(f: uint8) -> uint32 {
+  var v: int32 = (int32)(f & 0x0F);
+  var col: uint32 = C_TEXT2;
+  if (v > 0) {
+    col = C_TEXT;
+    if (v % 2 == 1) { col = C_AMBER; }
+  }
+  if ((f & 0x40) != 0) { col = mythic_color_lerp(col, C_BG, 0.5); }
+  return col;
+}
+
+fn draw_runs(p: MythicPainter*, st: MythicTextStyle, x0: float32, top: float32, h: float32, adv: float32) {
+  var n: int64 = g_rt.len;
+  var a: int64 = 0;
+  while (a < n) {
+    var f: uint8 = g_rf.data[a];
+    var b: int64 = a;
+    while (b < n && g_rf.data[b] == f) { b = b + 1; }
+    var x: float32 = x0 + (float32)a * adv;
+    if (x < g_canvas.x + g_canvas.w) {
+      text_at(p, bview(&g_rt, a, b - a), st, x, top, h, run_color(f));
+    }
+    a = b;
+  }
+}
+
+fn draw_list(p: MythicPainter*, box: MythicRect) {
+  var st: MythicTextStyle = mono(15.0);
+  var adv: float32 = adv_of(15.0);
+  var gst: MythicTextStyle = mono(13.0);
+  list_prefix();
+  if (g_lpre.len > 0 && g_lv_mode != 1) {
+    text_at(p, merc_buf_view(&g_lpre), mono(13.0), box.x + LV_GUT + 16.0, box.y + 10.0, 24.0, C_MUTED);
+  }
+  lv_clamp();
+  var first: int64 = (int64)g_lv_top;
+  var total: int64 = lv_count();
+  var y: float32 = box.y + LV_TOP;
+  var x0: float32 = box.x + LV_GUT + 16.0 - g_lv_x;
+  var widest: float32 = 0.0;
+  var r: int64 = first;
+  while (r < total && y + LV_ROW <= box.y + box.h - 6.0) {
+    fmt_reset();
+    if (g_lv_mode == 1) {
+      var e: VEntry* = &g_ve[g_list[r]];
+      fmt_group(e->count);
+      merc_buf_clear(&g_rt);
+      merc_buf_clear(&g_rf);
+      for k: int64 in 0..e->len { flat_put(g_vtext.data[e->off + k], 1); }
+    } else {
+      var row: int64 = r;
+      if (g_lv_mode == 2) { row = g_list[r]; }
+      fmt_group(row + 1);
+      flat_row(g_sh.hits.data + g_rows_off[row], g_rows_len[row], g_hit_fixed);
+    }
+    var gw: float32 = mythic_text_width(p->fonts, mythic_paint_text_spec(p->scale, gst), fmt_view()) / p->scale;
+    mythic_dl_push_clip(p->dl, mythic_paint_dev_rect(p, rect(box.x + LV_GUT + 8.0, box.y, box.w - LV_GUT - 8.0, box.h)), 0.0);
+    draw_runs(p, st, x0, y, LV_ROW, adv);
+    mythic_dl_pop_clip(p->dl);
+    widest = mythic_maxf(widest, (float32)g_rt.len * adv);
+    text_at(p, fmt_view(), gst, box.x + LV_GUT - gw, y, LV_ROW, C_MUTED);
+    y = y + LV_ROW;
+    r = r + 1;
+  }
+  g_lv_widest = widest;
+  var view: float32 = box.w - LV_GUT - 16.0;
+  if (widest - g_lv_x > view) {
+    var fp0: MythicVec2 = { x: box.x + box.w - 28.0, y: 0.0 };
+    var fp1: MythicVec2 = { x: box.x + box.w, y: 0.0 };
+    mythic_paint_gradient(p, rect(box.x + box.w - 28.0, box.y, 28.0, box.h), mythic_radius(0.0), fp0, fp1, 0x00131217, C_BG);
+  }
+  if (widest > view) {
+    var fw: float32 = mythic_clampf(view / widest, 0.05, 1.0);
+    var pos: float32 = mythic_clampf(g_lv_x / widest, 0.0, 1.0 - fw);
+    var bw: float32 = box.w - LV_GUT - 24.0;
+    mythic_paint_fill(p, rect(box.x + LV_GUT + 16.0 + pos * bw, box.y + box.h - 5.0, fw * bw, 2.0), mythic_radius(1.0), alpha(C_MUTED, 0.7));
+  }
+  if (total > lv_rows_visible()) {
+    var vh: float32 = box.h - LV_TOP - 8.0;
+    var fh: float32 = mythic_clampf((float32)lv_rows_visible() / (float32)total, 0.03, 1.0);
+    var vp: float32 = mythic_clampf(g_lv_top / (float32)total, 0.0, 1.0 - fh);
+    mythic_paint_fill(p, rect(box.x + box.w - 5.0, box.y + LV_TOP + vp * vh, 2.0, fh * vh), mythic_radius(1.0), alpha(C_MUTED, 0.7));
+  }
+}
+
+var g_lv_widest: float32 = 0.0;
+
+fn lv_click(mx: float32, my: float32) {
+  var idx: int64 = (int64)g_lv_top + (int64)((my - g_canvas.y - LV_TOP) / LV_ROW);
+  if (my < g_canvas.y + LV_TOP || idx < 0 || idx >= lv_count()) { return; }
+  if (g_lv_mode == 1) {
+    lv_set(2, g_lv_var, g_list[idx]);
+    return;
+  }
+  var row: int64 = idx;
+  if (g_lv_mode == 2) { row = g_list[idx]; }
+  var key: string = bview(&g_sh.hits, g_rows_off[row], g_rows_len[row]);
+  merc_zip_reset(&g_sh.zip);
+  merc_zip_descend(&g_sh.zip, key);
+  g_lv_sel = row;
+  fmt_reset();
+  fmt_s("zipper at row ");
+  fmt_group(row + 1);
+  log_s(fmt_view(), LL_NOTE);
+}
+
+var g_lv_sel: int64 = -1;
+
+fn canvas_paint_cb(ui: MythicUi*, p: MythicPainter*, box: MythicRect, ud: rawptr) {
+  g_canvas = box;
+  mythic_paint_fill(p, box, mythic_radius(0.0), C_BG);
+  mythic_dl_push_clip(p->dl, mythic_paint_dev_rect(p, box), 0.0);
+  if (g_results) {
+    draw_list(p, box);
+    mythic_dl_pop_clip(p->dl);
+    return;
+  }
+  if (!g_engine_busy && merc_count(vtrie()) == 0 && g_nv == 0) {
+    draw_empty(p, box);
+    mythic_dl_pop_clip(p->dl);
+    return;
+  }
+  var lab: bool = g_zoom >= MIN_ZOOM - 0.001;
+  del_exclusive();
+  draw_lines(p);
+  for i: int64 in 0..g_nv {
+    var v: VNode* = &g_vn[i];
+    if (v->veiled) { continue; }
+    if (v->kind == VK_NODE) {
+      draw_node(p, v, lab);
+    } else if (v->kind == VK_STUB || v->kind == VK_MORE) {
+      draw_fold(p, v, lab);
+    }
+  }
+  draw_miss(p);
+  draw_zipper(p, lab);
+  draw_gutter(p, box);
+  draw_edges_hint(p, box);
+  mythic_dl_pop_clip(p->dl);
+}
+
+var g_console_big: bool = false;
+var g_open_end: int32 = 0;
+var g_input_focused: bool = true;
+
+fn log_paint_cb(ui: MythicUi*, p: MythicPainter*, box: MythicRect, ud: rawptr) {
+  mythic_paint_fill(p, box, mythic_radius(0.0), C_RAISED);
+  mythic_dl_push_clip(p->dl, mythic_paint_dev_rect(p, box), 0.0);
+  var m: MythicTextStyle = mono(13.0);
+  var lh: float32 = 19.0;
+  var rows: int64 = (int64)((box.h - 10.0) / lh);
+  if (g_log_off > g_log_n - rows) { g_log_off = g_log_n - rows; }
+  if (g_log_off < 0) { g_log_off = 0; }
+  var last: int64 = g_log_n - 1 - g_log_off;
+  var y: float32 = box.y + box.h - lh - 10.0;
+  var i: int64 = last;
+  var ind: float32 = adv_of(13.0) * 2.0;
+  while (i >= 0 && y >= box.y + 12.0) {
+    var l: LogLine* = log_get(i);
+    var s: string;
+    s.chars = l->chars;
+    s.length = (uint64)l->len;
+    var col: uint32 = C_TEXT2;
+    var x: float32 = box.x + ind;
+    if (l->kind == LL_CMD) {
+      col = C_TEXT;
+      x = box.x;
+    } else if (l->kind == LL_ERR) {
+      col = C_RED;
+    } else if (l->kind == LL_NOTE) {
+      col = C_MUTED;
+    }
+    text_at(p, s, m, x, y, lh, col);
+    if (l->took_len > 0) {
+      var ts: string;
+      ts.chars = &l->took[0];
+      ts.length = (uint64)l->took_len;
+      var tw: float32 = mythic_text_width(p->fonts, mythic_paint_text_spec(p->scale, m), ts) / p->scale;
+      text_at(p, ts, m, box.x + box.w - tw, y, lh, C_MUTED);
+    }
+    y = y - lh;
+    i = i - 1;
+  }
+  mythic_dl_pop_clip(p->dl);
+}
+
+var g_input: MythicTextBuf;
+var g_hist: int64*;
+var g_hist_n: int64 = 0;
+var g_hist_cap: int64 = 0;
+var g_hist_at: int64 = -1;
+var g_themed: bool = false;
+var g_focused_once: bool = false;
+var g_frame_ms_sum: float64 = 0.0;
+var g_frame_ms_max: float64 = 0.0;
+var g_frame_n: int64 = 0;
+
+fn hist_add(s: string) {
+  if (s.length == (uint64)0) { return; }
+  if (g_hist_n == g_hist_cap) {
+    var cap: int64 = g_hist_cap * 2;
+    if (cap < 64) { cap = 64; }
+    g_hist = (int64*)realloc((rawptr)g_hist, cap * 8);
+    g_hist_cap = cap;
+  }
+  g_hist[g_hist_n] = (int64)line_new(s.chars, (int64)s.length);
+  g_hist_n = g_hist_n + 1;
+  g_hist_at = -1;
+}
+
+fn clamp_pan() {
+  var w: float32 = 0.0;
+  var h: float32 = 0.0;
+  tree_extent(&w, &h);
+  var vw: float32 = g_canvas.w / g_zoom;
+  var vh: float32 = g_canvas.h / g_zoom;
+  var maxx: float32 = mythic_maxf(-LEFT_PAD / g_zoom, w + 48.0 - vw);
+  var maxy: float32 = mythic_maxf(-36.0 / g_zoom, h + 36.0 - vh * 0.5);
+  g_cam_x = mythic_clampf(g_cam_x, -LEFT_PAD / g_zoom, maxx);
+  g_cam_y = mythic_clampf(g_cam_y, -36.0 / g_zoom, maxy);
+}
+
+fn canvas(ui: MythicUi*) {
+  var id: uint64 = mythic_id(ui, "canvas");
+  mythic_box_begin(ui, { id: id, width: mythic_grow(), height: mythic_grow(), clip: true });
+  var r: MythicResp = mythic_interact(ui, id, MYTHIC_SENSE_CLICK | MYTHIC_SENSE_DRAG);
+  mythic_end(ui);
+  mythic_node_paint(ui, &canvas_paint_cb, (rawptr)0);
+  if (ui->pass != 0) { return; }
+  var mouse: MythicVec2 = ui->in.mouse;
+  if (g_results) {
+    if (r.pressed) {
+      if (!g_drag) {
+        g_drag = true;
+        g_drag_dist = 0.0;
+      } else {
+        var ddx: float32 = mouse.x - g_last_mouse.x;
+        var ddy: float32 = mouse.y - g_last_mouse.y;
+        g_drag_dist = g_drag_dist + mythic_absf(ddx) + mythic_absf(ddy);
+        if (g_drag_dist > 3.0) {
+          g_lv_x = g_lv_x - ddx;
+          g_lv_top = g_lv_top - ddy / LV_ROW;
+        }
+      }
+    } else if (g_drag) {
+      g_drag = false;
+      if (g_drag_dist <= 3.0 && !g_engine_busy) { lv_click(mouse.x, mouse.y); }
+    }
+    g_last_mouse = mouse;
+    if (r.hovered) {
+      g_lv_top = g_lv_top - ui->in.wheel.y * 3.0;
+      g_lv_x = g_lv_x - ui->in.wheel.x * 60.0;
+    }
+    lv_clamp();
+    return;
+  }
+  if (r.pressed) {
+    if (!g_drag) {
+      g_drag = true;
+      g_drag_dist = 0.0;
+    } else {
+      var dx: float32 = mouse.x - g_last_mouse.x;
+      var dy: float32 = mouse.y - g_last_mouse.y;
+      g_drag_dist = g_drag_dist + mythic_absf(dx) + mythic_absf(dy);
+      if (g_drag_dist > 3.0) {
+        g_cam_x = g_cam_x - dx / g_zoom;
+        g_cam_y = g_cam_y - dy / g_zoom;
+        clamp_pan();
+        g_cam_moving = false;
+      }
+    }
+  } else if (g_drag) {
+    g_drag = false;
+    if (g_drag_dist <= 3.0 && !g_engine_busy) { click_at(mouse.x, mouse.y); }
+  }
+  g_last_mouse = mouse;
+  if (r.hovered && (ui->in.wheel.y != 0.0 || ui->in.wheel.x != 0.0)) {
+    if ((ui->in.mods & MYTHIC_MOD_CTRL) != 0) {
+      zoom_at(mythic_powf(1.12, ui->in.wheel.y), mouse.x, mouse.y);
+    } else {
+      g_cam_y = g_cam_y - ui->in.wheel.y * ROW_H * 3.0 / g_zoom;
+      g_cam_x = g_cam_x - ui->in.wheel.x * 60.0 / g_zoom;
+      if (g_cam_y < -36.0 / g_zoom) { g_cam_y = -36.0 / g_zoom; }
+      if (g_cam_x < -LEFT_PAD / g_zoom) { g_cam_x = -LEFT_PAD / g_zoom; }
+      clamp_pan();
+      g_cam_moving = false;
+    }
+  }
+}
+
+fn log_panel(ui: MythicUi*, h: float32) {
+  var id: uint64 = mythic_id(ui, "log");
+  mythic_box_begin(ui, { id: id, width: mythic_grow(), height: mythic_fixed(h), clip: true });
+  var r: MythicResp = mythic_interact(ui, id, MYTHIC_SENSE_HOVER);
+  mythic_end(ui);
+  mythic_node_paint(ui, &log_paint_cb, (rawptr)0);
+  if (ui->pass == 0 && r.hovered && ui->in.wheel.y != 0.0) {
+    g_log_off = g_log_off + (int64)mythic_iround(ui->in.wheel.y * 3.0);
+  }
+}
+
+fn theme() -> MythicTheme {
+  var t: MythicTheme = mythic_theme_dark();
+  var c: MythicColors* = &t.colors;
+  c->bg_window = C_BG;
+  c->bg_surface = C_BG;
+  c->bg_surface_raised = C_RAISED;
+  c->bg_input = C_BG;
+  c->border_default = C_BORDER;
+  c->border_strong = 0xFF3A3846;
+  c->border_subtle = C_BORDER;
+  c->input_border_focus = 0xFF6E5BA8;
+  c->focus_glow = 0;
+  c->focus_ring = 0;
+  c->caret = C_TEXT;
+  c->selection = 0x55A78BFA;
+  c->selection_inactive = 0x33A78BFA;
+  c->text_primary = C_TEXT;
+  c->text_secondary = C_TEXT2;
+  c->text_tertiary = C_MUTED;
+  c->scrollbar_thumb = 0x553A3846;
+  c->scrollbar_thumb_hover = 0x883A3846;
+  t.type.body = mono(14.0);
+  t.ctrl.md.text = mono(14.0);
+  t.ctrl.md.pad_x_input = 12.0;
+  t.ctrl.md.height = 36.0;
+  t.ctrl.md.radius = 4.0;
+  return t;
+}
+
+fn txt(ui: MythicUi*, s: string, st: MythicTextStyle, col: uint32) {
+  mythic_text(ui, s, st, col);
+}
+
+fn gap(ui: MythicUi*, h: float32) {
+  mythic_box_begin(ui, { height: mythic_fixed(h) });
+  mythic_end(ui);
+}
+
+fn wrap(ui: MythicUi*, s: string, st0: MythicTextStyle, col: uint32) {
+  var st: MythicTextStyle = st0;
+  st.flags = MYTHIC_TEXT_WRAP;
+  mythic_box_begin(ui, { width: mythic_grow() });
+    txt(ui, s, st, col);
+  mythic_end(ui);
+}
+
+fn clipped(ui: MythicUi*, s: string, st0: MythicTextStyle, col: uint32) {
+  var st: MythicTextStyle = st0;
+  st.flags = MYTHIC_TEXT_ELLIPSIS;
+  mythic_box_begin(ui, { width: mythic_grow(), clip: true });
+    txt(ui, s, st, col);
+  mythic_end(ui);
+}
+
+fn link(ui: MythicUi*, label: string, idl: string, on: bool) -> bool {
+  var id: uint64 = mythic_id(ui, idl);
+  var st: MythicTextStyle = sans(14.0);
+  mythic_box_begin(ui, { id: id, dir: MYTHIC_DIR_ROW, height: mythic_fixed(28.0), align_y: MYTHIC_ALIGN_CENTER });
+  var r: MythicResp = mythic_interact(ui, id, MYTHIC_SENSE_CLICK);
+  var col: uint32 = C_TEXT2;
+  if (on) { col = C_VIOLET; }
+  if (r.hovered) { col = C_TEXT; }
+  txt(ui, label, st, col);
+  mythic_end(ui);
+  return r.clicked;
+}
+
+fn topbar(ui: MythicUi*) {
+  mythic_row_begin(ui, { width: mythic_grow(), height: mythic_fixed(60.0), pad: mythic_pad_xy(32.0, 0.0), gap: 28, align_y: MYTHIC_ALIGN_CENTER });
+    txt(ui, "merc", serif(24.0), C_TEXT);
+    mythic_spacer(ui);
+    if (link(ui, "Open file", "open", false)) {
+      mythic_textbuf_set(&g_input, "load ");
+      g_focused_once = false;
+      g_open_end = 3;
+    }
+    if (link(ui, "Save", "save", false)) {
+      mythic_textbuf_set(&g_input, "save ");
+      g_focused_once = false;
+      g_open_end = 3;
+    }
+    if (link(ui, "Help", "help", false)) {
+      q_text("help");
+      g_console_big = true;
+    }
+    if (link(ui, "Panel", "panel", !g_side_hidden)) { g_side_hidden = !g_side_hidden; }
+    var fl: string = "Follow";
+    if (g_follow) { fl = "Following"; }
+    if (link(ui, fl, "follow", g_follow)) {
+      g_follow = !g_follow;
+      if (g_follow) { g_focus_new = true; }
+    }
+  mythic_end(ui);
+  rule_h(ui);
+}
+
+fn rule_h(ui: MythicUi*) {
+  mythic_box_begin(ui, { width: mythic_grow(), height: mythic_fixed(1.0), bg: C_BORDER });
+  mythic_end(ui);
+}
+
+fn rule_v(ui: MythicUi*) {
+  mythic_box_begin(ui, { width: mythic_fixed(1.0), height: mythic_grow(), bg: C_BORDER });
+  mythic_end(ui);
+}
+
+fn eyebrow(ui: MythicUi*, s: string) {
+  txt(ui, s, eyebrow_style(), C_MUTED);
+  gap(ui, 10.0);
+}
+
+fn byte_word(b: int32, raw: int32) {
+  if (raw > 0) {
+    if (b > 32 && b < 127) {
+      fmt_s("the letter ");
+      fmt_c(b);
+    } else {
+      fmt_s("byte ");
+      fmt_i((int64)b);
+    }
+    return;
+  }
+  if (b < 64) {
+    fmt_s("a list of ");
+    fmt_i((int64)b);
+  } else if (b > 0xC0) {
+    fmt_s("a word of ");
+    fmt_i((int64)(b & 63));
+  } else if (b == 0xC0) {
+    fmt_s("a variable");
+  } else if (b >= 0x80) {
+    fmt_s("variable ");
+    fmt_i((int64)(b & 63));
+    fmt_s(" again");
+  } else {
+    fmt_s("byte ");
+    fmt_i((int64)b);
+  }
+}
+
+var g_side_buf: MercBuf;
+
+fn prime(text: string) {
+  mythic_textbuf_set(&g_input, text);
+  g_focused_once = false;
+  g_open_end = 3;
+}
+
+fn next_link(ui: MythicUi*, label: string, idl: string) -> bool {
+  gap(ui, 8.0);
+  return link(ui, label, idl, true);
+}
+
+fn fmt_mem(mem: int64) {
+  if (mem >= 1048576) {
+    fmt_tenths(mem * 10 / 1048576);
+    fmt_s(" MB");
+  } else if (mem >= 10240) {
+    fmt_group(mem / 1024);
+    fmt_s(" KB");
+  } else {
+    fmt_group(mem);
+    fmt_s(" bytes");
+  }
+}
+
+fn side_rules(ui: MythicUi*) {
+  eyebrow(ui, "RULES");
+  if (g_rules_n == 0 && !g_go && !g_engine_busy) {
+    txt(ui, "No rules waiting", sans(15.0), C_TEXT);
+    if (next_link(ui, "Add a rule", "addrule")) { prime("(exec 0 (, "); }
+    return;
+  }
+  fmt_reset();
+  fmt_group(g_rules_n);
+  if (g_rules_more) { fmt_s("+"); }
+  txt(ui, fmt_view(), serif(34.0), C_TEXT);
+  fmt_reset();
+  fmt_s("waiting to run");
+  if (g_go) {
+    fmt_s(", ");
+    fmt_group(g_go_ran);
+    fmt_s(" ran so far");
+  }
+  txt(ui, fmt_view(), sans(14.0), C_TEXT2);
+  if (g_engine_busy) {
+    gap(ui, 4.0);
+    fmt_reset();
+    fmt_s("running ");
+    fmt_tenths((int64)((g_now - g_engine_t0) * 10.0));
+    fmt_s(" s");
+    txt(ui, fmt_view(), mono(13.0), C_VIOLET);
+  } else if (g_step_line.len > 0) {
+    gap(ui, 4.0);
+    fmt_reset();
+    fmt_s(merc_buf_view(&g_step_line));
+    fmt_s(" · ");
+    fmt_s(merc_buf_view(&g_step_took));
+    wrap(ui, fmt_view(), mono(12.0), C_MUTED);
+  }
+  gap(ui, 14.0);
+  for ri: int32 in 0..g_rule_shown {
+    rule_h(ui);
+    mythic_row_begin(ui, { width: mythic_grow(), height: mythic_fixed(32.0), align_y: MYTHIC_ALIGN_CENTER, gap: 10, clip: true });
+      var mark: uint32 = 0;
+      if (ri == 0) { mark = C_VIOLET; }
+      mythic_box_begin(ui, { width: mythic_fixed(2.0), height: mythic_fixed(18.0), bg: mark });
+      mythic_end(ui);
+      var rst: MythicTextStyle = mono(13.0);
+      rst.flags = MYTHIC_TEXT_ELLIPSIS;
+      var rcol: uint32 = C_TEXT2;
+      if (ri == 0) { rcol = C_TEXT; }
+      mythic_box_begin(ui, { width: mythic_grow(), clip: true });
+        txt(ui, bview(&g_rule_txt, g_rule_off[ri], g_rule_len[ri]), rst, rcol);
+      mythic_end(ui);
+    mythic_end(ui);
+  }
+  if (g_rule_shown > 0) { rule_h(ui); }
+}
+
+fn side_find(ui: MythicUi*) {
+  eyebrow(ui, "FIND");
+  if (g_hit_serial < 0) {
+    txt(ui, "Nothing searched yet", sans(15.0), C_TEXT);
+    if (next_link(ui, "Find a pattern", "find")) { prime("match "); }
+    return;
+  }
+  clipped(ui, merc_buf_view(&g_hit_pattern), mono(14.0), C_TEXT);
+  gap(ui, 6.0);
+  fmt_reset();
+  fmt_group(g_find_found);
+  txt(ui, fmt_view(), serif(34.0), C_TEXT);
+  fmt_reset();
+  if (g_find_found == 1) { fmt_s("match"); } else { fmt_s("matches"); }
+  if (!hits_live() && g_hit_n > 0) { fmt_s(" before the trie changed"); }
+  txt(ui, fmt_view(), sans(14.0), C_TEXT2);
+  gap(ui, 4.0);
+  fmt_reset();
+  fmt_s(merc_buf_view(&g_find_took));
+  fmt_s(" · ");
+  fmt_group(g_find_walked);
+  fmt_s(" bytes walked");
+  wrap(ui, fmt_view(), mono(12.0), C_MUTED);
+  if (g_vars > 0) {
+    gap(ui, 16.0);
+    for v: int32 in 0..g_vars {
+      rule_h(ui);
+      gap(ui, 10.0);
+      mythic_row_begin(ui, { width: mythic_grow(), align_y: MYTHIC_ALIGN_CENTER, gap: 10 });
+        txt(ui, bview(&g_vname, g_vname_off[v], g_vname_len[v]), mono(14.0), C_AMBER);
+        mythic_spacer(ui);
+        fmt_reset();
+        fmt_group(g_vdistinct[v]);
+        if (g_vdistinct[v] == 1) { fmt_s(" value"); } else { fmt_s(" values"); }
+        txt(ui, fmt_view(), sans(13.0), C_TEXT2);
+      mythic_end(ui);
+      gap(ui, 6.0);
+      for k: int32 in 0..g_vtop_n[v] {
+        var e: VEntry* = &g_ve[g_vtop[v * 3 + k]];
+        mythic_row_begin(ui, { width: mythic_grow(), height: mythic_fixed(22.0), align_y: MYTHIC_ALIGN_CENTER, gap: 10, clip: true });
+          var est: MythicTextStyle = mono(13.0);
+          est.flags = MYTHIC_TEXT_ELLIPSIS;
+          mythic_box_begin(ui, { width: mythic_grow(), clip: true });
+            txt(ui, bview(&g_vtext, e->off, e->len), est, C_TEXT);
+          mythic_end(ui);
+          fmt_reset();
+          fmt_group(e->count);
+          txt(ui, fmt_view(), mono(13.0), C_MUTED);
+        mythic_end(ui);
+      }
+      gap(ui, 8.0);
+    }
+    rule_h(ui);
+    if (g_vt_capped) {
+      gap(ui, 8.0);
+      fmt_reset();
+      fmt_s("Counted over the first ");
+      fmt_group(VT_CAP);
+      fmt_s(" matches.");
+      txt(ui, fmt_view(), sans(12.0), C_MUTED);
+    }
+  }
+  if (next_link(ui, "Find a pattern", "find")) { prime("match "); }
+}
+
+fn side_save(ui: MythicUi*) {
+  eyebrow(ui, "SAVE");
+  if (g_save_line.len > 0) {
+    wrap(ui, merc_buf_view(&g_save_line), mono(13.0), C_TEXT2);
+  } else {
+    txt(ui, "Nothing saved yet", sans(15.0), C_TEXT);
+  }
+  if (next_link(ui, "Save a result", "saveres")) { prime("save "); }
+}
+
+var g_stat_n: int64 = 0;
+var g_stat_nodes: int64 = 0;
+var g_stat_mem: int64 = 0;
+
+fn side(ui: MythicUi*, w: float32) {
+  mythic_box_begin(ui, { width: mythic_fixed(w), height: mythic_grow(), clip: true });
+  mythic_scroll_begin(ui, "side", { width: mythic_grow(), height: mythic_grow(), pad: mythic_pad_xy(32.0, 36.0), gap: 0 });
+    if (!g_engine_busy) {
+      rules_scan();
+      g_stat_n = merc_count(trie());
+      g_stat_nodes = merc_node_count(trie());
+      g_stat_mem = merc_memory(trie());
+    }
+    var n: int64 = g_stat_n;
+    if (g_rules_n > 0 || g_go || g_engine_busy) {
+      side_rules(ui);
+      gap(ui, 40.0);
+    }
+    eyebrow(ui, "THE TRIE");
+    fmt_reset();
+    fmt_group(n);
+    txt(ui, fmt_view(), serif(34.0), C_TEXT);
+    if (n == 1) { txt(ui, "expression", sans(14.0), C_TEXT2); } else { txt(ui, "expressions", sans(14.0), C_TEXT2); }
+    gap(ui, 6.0);
+    fmt_reset();
+    fmt_group(g_stat_nodes);
+    if (g_stat_nodes == 1) { fmt_s(" node · "); } else { fmt_s(" nodes · "); }
+    fmt_mem(g_stat_mem);
+    if (n > 0) {
+      fmt_s(" · ");
+      fmt_group(g_stat_mem / n);
+      fmt_s(" bytes each");
+    }
+    wrap(ui, fmt_view(), sans(13.0), C_MUTED);
+    if (g_load_took.len > 0) {
+      fmt_reset();
+      fmt_s("loaded in ");
+      fmt_s(merc_buf_view(&g_load_took));
+      txt(ui, fmt_view(), mono(12.0), C_MUTED);
+    }
+    if (n > 0) {
+      gap(ui, 40.0);
+      side_find(ui);
+      if (g_rules_n == 0 && !g_go && !g_engine_busy) {
+        gap(ui, 40.0);
+        side_rules(ui);
+      }
+      gap(ui, 40.0);
+      side_save(ui);
+    }
+    if (!g_engine_busy && merc_zip_depth(&g_sh.zip) > 0) {
+      gap(ui, 40.0);
+      eyebrow(ui, "ZIPPER");
+      merc_buf_clear(&g_side_buf);
+      fmt_partial(merc_zip_path(&g_sh.zip), &g_side_buf);
+      clipped(ui, merc_buf_view(&g_side_buf), mono(14.0), C_VIOLET);
+      if (!merc_zip_exists(&g_sh.zip)) {
+        gap(ui, 6.0);
+        txt(ui, "Past the end of the trie", sans(14.0), C_TEXT2);
+      }
+    }
+  mythic_end(ui);
+  mythic_end(ui);
+}
+
+fn run_button(ui: MythicUi*, label: string) -> bool {
+  var id: uint64 = mythic_id(ui, label);
+  mythic_box_begin(ui, { id: id, dir: MYTHIC_DIR_ROW, width: mythic_fixed(72.0), height: mythic_fixed(36.0),
+                         align_x: MYTHIC_ALIGN_CENTER, align_y: MYTHIC_ALIGN_CENTER, radius: mythic_radius(4.0) });
+  var r: MythicResp = mythic_interact(ui, id, MYTHIC_SENSE_CLICK);
+  var n: MythicNode* = ui->cur;
+  n->box.bg = C_VIOLET;
+  if (r.hovered) { n->box.bg = 0xFFB9A2FB; }
+  var st: MythicTextStyle = { font: MYTHIC_FONT_SEMIBOLD, size: 14.0, line_height: 20.0, tracking: 0.0, flags: 0 };
+  txt(ui, label, st, C_BG);
+  mythic_end(ui);
+  return r.clicked;
+}
+
+fn submit() {
+  var s: string = mythic_textbuf_str(&g_input);
+  if (trim(s).length > (uint64)0) {
+    q_text(s);
+    hist_add(s);
+  }
+  mythic_textbuf_set(&g_input, "");
+  g_hist_at = -1;
+}
+
+var g_cm: MercComplete;
+var g_cp_text: MercBuf;
+var g_cp_cursor: int64 = -1;
+var g_cp_sel: int32 = 0;
+var g_cp_moved: bool = false;
+var g_cp_closed: bool = false;
+var g_cp_show: bool = false;
+var g_cp_forced: bool = false;
+var g_cp_ns: int64 = 0;
+var g_cp_ns_sum: int64 = 0;
+var g_cp_ns_max: int64 = 0;
+var g_cp_runs: int64 = 0;
+var g_cp_id: uint64 = 0;
+
+fn input_cursor(ui: MythicUi*, cid: uint64) -> int64 {
+  var n: int64 = (int64)mythic_textbuf_str(&g_input).length;
+  if (ui->edit.id == cid) {
+    var c: int64 = ui->edit.cursor;
+    if (c >= 0 && c <= n) { return c; }
+  }
+  return n;
+}
+
+fn complete_update(ui: MythicUi*, cid: uint64, focused: bool) {
+  g_cp_id = cid;
+  if (ui->pass != 0) { return; }
+  var text: string = mythic_textbuf_str(&g_input);
+  var cur: int64 = input_cursor(ui, cid);
+  var same: bool = cur == g_cp_cursor && g_cp_text.len == (int64)text.length;
+  if (same && text.length > (uint64)0) { same = memcmp((rawptr)g_cp_text.data, (rawptr)text.chars, (int64)text.length) == 0; }
+  if (!same && !g_engine_busy) {
+    merc_buf_clear(&g_cp_text);
+    merc_buf_text(&g_cp_text, text);
+    g_cp_cursor = cur;
+    var t0: int64 = time_mono_ns();
+    merc_shell_complete(&g_sh, text, cur, &g_cm);
+    g_cp_ns = time_mono_ns() - t0;
+    g_cp_ns_sum = g_cp_ns_sum + g_cp_ns;
+    g_cp_runs = g_cp_runs + 1;
+    if (g_cp_ns > g_cp_ns_max) { g_cp_ns_max = g_cp_ns; }
+    g_cp_sel = 0;
+    g_cp_moved = false;
+    g_cp_closed = false;
+    g_cp_forced = false;
+  }
+  g_cp_show = false;
+  if (!focused || g_cp_closed || g_cm.n == 0) { return; }
+  if (text.length == (uint64)0 && !g_cp_forced) { return; }
+  var c0: MercCand* = &g_cm.c[0];
+  var word: int64 = c0->to - c0->from;
+  if (word >= 1 || g_cp_forced || c0->kind == MERC_CK_MOVE || c0->kind == MERC_CK_PATH) { g_cp_show = true; }
+  if (g_cm.n == 1 && word == c0->text_len && c0->kind != MERC_CK_PATH) {
+    var t: string = merc_complete_text(&g_cm, 0);
+    if (memcmp((rawptr)t.chars, (rawptr)(text.chars + c0->from), word) == 0) { g_cp_show = false; }
+  }
+}
+
+fn cp_common(word: int64) -> int64 {
+  var t0: string = merc_complete_text(&g_cm, 0);
+  var n: int64 = (int64)t0.length;
+  for i in 1..g_cm.n {
+    var t: string = merc_complete_text(&g_cm, i);
+    var k: int64 = 0;
+    while (k < n && k < (int64)t.length && t.chars[k] == t0.chars[k]) { k = k + 1; }
+    n = k;
+  }
+  return n;
+}
+
+fn cp_accept(ui: MythicUi*, idx: int32, common_only: bool) {
+  var c: MercCand* = &g_cm.c[idx];
+  var text: string = mythic_textbuf_str(&g_input);
+  var t: string = merc_complete_text(&g_cm, idx);
+  var take: int64 = (int64)t.length;
+  var space: bool = true;
+  if (common_only) {
+    take = cp_common(c->to - c->from);
+    space = false;
+  }
+  if (take > 0 && t.chars[take - 1] == 47) { space = false; }
+  var nb: MercBuf;
+  merc_buf_add(&nb, text.chars, c->from);
+  merc_buf_add(&nb, t.chars, take);
+  if (space) { merc_buf_push(&nb, 32); }
+  var pos: int64 = nb.len;
+  merc_buf_add(&nb, text.chars + c->to, (int64)text.length - c->to);
+  mythic_textbuf_set(&g_input, merc_buf_view(&nb));
+  merc_buf_free(&nb);
+  if (ui->edit.id == g_cp_id) {
+    ui->edit.cursor = pos;
+    ui->edit.anchor = pos;
+  }
+  g_cp_cursor = -1;
+}
+
+fn complete_keys(ui: MythicUi*) {
+  if (mythic_key_pressed(ui, MYTHIC_KEY_TAB, -1)) {
+    if (!g_cp_show) {
+      g_cp_forced = true;
+      g_cp_closed = false;
+    } else if (g_cm.n > 0) {
+      var c0: MercCand* = &g_cm.c[0];
+      var word: int64 = c0->to - c0->from;
+      if (!g_cp_moved && g_cm.n > 1 && cp_common(word) > word) {
+        cp_accept(ui, 0, true);
+      } else {
+        cp_accept(ui, g_cp_sel, false);
+      }
+    }
+    g_focused_once = false;
+    return;
+  }
+  if (!g_cp_show) { return; }
+  var shown: int32 = g_cm.n;
+  if (shown > 8) { shown = 8; }
+  if (mythic_key_consume(ui, MYTHIC_KEY_DOWN, -1)) {
+    g_cp_sel = (g_cp_sel + 1) % shown;
+    g_cp_moved = true;
+  }
+  if (mythic_key_consume(ui, MYTHIC_KEY_UP, -1)) {
+    g_cp_sel = (g_cp_sel + shown - 1) % shown;
+    g_cp_moved = true;
+  }
+  if (mythic_key_consume(ui, MYTHIC_KEY_ESCAPE, -1)) {
+    g_cp_closed = true;
+    g_cp_forced = false;
+    g_cp_show = false;
+    g_esc_eaten = true;
+  }
+  if (g_cp_moved && mythic_key_consume(ui, MYTHIC_KEY_ENTER, -1)) { cp_accept(ui, g_cp_sel, false); }
+}
+
+var g_esc_eaten: bool = false;
+
+fn cp_row_w() -> float32 {
+  var w: float32 = 0.0;
+  var shown: int32 = g_cm.n;
+  if (shown > 8) { shown = 8; }
+  for i in 0..shown {
+    var tw: float32 = (float32)g_cm.c[i].text_len * adv_of(14.0);
+    var nw: float32 = (float32)g_cm.c[i].note_len * adv_of(12.0);
+    if (g_cm.c[i].count > 0) { nw = 7.0 * adv_of(12.0); }
+    w = mythic_maxf(w, tw + nw + 48.0);
+  }
+  return mythic_clampf(w, 180.0, 620.0);
+}
+
+fn cp_paint_cb(ui: MythicUi*, p: MythicPainter*, box: MythicRect, ud: rawptr) {
+  mythic_paint_fill(p, box, mythic_radius(4.0), C_RAISED);
+  mythic_paint_stroke(p, box, mythic_radius(4.0), 1.0, C_BORDER);
+  var shown: int32 = g_cm.n;
+  if (shown > 8) { shown = 8; }
+  var st: MythicTextStyle = mono(14.0);
+  var nst: MythicTextStyle = mono(12.0);
+  var y: float32 = box.y + 4.0;
+  for i in 0..shown {
+    var c: MercCand* = &g_cm.c[i];
+    if (i == g_cp_sel) { mythic_paint_fill(p, rect(box.x + 1.0, y + 5.0, 2.0, 16.0), mythic_radius(0.0), C_VIOLET); }
+    var col: uint32 = C_TEXT2;
+    if (i == g_cp_sel) { col = C_TEXT; }
+    text_at(p, merc_complete_text(&g_cm, i), st, box.x + 12.0, y, 26.0, col);
+    fmt_reset();
+    if (c->count > 0) {
+      fmt_group(c->count);
+      if (c->capped) { fmt_s("+"); }
+    } else {
+      fmt_s(merc_complete_note(&g_cm, i));
+    }
+    var nw: float32 = mythic_text_width(p->fonts, mythic_paint_text_spec(p->scale, nst), fmt_view()) / p->scale;
+    var nx: float32 = mythic_maxf(box.x + box.w - 12.0 - nw, box.x + 12.0 + (float32)c->text_len * adv_of(14.0) + 16.0);
+    mythic_dl_push_clip(p->dl, mythic_paint_dev_rect(p, rect(box.x, box.y, box.w - 8.0, box.h)), 0.0);
+    text_at(p, fmt_view(), nst, nx, y, 26.0, C_MUTED);
+    mythic_dl_pop_clip(p->dl);
+    y = y + 26.0;
+  }
+  if (g_cm.more) { text_at(p, "more", nst, box.x + 12.0, y, 20.0, C_MUTED); }
+}
+
+fn ghost_paint_cb(ui: MythicUi*, p: MythicPainter*, box: MythicRect, ud: rawptr) {
+  var c0: MercCand* = &g_cm.c[g_cp_sel];
+  var t: string = merc_complete_text(&g_cm, g_cp_sel);
+  var word: int64 = c0->to - c0->from;
+  if (word >= (int64)t.length) { return; }
+  var rest: string;
+  rest.chars = t.chars + word;
+  rest.length = (uint64)((int64)t.length - word);
+  text_at(p, rest, mono(14.0), box.x, box.y, box.h, alpha(C_MUTED, 0.8));
+}
+
+fn complete_overlay(ui: MythicUi*, cid: uint64) {
+  if (!g_cp_show) { return; }
+  var c0: MercCand* = &g_cm.c[0];
+  var adv: float32 = adv_of(14.0);
+  var shown: int32 = g_cm.n;
+  if (shown > 8) { shown = 8; }
+  var h: float32 = (float32)shown * 26.0 + 8.0;
+  if (g_cm.more) { h = h + 20.0; }
+  var lid: uint64 = mythic_id(ui, "cplist");
+  var b: MythicBox = { id: lid, width: mythic_fixed(cp_row_w()), height: mythic_fixed(h) };
+  b.floating.attach = MYTHIC_ATTACH_ELEMENT;
+  b.floating.target = cid;
+  b.floating.self_anchor = 6;
+  b.floating.target_anchor = 0;
+  b.floating.dx = (float32)c0->from * adv;
+  b.floating.dy = -6.0;
+  b.floating.z = 50;
+  b.floating.clamp_margin = 8.0;
+  mythic_box_begin(ui, b);
+  var r: MythicResp = mythic_interact(ui, lid, MYTHIC_SENSE_CLICK);
+  mythic_end(ui);
+  mythic_node_paint(ui, &cp_paint_cb, (rawptr)0);
+  if (r.clicked && ui->pass == 0) {
+    var row: int32 = (int32)((ui->in.mouse.y - r.rect.y - 4.0) / 26.0);
+    if (row >= 0 && row < shown) {
+      cp_accept(ui, row, false);
+      g_focused_once = false;
+    }
+  }
+  var cur: int64 = input_cursor(ui, cid);
+  if (cur == (int64)mythic_textbuf_str(&g_input).length && c0->to == cur) {
+    var gid: uint64 = mythic_id(ui, "cpghost");
+    var gb: MythicBox = { id: gid, width: mythic_fixed(360.0), height: mythic_fixed(36.0) };
+    gb.floating.attach = MYTHIC_ATTACH_ELEMENT;
+    gb.floating.target = cid;
+    gb.floating.self_anchor = 0;
+    gb.floating.target_anchor = 0;
+    gb.floating.dx = 12.0 + (float32)cur * adv;
+    gb.floating.z = 40;
+    gb.floating.passthrough = true;
+    mythic_box_begin(ui, gb);
+    mythic_end(ui);
+    mythic_node_paint(ui, &ghost_paint_cb, (rawptr)0);
+  }
+}
+
+fn console(ui: MythicUi*, log_h: float32) {
+  mythic_column_begin(ui, { width: mythic_grow(), pad: mythic_pad_xy(32.0, 0.0), bg: C_RAISED });
+    if (log_h > 0.0) {
+      log_panel(ui, log_h);
+    } else {
+      gap(ui, 12.0);
+    }
+    mythic_row_begin(ui, { width: mythic_grow(), gap: 12, align_y: MYTHIC_ALIGN_CENTER });
+      var cid: uint64 = mythic_id(ui, "##cmd");
+      if (!g_focused_once) {
+        mythic_focus_set(ui, cid);
+        g_focused_once = true;
+      }
+      if (g_open_end > 0 && ui->pass == 0) {
+        if (g_input_focused) {
+          var ke: MythicKeyEvent;
+          ke.key = MYTHIC_KEY_END;
+          mythic_vec_push<MythicKeyEvent>(&ui->in.keys, ke);
+          g_open_end = 0;
+        }
+      }
+      mythic_text_input_ex(ui, "##cmd", &g_input, { placeholder: "", width: mythic_grow() });
+      var lr: MythicResp = mythic_last(ui);
+      if (ui->pass == 0) { g_input_focused = lr.focused; }
+      complete_update(ui, cid, lr.focused);
+      complete_overlay(ui, cid);
+      if (lr.submitted) {
+        submit();
+      } else if (lr.focused && ui->pass == 0 && g_hist_n > 0) {
+        if (mythic_key_pressed(ui, MYTHIC_KEY_UP, -1)) {
+          if (g_hist_at < 0) { g_hist_at = g_hist_n - 1; } else if (g_hist_at > 0) { g_hist_at = g_hist_at - 1; }
+          mythic_textbuf_set(&g_input, line_view((uint8*)g_hist[g_hist_at]));
+        } else if (mythic_key_pressed(ui, MYTHIC_KEY_DOWN, -1) && g_hist_at >= 0) {
+          g_hist_at = g_hist_at + 1;
+          if (g_hist_at >= g_hist_n) {
+            g_hist_at = -1;
+            mythic_textbuf_set(&g_input, "");
+          } else {
+            mythic_textbuf_set(&g_input, line_view((uint8*)g_hist[g_hist_at]));
+          }
+        }
+      }
+      if (!g_engine_busy) { rules_scan(); }
+      if (g_rules_n > 0 || g_go || g_engine_busy) {
+        if (g_go) {
+          if (link(ui, "Stop", "stop", true)) { g_go = false; }
+        } else if (link(ui, "Run all", "runall", false)) {
+          go_start();
+        }
+        if (run_button(ui, "Step")) { q_text("step"); }
+      } else if (run_button(ui, "Run")) {
+        submit();
+        g_focused_once = false;
+      }
+    mythic_end(ui);
+    mythic_row_begin(ui, { width: mythic_grow(), height: mythic_fixed(40.0), align_y: MYTHIC_ALIGN_CENTER, gap: 16 });
+      mythic_spacer(ui);
+      fmt_reset();
+      if (g_q_len > 0) {
+        fmt_group(g_q_len);
+        fmt_s(" waiting · ");
+      }
+      if (g_watch_name.length > (uint64)0) {
+        fmt_s("Watching ");
+        fmt_s(g_watch_name);
+        fmt_s(" · ");
+      }
+      if (g_use_stdin && !g_stdin.eof) { fmt_s("Reading stdin · "); }
+      fmt_s("help · ctrl+l log · frame ");
+      fmt_tenths((int64)mythic_iround(mythic_frame_ms(ui) * 10.0));
+      fmt_s(" ms");
+      txt(ui, fmt_view(), sans(12.0), C_MUTED);
+    mythic_end(ui);
+  mythic_end(ui);
+}
+
+fn go_start() {
+  g_go = true;
+  g_go_ran = 0;
+  log_s("> go", LL_CMD);
+}
+
+fn keys(ui: MythicUi*) {
+  g_esc_eaten = false;
+  complete_keys(ui);
+  if (mythic_key_pressed(ui, 76, MYTHIC_MOD_CTRL)) {
+    if (g_console_big) {
+      g_console_big = false;
+      g_log_h = 0.0;
+    } else if (g_log_h <= 0.0) {
+      g_log_h = log_default(ui);
+    } else {
+      g_console_big = true;
+    }
+  }
+  if (g_go && mythic_key_pressed(ui, MYTHIC_KEY_ESCAPE, -1)) {
+    g_go = false;
+    log_s("stopped", LL_NOTE);
+  }
+  if (g_results && !g_go && !g_esc_eaten && mythic_key_pressed(ui, MYTHIC_KEY_ESCAPE, -1)) {
+    if (mythic_textbuf_str(&g_input).length > (uint64)0) {
+      mythic_textbuf_set(&g_input, "");
+    } else if (g_lv_mode == 2) {
+      lv_set(1, g_lv_var, 0);
+    } else {
+      g_results = false;
+    }
+    g_focused_once = false;
+  }
+  if (g_results) {
+    var page: float32 = (float32)(lv_rows_visible() - 1);
+    if (mythic_key_pressed(ui, MYTHIC_KEY_PAGE_DOWN, -1)) { g_lv_top = g_lv_top + page; }
+    if (mythic_key_pressed(ui, MYTHIC_KEY_PAGE_UP, -1)) { g_lv_top = g_lv_top - page; }
+    var empty_line: bool = mythic_textbuf_str(&g_input).length == (uint64)0;
+    if (empty_line || !g_input_focused) {
+      if (mythic_key_pressed(ui, MYTHIC_KEY_HOME, -1)) { g_lv_top = 0.0; }
+      if (mythic_key_pressed(ui, MYTHIC_KEY_END, -1)) { g_lv_top = (float32)lv_count(); }
+    }
+    lv_clamp();
+  }
+  if (g_input_focused) { return; }
+  if (mythic_key_pressed(ui, 70, 0)) { g_fit_all = true; }
+  if (mythic_key_pressed(ui, 72, 0)) {
+    hm_clear(&g_user);
+    hm_clear(&g_more);
+    cam_home();
+  }
+  if (mythic_key_pressed(ui, 84, 0)) {
+    g_follow = !g_follow;
+    if (g_follow) { g_focus_new = true; }
+  }
+  if (mythic_key_pressed(ui, MYTHIC_KEY_ENTER, -1) || mythic_key_pressed(ui, 73, 0)) { g_focused_once = false; }
+  if (mythic_key_pressed(ui, 83, 0)) { q_text("step"); }
+  if (mythic_key_pressed(ui, 66, 0)) { g_side_hidden = !g_side_hidden; }
+  if (mythic_key_pressed(ui, 66, MYTHIC_MOD_SHIFT)) {
+    g_side_left = !g_side_left;
+    g_side_hidden = false;
+  }
+  if (mythic_key_pressed(ui, 71, 0) && !g_go) { go_start(); }
+}
+
+fn busy() -> bool {
+  return g_go || g_engine_busy || g_shot_pan || g_q_len > 0 || g_del_t0 >= 0.0 || g_cam_moving || g_drag || g_count_pending ||
+         (g_anim_kind != AN_NONE && anim_age() < 2.7) || (hits_live() && g_now - g_hit_t0 < 1.3) || moving();
+}
+
+var g_side_w: float32 = -1.0;
+var g_log_h: float32 = -1.0;
+var g_side_hidden: bool = false;
+var g_side_left: bool = false;
+var g_div_drag: int32 = 0;
+var g_div_from: float32 = 0.0;
+var g_div_start: float32 = 0.0;
+var g_div_hot: int32 = 0;
+var g_prefs_loaded: bool = false;
+var g_prefs_saved: MercBuf;
+var g_win: MythicVec2;
+
+const LOG_LINE: float32 = 20.0;
+
+fn side_default(ui: MythicUi*) -> float32 {
+  if (ui->size.x < 1300.0) { return 290.0; }
+  return 340.0;
+}
+
+fn log_default(ui: MythicUi*) -> float32 {
+  if (ui->size.y < 800.0) { return 3.0 * LOG_LINE + 20.0; }
+  return 5.0 * LOG_LINE + 24.0;
+}
+
+fn log_min() -> float32 { return 3.0 * LOG_LINE + 20.0; }
+
+fn clamp_layout(ui: MythicUi*) {
+  if (g_side_w < 0.0) { g_side_w = side_default(ui); }
+  if (g_log_h < 0.0) { g_log_h = log_default(ui); }
+  var maxw: float32 = mythic_maxf(240.0, mythic_floorf(ui->size.x * 0.5));
+  g_side_w = mythic_clampf(g_side_w, 240.0, maxw);
+  var maxh: float32 = mythic_floorf((ui->size.y - 60.0) * 0.66);
+  if (g_log_h > 0.0) { g_log_h = mythic_clampf(g_log_h, log_min(), mythic_maxf(log_min(), maxh)); }
+}
+
+fn prefs_path(out: MercBuf*) -> bool {
+  var home: string = env_get_or("HOME", "");
+  if (home.length == (uint64)0) { return false; }
+  merc_buf_text(out, home);
+  merc_buf_text(out, "/.cache/merc/window.txt");
+  merc_buf_push(out, 0);
+  return true;
+}
+
+fn prefs_num(p: uint8*, n: int64, at: int64*) -> int64 {
+  var i: int64 = *at;
+  while (i < n && (p[i] < 48 || p[i] > 57)) { i = i + 1; }
+  var v: int64 = 0;
+  while (i < n && p[i] >= 48 && p[i] <= 57) {
+    v = v * 10 + (int64)(p[i] - 48);
+    i = i + 1;
+  }
+  *at = i;
+  return v;
+}
+
+fn prefs_load() {
+  var path: MercBuf;
+  if (!prefs_path(&path)) { return; }
+  var fd: int64 = syscall(2, (int64)path.data, 0, 0);
+  merc_buf_free(&path);
+  if (fd < 0) { return; }
+  var buf: uint8[128];
+  var n: int64 = syscall(0, fd, (int64)&buf[0], 127);
+  syscall(3, fd);
+  if (n <= 0) { return; }
+  var at: int64 = 0;
+  var sw: int64 = prefs_num(&buf[0], n, &at);
+  var lh: int64 = prefs_num(&buf[0], n, &at);
+  var hid: int64 = prefs_num(&buf[0], n, &at);
+  var left: int64 = prefs_num(&buf[0], n, &at);
+  if (sw >= 240 && sw < 4000) { g_side_w = (float32)sw; }
+  if (lh < 4000) { g_log_h = (float32)lh; }
+  g_side_hidden = hid == 1;
+  g_side_left = left == 1;
+}
+
+fn prefs_save() {
+  fmt_reset();
+  fmt_i((int64)g_side_w);
+  fmt_c(32);
+  fmt_i((int64)g_log_h);
+  fmt_c(32);
+  if (g_side_hidden) { fmt_c(49); } else { fmt_c(48); }
+  fmt_c(32);
+  if (g_side_left) { fmt_c(49); } else { fmt_c(48); }
+  fmt_c(10);
+  if (g_prefs_saved.len == g_fmt.len && memcmp((rawptr)g_prefs_saved.data, (rawptr)g_fmt.data, g_fmt.len) == 0) { return; }
+  merc_buf_clear(&g_prefs_saved);
+  merc_buf_add(&g_prefs_saved, g_fmt.data, g_fmt.len);
+  var path: MercBuf;
+  if (!prefs_path(&path)) { return; }
+  var fd: int64 = syscall(2, (int64)path.data, 0x241, 0x1A4);
+  merc_buf_free(&path);
+  if (fd < 0) { return; }
+  syscall(1, fd, (int64)g_prefs_saved.data, g_prefs_saved.len);
+  syscall(3, fd);
+}
+
+fn divider_paint_cb(ui: MythicUi*, p: MythicPainter*, box: MythicRect, ud: rawptr) {
+  var which: int32 = (int32)(int64)ud;
+  var col: uint32 = C_BORDER;
+  if (g_div_hot == which || g_div_drag == which) { col = C_VIOLET; }
+  if (which == 1) {
+    mythic_paint_fill(p, rect(box.x + mythic_floorf(box.w / 2.0), box.y, 1.0, box.h), mythic_radius(0.0), col);
+  } else {
+    mythic_paint_fill(p, rect(box.x, box.y + mythic_floorf(box.h / 2.0), box.w, 1.0), mythic_radius(0.0), col);
+  }
+}
+
+fn divider(ui: MythicUi*, which: int32) {
+  var id: uint64 = mythic_id(ui, "divider");
+  if (which == 2) { id = mythic_id(ui, "divider2"); }
+  if (which == 1) {
+    mythic_box_begin(ui, { id: id, width: mythic_fixed(9.0), height: mythic_grow() });
+  } else {
+    mythic_box_begin(ui, { id: id, width: mythic_grow(), height: mythic_fixed(9.0) });
+  }
+  var r: MythicResp = mythic_interact(ui, id, MYTHIC_SENSE_CLICK | MYTHIC_SENSE_DRAG);
+  mythic_end(ui);
+  mythic_node_paint(ui, &divider_paint_cb, (rawptr)(int64)which);
+  if (r.hovered || g_div_drag == which) {
+    if (which == 1) { mythic_set_cursor(ui, MYTHIC_CURSOR_RESIZE_H); } else { mythic_set_cursor(ui, MYTHIC_CURSOR_RESIZE_V); }
+  }
+  if (ui->pass != 0) { return; }
+  if (r.hovered) { g_div_hot = which; } else if (g_div_hot == which) { g_div_hot = 0; }
+  var m: MythicVec2 = ui->in.mouse;
+  if (r.pressed) {
+    if (g_div_drag != which) {
+      g_div_drag = which;
+      if (which == 1) {
+        g_div_from = m.x;
+        g_div_start = g_side_w;
+      } else {
+        g_div_from = m.y;
+        if (g_console_big) {
+          g_log_h = mythic_floorf((ui->size.y - 60.0) * 0.66);
+          g_console_big = false;
+        }
+        g_div_start = g_log_h;
+        if (g_div_start <= 0.0) { g_div_start = 0.0; }
+      }
+    } else if (which == 1) {
+      var dx: float32 = m.x - g_div_from;
+      if (g_side_left) { g_side_w = g_div_start + dx; } else { g_side_w = g_div_start - dx; }
+    } else {
+      var nh: float32 = g_div_start - (m.y - g_div_from);
+      if (nh < log_min() * 0.6) { g_log_h = 0.0; } else { g_log_h = mythic_maxf(nh, log_min()); }
+    }
+  } else if (g_div_drag == which) {
+    g_div_drag = 0;
+  }
+  if (r.clicked && r.click_count >= 2) {
+    if (which == 1) { g_side_w = side_default(ui); } else { g_log_h = log_default(ui); }
+  }
+}
+
+fn results_bar(ui: MythicUi*) {
+  mythic_row_begin(ui, { width: mythic_grow(), height: mythic_fixed(52.0), pad: mythic_pad_xy(48.0, 0.0), gap: 18, align_y: MYTHIC_ALIGN_CENTER });
+    var pst: MythicTextStyle = mono(15.0);
+    txt(ui, merc_buf_view(&g_hit_pattern), pst, C_TEXT);
+    fmt_reset();
+    fmt_group(g_find_found);
+    if (g_find_found == 1) { fmt_s(" match"); } else { fmt_s(" matches"); }
+    txt(ui, fmt_view(), sans(14.0), C_TEXT2);
+    txt(ui, merc_buf_view(&g_find_took), mono(13.0), C_MUTED);
+    if (g_find_found > merc_count(&g_res)) {
+      fmt_reset();
+      fmt_s("first ");
+      fmt_group(merc_count(&g_res));
+      fmt_s(" shown");
+      txt(ui, fmt_view(), sans(13.0), C_MUTED);
+    }
+    mythic_spacer(ui);
+    if (link(ui, "Show all", "showall", true)) { g_results = false; }
+  mythic_end(ui);
+  mythic_row_begin(ui, { width: mythic_grow(), height: mythic_fixed(36.0), pad: mythic_pad_xy(48.0, 0.0), gap: 22, align_y: MYTHIC_ALIGN_CENTER });
+    if (g_lv_mode == 2) {
+      if (link(ui, "Back", "lvback", true)) { lv_set(1, g_lv_var, 0); }
+      var e: VEntry* = &g_ve[g_lv_entry];
+      var vst: MythicTextStyle = mono(14.0);
+      vst.flags = MYTHIC_TEXT_ELLIPSIS;
+      txt(ui, bview(&g_vname, g_vname_off[g_lv_var], g_vname_len[g_lv_var]), mono(14.0), C_AMBER);
+      mythic_box_begin(ui, { width: mythic_grow(), clip: true });
+        txt(ui, bview(&g_vtext, e->off, e->len), vst, C_TEXT);
+      mythic_end(ui);
+      fmt_reset();
+      fmt_group(g_list_n);
+      fmt_s(" rows");
+      txt(ui, fmt_view(), sans(13.0), C_MUTED);
+    } else {
+      if (link(ui, "All", "lvall", g_lv_mode == 0)) { lv_set(0, 0, 0); }
+      for v: int32 in 0..g_vars {
+        fmt_reset();
+        fmt_s("by ");
+        fmt_s(bview(&g_vname, g_vname_off[v], g_vname_len[v]));
+        mythic_push_id_int(ui, (int64)v);
+        if (link(ui, fmt_view(), "lvby", g_lv_mode == 1 && g_lv_var == v)) { lv_set(1, v, 0); }
+        mythic_pop_id(ui);
+      }
+      mythic_spacer(ui);
+      if (g_vt_capped) {
+        fmt_reset();
+        fmt_s("grouped over the first ");
+        fmt_group(VT_CAP);
+        txt(ui, fmt_view(), sans(13.0), C_MUTED);
+      }
+    }
+  mythic_end(ui);
+  rule_h(ui);
+}
+
+fn tree_row(ui: MythicUi*) {
+  mythic_row_begin(ui, { width: mythic_grow(), height: mythic_grow() });
+    if (!g_side_hidden && g_side_left) {
+      side(ui, g_side_w);
+      divider(ui, 1);
+    }
+    mythic_column_begin(ui, { width: mythic_grow(), height: mythic_grow() });
+      if (g_results) { results_bar(ui); }
+      canvas(ui);
+    mythic_end(ui);
+    if (!g_side_hidden && !g_side_left) {
+      divider(ui, 1);
+      side(ui, g_side_w);
+    }
+  mythic_end(ui);
+}
+
+fn frame(ui: MythicUi*, ud: rawptr) {
+  if (!g_themed) {
+    g_themed = true;
+    mythic_set_theme(ui, theme());
+  }
+  if (ui->pass == 0) {
+    var dt: float32 = mythic_dt(ui);
+    g_reduced = ui->reduced_motion || mythic_theme(ui)->reduced_motion;
+    g_now = g_now + (float64)dt;
+    g_adv = mythic_text_size(ui, "0000000000", mono(12.0)).x / 10.0;
+    keys(ui);
+    g_ui_node.turn();
+    engine_check();
+    pump_queue();
+    if (g_results && g_sh.serial != g_results_serial) { g_results = false; }
+    go_pump();
+    if (g_sh.quit) {
+      g_sh.quit = false;
+      log_s("Quit does nothing here. Close the window instead.", LL_NOTE);
+    }
+    if (!g_engine_busy && !g_results) { layout(); }
+    if (g_results) { g_count_pending = false; }
+    ease_positions(dt);
+    if (!g_cam_set && g_canvas.w > 0.0) {
+      g_cam_set = true;
+      cam_home();
+    }
+    if (g_fit_all && g_canvas.w > 0.0) {
+      g_fit_all = false;
+      cam_fit();
+    }
+    if (g_focus_new && g_follow && g_canvas.w > 0.0) {
+      g_focus_new = false;
+      cam_focus();
+    }
+    cam_step(dt);
+    var fm: float64 = (float64)mythic_frame_ms(ui);
+    g_frame_ms_sum = g_frame_ms_sum + fm;
+    if (fm > g_frame_ms_max) { g_frame_ms_max = fm; }
+    g_frame_n = g_frame_n + 1;
+  }
+  if (!g_prefs_loaded) {
+    g_prefs_loaded = true;
+    if (g_shot.length == (uint64)0) { prefs_load(); }
+  }
+  clamp_layout(ui);
+  var log_h: float32 = g_log_h;
+  if (g_console_big) { log_h = mythic_floorf((ui->size.y - 60.0) * 0.66); }
+  mythic_column_begin(ui, { width: mythic_grow(), height: mythic_grow(), bg: C_BG });
+    topbar(ui);
+    tree_row(ui);
+    divider(ui, 2);
+    console(ui, log_h);
+  mythic_end(ui);
+  if (ui->pass == 0 && g_div_drag == 0 && g_shot.length == (uint64)0) { prefs_save(); }
+  if (busy()) {
+    mythic_request_frame_in(ui, 16);
+  } else if (merc_zip_depth(&g_sh.zip) > 0 && !g_reduced) {
+    mythic_request_frame_in(ui, 100);
+  } else {
+    mythic_request_frame_in(ui, 250);
+  }
+}
+
+var g_shot: string;
+var g_shot_w: float32 = 1500.0;
+var g_shot_h: float32 = 950.0;
+var g_shot_wait: int64 = 600;
+var g_shot_pan: bool = false;
+var g_shot_settle: int64 = 0;
+var g_shot_at: int64 = 0;
+var g_acts: string[32];
+var g_act_n: int32 = 0;
+var g_act_i: int32 = 0;
+var g_pending_click: bool = false;
+var g_dg_phase: int32 = 0;
+var g_dg_x0: float32 = 0.0;
+var g_dg_y0: float32 = 0.0;
+var g_dg_x1: float32 = 0.0;
+var g_dg_y1: float32 = 0.0;
+var g_release_at: int64 = 0;
+var g_click_x: float32 = 0.0;
+var g_click_y: float32 = 0.0;
+
+fn push_key(plat: MythicPlatform*, key: int32) {
+  var ev: MythicEvent;
+  ev.kind = MYTHIC_EV_KEY_DOWN;
+  ev.key = key;
+  mythic_headless_push(plat, ev);
+  var up: MythicEvent;
+  up.kind = MYTHIC_EV_KEY_UP;
+  up.key = key;
+  mythic_headless_push(plat, up);
+}
+
+fn run_act(plat: MythicPlatform*, a: string) {
+  if (a == "key:up") {
+    push_key(plat, MYTHIC_KEY_UP);
+    return;
+  }
+  if (a == "key:down") {
+    push_key(plat, MYTHIC_KEY_DOWN);
+    return;
+  }
+  if (a == "key:ctrl+l") {
+    var ev: MythicEvent;
+    ev.kind = MYTHIC_EV_KEY_DOWN;
+    ev.key = 76;
+    ev.mods = MYTHIC_MOD_CTRL;
+    mythic_headless_push(plat, ev);
+    return;
+  }
+  if (a == "key:tab") {
+    push_key(plat, MYTHIC_KEY_TAB);
+    return;
+  }
+  if (a == "key:down") {
+    push_key(plat, MYTHIC_KEY_DOWN);
+    return;
+  }
+  if (a == "key:end") {
+    push_key(plat, MYTHIC_KEY_END);
+    return;
+  }
+  if (a == "key:pgdn") {
+    push_key(plat, MYTHIC_KEY_PAGE_DOWN);
+    return;
+  }
+  if (a == "key:b") {
+    push_key(plat, 66);
+    return;
+  }
+  if (a == "key:shift+b") {
+    var sb: MythicEvent;
+    sb.kind = MYTHIC_EV_KEY_DOWN;
+    sb.key = 66;
+    sb.mods = MYTHIC_MOD_SHIFT;
+    mythic_headless_push(plat, sb);
+    return;
+  }
+  if (a == "key:esc") {
+    push_key(plat, MYTHIC_KEY_ESCAPE);
+    return;
+  }
+  if (a == "key:enter") {
+    push_key(plat, MYTHIC_KEY_ENTER);
+    return;
+  }
+  if (has_prefix(a, "drag:")) {
+    var dn: int64[4];
+    var dk: int32 = 0;
+    var dv: int64 = 0;
+    for dj: int64 in 5..(int64)a.length + 1 {
+      if (dj == (int64)a.length || a.chars[dj] == 44) {
+        if (dk < 4) { dn[dk] = dv; }
+        dk = dk + 1;
+        dv = 0;
+      } else {
+        dv = dv * 10 + (int64)((int32)a.chars[dj] - 48);
+      }
+    }
+    g_dg_x0 = (float32)dn[0];
+    g_dg_y0 = (float32)dn[1];
+    g_dg_x1 = (float32)dn[2];
+    g_dg_y1 = (float32)dn[3];
+    g_dg_phase = 1;
+    return;
+  }
+  if (has_prefix(a, "click:") || has_prefix(a, "wheel:")) {
+    var nums: int64[3];
+    var k: int32 = 0;
+    var v: int64 = 0;
+    var neg: bool = false;
+    for j: int64 in 6..(int64)a.length + 1 {
+      if (j == (int64)a.length || a.chars[j] == 44) {
+        if (k < 3) { if (neg) { nums[k] = 0 - v; } else { nums[k] = v; } }
+        k = k + 1;
+        v = 0;
+        neg = false;
+      } else if (a.chars[j] == 45) {
+        neg = true;
+      } else {
+        v = v * 10 + (int64)((int32)a.chars[j] - 48);
+      }
+    }
+    var mv: MythicEvent;
+    mv.kind = MYTHIC_EV_MOUSE_MOVE;
+    mv.x = (float32)nums[0];
+    mv.y = (float32)nums[1];
+    mythic_headless_push(plat, mv);
+    if (has_prefix(a, "wheel:")) {
+      var wv: MythicEvent;
+      wv.kind = MYTHIC_EV_WHEEL;
+      wv.x = mv.x;
+      wv.y = mv.y;
+      wv.wheel_y = (float32)nums[2];
+      mythic_headless_push(plat, wv);
+      return;
+    }
+    g_pending_click = true;
+    g_click_x = mv.x;
+    g_click_y = mv.y;
+    return;
+  }
+  for i: int64 in 0..(int64)a.length {
+    var ev: MythicEvent;
+    ev.kind = MYTHIC_EV_TEXT;
+    ev.codepoint = (uint32)a.chars[i];
+    mythic_headless_push(plat, ev);
+  }
+}
+var g_step_sum: float64 = 0.0;
+var g_step_max: float64 = 0.0;
+var g_step_n: int64 = 0;
+var g_busy_n: int64 = 0;
+var g_busy_max: float64 = 0.0;
+var g_busy_seen: int64 = 0;
+var g_cmd_max: float64 = 0.0;
+var g_busy_slow: int64 = 0;
+var g_layout_max: float64 = 0.0;
+
+fn shot_run() -> int32 {
+  var app: MythicApp* = mythic_app_create_headless({ title: "merc", width: g_shot_w, height: g_shot_h, dark: true }, 1.0);
+  if (app == 0) {
+    println("could not create the headless app");
+    return 1;
+  }
+  var plat: MythicPlatform* = mythic_app_platform(app);
+  var drained_at: int64 = -1;
+  var vt: int64 = 0;
+  var guard: int64 = 0;
+  var pan_frames: int64 = 0;
+  var pan_sum: float64 = 0.0;
+  var pan_max: float64 = 0.0;
+  while (guard < 20000) {
+    guard = guard + 1;
+    time_sleep_ms(4);
+    mythic_headless_advance_us(plat, 16000);
+    vt = vt + 16;
+    if (g_shot_pan && drained_at >= 0) {
+      g_cam_x = g_cam_x + 3.0;
+    }
+    if (g_dg_phase > 0) {
+      var ev: MythicEvent;
+      if (g_dg_phase == 1) {
+        ev.kind = MYTHIC_EV_MOUSE_MOVE;
+        ev.x = g_dg_x0;
+        ev.y = g_dg_y0;
+      } else if (g_dg_phase == 2) {
+        ev.kind = MYTHIC_EV_MOUSE_DOWN;
+        ev.button = 1;
+        ev.x = g_dg_x0;
+        ev.y = g_dg_y0;
+      } else if (g_dg_phase < 13) {
+        var t: float32 = (float32)(g_dg_phase - 2) / 10.0;
+        ev.kind = MYTHIC_EV_MOUSE_MOVE;
+        ev.x = g_dg_x0 + (g_dg_x1 - g_dg_x0) * t;
+        ev.y = g_dg_y0 + (g_dg_y1 - g_dg_y0) * t;
+      } else {
+        ev.kind = MYTHIC_EV_MOUSE_UP;
+        ev.button = 1;
+        ev.x = g_dg_x1;
+        ev.y = g_dg_y1;
+      }
+      mythic_headless_push(plat, ev);
+      g_dg_phase = g_dg_phase + 1;
+      if (g_dg_phase > 13) { g_dg_phase = 0; }
+      drained_at = vt;
+    }
+    if (g_pending_click && guard % 6 == 3) {
+      g_pending_click = false;
+      var dn: MythicEvent;
+      dn.kind = MYTHIC_EV_MOUSE_DOWN;
+      dn.button = 1;
+      dn.x = g_click_x;
+      dn.y = g_click_y;
+      mythic_headless_push(plat, dn);
+      g_release_at = guard + 2;
+    }
+    if (g_release_at > 0 && guard == g_release_at) {
+      g_release_at = 0;
+      var upv: MythicEvent;
+      upv.kind = MYTHIC_EV_MOUSE_UP;
+      upv.button = 1;
+      upv.x = g_click_x;
+      upv.y = g_click_y;
+      mythic_headless_push(plat, upv);
+    }
+    if (drained_at >= 0 && g_dg_phase == 0 && g_act_i < g_act_n && guard % 6 == 0) {
+      run_act(plat, g_acts[g_act_i]);
+      g_act_i = g_act_i + 1;
+      drained_at = vt;
+    }
+    var st0: int64 = time_mono_ns();
+    mythic_app_step(app, &frame, (rawptr)0, false);
+    var step_ms: float64 = (float64)(time_mono_ns() - st0) / 1000000.0;
+    if (g_q_len > 0 || g_lines_in > g_busy_seen) {
+      g_busy_seen = g_lines_in;
+      g_busy_n = g_busy_n + 1;
+      if (step_ms > g_busy_max) { g_busy_max = step_ms; }
+      if (step_ms > 16.0) { g_busy_slow = g_busy_slow + 1; }
+    }
+    if (drained_at >= 0) {
+      g_step_sum = g_step_sum + step_ms;
+      g_step_n = g_step_n + 1;
+      if (step_ms > g_step_max) { g_step_max = step_ms; }
+    }
+    var idle: bool = g_q_len == 0 && g_del_t0 < 0.0 && !g_count_pending && vt > g_shot_settle;
+    if (idle && drained_at < 0) {
+      drained_at = vt;
+      g_frame_ms_sum = 0.0;
+      g_frame_ms_max = 0.0;
+      g_frame_n = 0;
+    }
+    if (drained_at >= 0 && g_shot_pan && vt - drained_at > 100) {
+      var fm: float64 = (float64)mythic_frame_ms(mythic_app_ui(app));
+      pan_sum = pan_sum + fm;
+      pan_frames = pan_frames + 1;
+      if (fm > pan_max) { pan_max = fm; }
+    }
+    if (g_shot_at > 0 && vt >= g_shot_at) { break; }
+    if (g_shot_at <= 0 && drained_at >= 0 && vt - drained_at >= g_shot_wait) { break; }
+  }
+  var ok: bool = mythic_app_save_png(app, g_shot);
+  var frames: int64 = mythic_app_frames(app);
+  var avg10: int64 = 0;
+  if (g_frame_n > 0) { avg10 = (int64)(g_frame_ms_sum / (float64)g_frame_n * 100.0); }
+  var last10: int64 = (int64)((float64)mythic_frame_ms(mythic_app_ui(app)) * 100.0);
+  var lay10: int64 = (int64)(g_layout_ms * 100.0);
+  println("wrote {g_shot}: frames={frames} expressions={merc_count(trie())} nodes={merc_node_count(trie())} vnodes={g_nv} cells={g_nc} layout_ms_x100={lay10} frame_ms_x100_last={last10} frame_ms_x100_avg={avg10}");
+  if (g_step_n > 0) {
+    var sa: int64 = (int64)(g_step_sum / (float64)g_step_n * 100.0);
+    var sm: int64 = (int64)(g_step_max * 100.0);
+    println("whole frame (layout, ui, raster): frames={g_step_n} ms_x100_avg={sa} ms_x100_max={sm}");
+  }
+  if (g_busy_n > 0) {
+    var bm: int64 = (int64)(g_busy_max * 100.0);
+    var cm: int64 = (int64)(g_cmd_max * 100.0);
+    var lm: int64 = (int64)(g_layout_max * 100.0);
+    println("frames while lines were queued: {g_busy_n} ms_x100_max={bm} lines_in={g_lines_in} queued_now={g_q_len} over_16ms={g_busy_slow} slowest_command_ms_x100={cm} slowest_layout_ms_x100={lm}");
+  }
+  if (g_cp_runs > 0) {
+    var ca: int64 = g_cp_ns_sum / g_cp_runs / 1000;
+    var cmx: int64 = g_cp_ns_max / 1000;
+    var cl: int64 = g_cp_ns / 1000;
+    println("completion: runs={g_cp_runs} last_us={cl} avg_us={ca} max_us={cmx} candidates={g_cm.n} more={g_cm.more} work={g_cm.work}");
+  }
+  if (pan_frames > 0) {
+    var pa: int64 = (int64)(pan_sum / (float64)pan_frames * 100.0);
+    var pm: int64 = (int64)(pan_max * 100.0);
+    println("pan: frames={pan_frames} frame_ms_x100_avg={pa} frame_ms_x100_max={pm}");
+  }
+  mythic_app_destroy(app);
+  if (!ok) { return 1; }
+  return 0;
+}
+
+fn arg(argv: cstring*, i: int32) -> string {
+  return str_from_cstr(argv[(int64)i]);
+}
+
+fn to_int(s: string) -> int64 {
+  var v: int64 = 0;
+  for i: int64 in 0..(int64)s.length {
+    var c: int32 = (int32)s.chars[i];
+    if (c < 48 || c > 57) { return v; }
+    v = v * 10 + (int64)(c - 48);
+  }
+  return v;
+}
+
+export fn merc_view(argc: int32, argv: cstring*) -> int32 {
+  merc_shell_init(&g_sh);
+  g_shot.length = (uint64)0;
+  g_watch_name.length = (uint64)0;
+  var i: int32 = 1;
+  while (i < argc) {
+    var a: string = arg(argv, i);
+    if (a == "--watch" && i + 1 < argc) {
+      g_watch_name = arg(argv, i + 1);
+      i = i + 2;
+    } else if (a == "--stdin") {
+      g_use_stdin = true;
+      i = i + 1;
+    } else if (a == "-c" && i + 1 < argc) {
+      q_text(arg(argv, i + 1));
+      i = i + 2;
+    } else if (a == "--shot" && i + 1 < argc) {
+      g_shot = arg(argv, i + 1);
+      i = i + 2;
+    } else if (a == "--size" && i + 2 < argc) {
+      g_shot_w = (float32)to_int(arg(argv, i + 1));
+      g_shot_h = (float32)to_int(arg(argv, i + 2));
+      i = i + 3;
+    } else if (a == "--wait" && i + 1 < argc) {
+      g_shot_wait = to_int(arg(argv, i + 1));
+      i = i + 2;
+    } else if (a == "--act" && i + 1 < argc) {
+      if (g_act_n < 32) {
+        g_acts[g_act_n] = arg(argv, i + 1);
+        g_act_n = g_act_n + 1;
+      }
+      i = i + 2;
+    } else if (a == "--at" && i + 1 < argc) {
+      g_shot_at = to_int(arg(argv, i + 1));
+      i = i + 2;
+    } else if (a == "--settle" && i + 1 < argc) {
+      g_shot_settle = to_int(arg(argv, i + 1));
+      i = i + 2;
+    } else if (a == "--open-all") {
+      g_open_all = true;
+      i = i + 1;
+    } else if (a == "--debug") {
+      g_debug = true;
+      i = i + 1;
+    } else if (a == "--pan") {
+      g_shot_pan = true;
+      i = i + 1;
+    } else if (a == "--help" || a == "-h") {
+      println("usage: merc [FILE...] [--watch FILE] [--stdin] [-c COMMAND]... [--no-gpu]\n       merc run FILE [--aux-path FILE]... [--steps N] [--cores N] [OUT]\n       merc shell [FILE...]");
+      return 0;
+    } else {
+      fmt_reset();
+      if (ends_with(a, ".mm2") || ends_with(a, ".metta")) { fmt_s("load "); } else { fmt_s("run "); }
+      fmt_s(a);
+      q_text(fmt_view());
+      i = i + 1;
+    }
+  }
+  io_start();
+  var rc: int32 = 0;
+  if (g_shot.length > (uint64)0) {
+    rc = shot_run();
+  } else {
+    rc = mythic_run({ title: "merc viewer", width: g_shot_w, height: g_shot_h, dark: true }, &frame, (rawptr)0);
+    if (rc != 0) {
+      println("could not open the window (is DISPLAY set, and is an X server running?)");
+    }
+  }
+  io_stop();
+  merc_shell_free(&g_sh);
+  return rc;
+}

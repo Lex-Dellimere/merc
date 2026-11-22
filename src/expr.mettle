@@ -1,0 +1,551 @@
+// expressions as bytes in prefix order. a parent says how many children
+// follow, then the children come. nothing closes it.
+//   00 + n   parent with n children, up to 63
+//   c0 + n   symbol of n bytes, 1 to 63, then the bytes
+//   c0       a variable the first time it shows up
+//   80 + i   variable i again
+// (edge a (to b)) is 03 c4 edge c1 a 02 c2 to c1 b
+// same bytes as MORK.
+
+import "std/mem";
+
+export const MERC_TAG_VAR: uint8 = 0xC0;
+export const MERC_MAX_ARITY: int32 = 63;
+export const MERC_MAX_SYMBOL: int32 = 63;
+export const MERC_MAX_VARS: int32 = 64;
+
+export struct MercBuf {
+  data: uint8*;
+  len: int64;
+  cap: int64;
+}
+
+export fn merc_buf_room(b: MercBuf*, more: int64) -> bool {
+  if (b->len + more <= b->cap) { return true; }
+  var cap: int64 = b->cap * 2;
+  if (cap < 64) { cap = 64; }
+  if (cap < b->len + more) { cap = b->len + more; }
+  var p: uint8* = realloc(b->data, cap);
+  if (p == 0) { return false; }
+  b->data = p;
+  b->cap = cap;
+  return true;
+}
+
+export fn merc_buf_push(b: MercBuf*, byte: uint8) -> bool {
+  if (!merc_buf_room(b, 1)) { return false; }
+  b->data[b->len] = byte;
+  b->len = b->len + 1;
+  return true;
+}
+
+export fn merc_buf_add(b: MercBuf*, src: uint8*, n: int64) -> bool {
+  if (n <= 0) { return true; }
+  if (!merc_buf_room(b, n)) { return false; }
+  memcpy(b->data + b->len, src, n);
+  b->len = b->len + n;
+  return true;
+}
+
+export fn merc_buf_text(b: MercBuf*, s: string) -> bool {
+  return merc_buf_add(b, s.chars, (int64)s.length);
+}
+
+export fn merc_buf_clear(b: MercBuf*) { b->len = 0; }
+
+export fn merc_buf_free(b: MercBuf*) {
+  if (b->data != 0) { free(b->data); }
+  b->data = (uint8*)0;
+  b->len = 0;
+  b->cap = 0;
+}
+
+export fn merc_buf_view(b: MercBuf*) -> string {
+  var s: string;
+  s.chars = b->data;
+  s.length = (uint64)b->len;
+  return s;
+}
+
+@inline fn merc_is_arity(tag: uint8) -> bool { return tag < 64; }
+@inline fn merc_is_symbol(tag: uint8) -> bool { return tag > 0xC0; }
+@inline fn merc_is_newvar(tag: uint8) -> bool { return tag == 0xC0; }
+@inline fn merc_is_ref(tag: uint8) -> bool { return tag >= 0x80 && tag < 0xC0; }
+
+// length of the expression at p, or -1 if it is cut short.
+export fn merc_span(p: uint8*, n: int64) -> int64 {
+  var i: int64 = 0;
+  var need: int64 = 1;
+  while (need > 0) {
+    if (i >= n) { return -1; }
+    var tag: uint8 = p[i];
+    i = i + 1;
+    need = need - 1;
+    if (tag < 64) {
+      need = need + (int64)tag;
+    } else if (tag > 0xC0) {
+      i = i + (int64)(tag & 63);
+    } else if (tag < 0x80) {
+      return -1;
+    }
+  }
+  if (i > n) { return -1; }
+  return i;
+}
+
+export fn merc_valid(e: string) -> bool {
+  return e.length != 0 && merc_span(e.chars, (int64)e.length) == (int64)e.length;
+}
+
+export fn merc_var_count(e: string) -> int32 {
+  var p: uint8* = e.chars;
+  var n: int64 = (int64)e.length;
+  var i: int64 = 0;
+  var vars: int32 = 0;
+  while (i < n) {
+    var tag: uint8 = p[i];
+    i = i + 1;
+    if (tag == 0xC0) { vars = vars + 1; }
+    else if (tag > 0xC0) { i = i + (int64)(tag & 63); }
+  }
+  return vars;
+}
+
+// variable names in the order they were first seen. parse a second text
+// with the same names and the same name gets the same number.
+export struct MercNames {
+  text: uint8[1024];
+  at: int32[64];
+  len: int32[64];
+  count: int32;
+  used: int32;
+}
+
+export fn merc_names_clear(names: MercNames*) {
+  names->count = 0;
+  names->used = 0;
+}
+
+export fn merc_name(names: MercNames*, i: int32) -> string {
+  var s: string;
+  if (i < 0 || i >= names->count) { return s; }
+  s.chars = &names->text[names->at[i]];
+  s.length = (uint64)names->len[i];
+  return s;
+}
+
+fn merc_name_find(names: MercNames*, p: uint8*, n: int64) -> int32 {
+  for i in 0..names->count {
+    if ((int64)names->len[i] != n) { continue; }
+    var q: uint8* = &names->text[names->at[i]];
+    var same: bool = true;
+    for j: int64 in 0..n {
+      if (q[j] != p[j]) { same = false; break; }
+    }
+    if (same) { return i; }
+  }
+  return -1;
+}
+
+fn merc_name_add(names: MercNames*, p: uint8*, n: int64) -> int32 {
+  if (names->count >= 64) { return -1; }
+  var keep: int64 = n;
+  if ((int64)names->used + keep > 1024) { keep = 1024 - (int64)names->used; }
+  var i: int32 = names->count;
+  names->at[i] = names->used;
+  names->len[i] = (int32)keep;
+  for j: int64 in 0..keep { names->text[(int64)names->used + j] = p[j]; }
+  names->used = names->used + (int32)keep;
+  names->count = i + 1;
+  return i;
+}
+
+@inline fn merc_is_space(c: uint8) -> bool { return c == 32 || c == 9 || c == 10 || c == 13; }
+
+export const MERC_ERR_EMPTY: int64 = -1;
+export const MERC_ERR_UNCLOSED: int64 = -2;
+export const MERC_ERR_STRAY_CLOSE: int64 = -3;
+export const MERC_ERR_ARITY: int64 = -4;
+export const MERC_ERR_SYMBOL: int64 = -5;
+export const MERC_ERR_VARS: int64 = -6;
+export const MERC_ERR_DEPTH: int64 = -7;
+export const MERC_ERR_MEMORY: int64 = -8;
+
+export fn merc_parse_error(code: int64) -> string {
+  if (code == MERC_ERR_EMPTY) { return "nothing to read"; }
+  if (code == MERC_ERR_UNCLOSED) { return "a ( is never closed"; }
+  if (code == MERC_ERR_STRAY_CLOSE) { return "a ) closes nothing"; }
+  if (code == MERC_ERR_ARITY) { return "more than 63 children in one expression"; }
+  if (code == MERC_ERR_SYMBOL) { return "a symbol longer than 63 bytes"; }
+  if (code == MERC_ERR_VARS) { return "more than 64 variables"; }
+  if (code == MERC_ERR_DEPTH) { return "nested deeper than 256"; }
+  if (code == MERC_ERR_MEMORY) { return "out of memory"; }
+  return "not an expression";
+}
+
+// read one expression from text into out.
+// returns the text bytes used or a MERC_ERR number.
+export fn merc_parse(text: string, out: MercBuf*, names: MercNames*) -> int64 {
+  var p: uint8* = text.chars;
+  var n: int64 = (int64)text.length;
+  var i: int64 = 0;
+  var start: int64 = out->len;
+  var open_at: int64[256];
+  var open_n: int32[256];
+  var depth: int32 = 0;
+  var done: bool = false;
+  var err: int64 = 0;
+  var known: int32 = names->count;
+  while (!done && err == 0) {
+    while (i < n && (merc_is_space(p[i]) || p[i] == 59)) {
+      if (p[i] == 59) {
+        while (i < n && p[i] != 10) { i = i + 1; }
+      } else {
+        i = i + 1;
+      }
+    }
+    if (i >= n) {
+      if (depth > 0) { err = MERC_ERR_UNCLOSED; } else { err = MERC_ERR_EMPTY; }
+      break;
+    }
+    var c: uint8 = p[i];
+    var item: bool = false;
+    if (c == 40) {
+      if (depth >= 256) { err = MERC_ERR_DEPTH; break; }
+      if (depth > 0) {
+        open_n[depth - 1] = open_n[depth - 1] + 1;
+        if (open_n[depth - 1] > 63) { err = MERC_ERR_ARITY; break; }
+      }
+      open_at[depth] = out->len;
+      open_n[depth] = 0;
+      depth = depth + 1;
+      if (!merc_buf_push(out, 0)) { err = MERC_ERR_MEMORY; break; }
+      i = i + 1;
+      continue;
+    }
+    if (c == 41) {
+      if (depth == 0) { err = MERC_ERR_STRAY_CLOSE; break; }
+      depth = depth - 1;
+      out->data[open_at[depth]] = (uint8)open_n[depth];
+      i = i + 1;
+      if (depth == 0) { done = true; }
+      continue;
+    }
+    if (depth > 0) {
+      open_n[depth - 1] = open_n[depth - 1] + 1;
+      if (open_n[depth - 1] > 63) { err = MERC_ERR_ARITY; break; }
+    }
+    if (c == 36) {
+      var from: int64 = i + 1;
+      i = from;
+      while (i < n && !merc_is_space(p[i]) && p[i] != 40 && p[i] != 41) { i = i + 1; }
+      var id: int32 = merc_name_find(names, p + from, i - from);
+      if (id < 0) {
+        id = merc_name_add(names, p + from, i - from);
+        if (id < 0) { err = MERC_ERR_VARS; break; }
+        if (!merc_buf_push(out, 0xC0)) { err = MERC_ERR_MEMORY; break; }
+      } else {
+        if (!merc_buf_push(out, (uint8)(0x80 + id))) { err = MERC_ERR_MEMORY; break; }
+      }
+      item = true;
+    } else if (c == 34) {
+      var q0: int64 = i;
+      i = i + 1;
+      var closed: bool = false;
+      while (i < n) {
+        var q: uint8 = p[i];
+        i = i + 1;
+        if (q == 34) { closed = true; break; }
+        if (q == 92 && i < n) { i = i + 1; }
+      }
+      if (!closed) { err = MERC_ERR_UNCLOSED; break; }
+      if (i - q0 > 63) { err = MERC_ERR_SYMBOL; break; }
+      if (!merc_buf_push(out, (uint8)(0xC0 + (i - q0))) || !merc_buf_add(out, p + q0, i - q0)) { err = MERC_ERR_MEMORY; break; }
+      item = true;
+    } else {
+      var s0: int64 = i;
+      while (i < n && !merc_is_space(p[i]) && p[i] != 40 && p[i] != 41) { i = i + 1; }
+      if (i - s0 > 63) { err = MERC_ERR_SYMBOL; break; }
+      if (!merc_buf_push(out, (uint8)(0xC0 + (i - s0))) || !merc_buf_add(out, p + s0, i - s0)) { err = MERC_ERR_MEMORY; break; }
+      item = true;
+    }
+    if (item && depth == 0) { done = true; }
+  }
+  if (err != 0) {
+    out->len = start;
+    names->count = known;
+    return err;
+  }
+  return i;
+}
+
+fn merc_write_var(out: MercBuf*, names: MercNames*, id: int32) {
+  merc_buf_push(out, 36);
+  if (names != 0 && id < names->count) {
+    merc_buf_add(out, &names->text[names->at[id]], (int64)names->len[id]);
+    return;
+  }
+  if (id < 10) {
+    merc_buf_push(out, (uint8)(97 + id));
+    return;
+  }
+  merc_buf_push(out, 120);
+  merc_buf_push(out, (uint8)(48 + id / 10));
+  merc_buf_push(out, (uint8)(48 + id % 10));
+}
+
+export fn merc_format(e: string, out: MercBuf*, names: MercNames*) -> bool {
+  var p: uint8* = e.chars;
+  var n: int64 = (int64)e.length;
+  if (merc_span(p, n) != n || n == 0) { return false; }
+  var left: int32[256];
+  var depth: int32 = 0;
+  var i: int64 = 0;
+  var vars: int32 = 0;
+  while (i < n) {
+    var tag: uint8 = p[i];
+    i = i + 1;
+    if (depth > 0) {
+      if (out->len > 0 && out->data[out->len - 1] != 40) { merc_buf_push(out, 32); }
+      left[depth - 1] = left[depth - 1] - 1;
+    }
+    if (tag < 64) {
+      merc_buf_push(out, 40);
+      if (tag == 0) {
+        merc_buf_push(out, 41);
+      } else {
+        if (depth >= 256) { return false; }
+        left[depth] = (int32)tag;
+        depth = depth + 1;
+        continue;
+      }
+    } else if (tag > 0xC0) {
+      var len: int64 = (int64)(tag & 63);
+      merc_buf_add(out, p + i, len);
+      i = i + len;
+    } else if (tag == 0xC0) {
+      merc_write_var(out, names, vars);
+      vars = vars + 1;
+    } else {
+      merc_write_var(out, names, (int32)(tag & 63));
+    }
+    while (depth > 0 && left[depth - 1] == 0) {
+      merc_buf_push(out, 41);
+      depth = depth - 1;
+    }
+  }
+  return true;
+}
+
+export struct MercUnify {
+  term: uint8*[2];
+  size: int64[2];
+  var_at: int32[128];
+  var_count: int32[2];
+  bound: int32[128];
+  to_side: int32[128];
+  to_at: int32[128];
+  out_id: int32[128];
+  out_count: int32;
+}
+
+fn merc_unify_scan(u: MercUnify*, side: int32) {
+  var p: uint8* = u->term[side];
+  var n: int64 = u->size[side];
+  var i: int64 = 0;
+  var vars: int32 = 0;
+  while (i < n) {
+    var tag: uint8 = p[i];
+    if (tag == 0xC0 && vars < 64) {
+      u->var_at[side * 64 + vars] = (int32)i;
+      vars = vars + 1;
+    }
+    i = i + 1;
+    if (tag > 0xC0) { i = i + (int64)(tag & 63); }
+  }
+  u->var_count[side] = vars;
+}
+
+fn merc_unify_var(u: MercUnify*, side: int32, at: int32) -> int32 {
+  var tag: uint8 = u->term[side][at];
+  if (tag == 0xC0) {
+    for v in 0..u->var_count[side] {
+      if (u->var_at[side * 64 + v] == at) { return side * 64 + v; }
+    }
+    return -1;
+  }
+  if (tag >= 0x80 && tag < 0xC0) { return side * 64 + (int32)(tag & 63); }
+  return -1;
+}
+
+fn merc_unify_walk(u: MercUnify*, side: int32*, at: int32*) {
+  while (true) {
+    var v: int32 = merc_unify_var(u, *side, *at);
+    if (v < 0 || u->bound[v] == 0) { return; }
+    *side = u->to_side[v];
+    *at = u->to_at[v];
+  }
+}
+
+fn merc_unify_occurs(u: MercUnify*, v: int32, side: int32, at: int32) -> bool {
+  var s: int32 = side;
+  var a: int32 = at;
+  merc_unify_walk(u, &s, &a);
+  var w: int32 = merc_unify_var(u, s, a);
+  if (w >= 0) { return w == v; }
+  var p: uint8* = u->term[s];
+  var tag: uint8 = p[a];
+  if (tag >= 64) { return false; }
+  var child: int32 = a + 1;
+  for k in 0..(int32)tag {
+    if (merc_unify_occurs(u, v, s, child)) { return true; }
+    child = child + (int32)merc_span(p + child, u->size[s] - (int64)child);
+  }
+  return false;
+}
+
+fn merc_unify_at(u: MercUnify*, side1: int32, at1: int32, side2: int32, at2: int32) -> bool {
+  var s1: int32 = side1;
+  var a1: int32 = at1;
+  var s2: int32 = side2;
+  var a2: int32 = at2;
+  merc_unify_walk(u, &s1, &a1);
+  merc_unify_walk(u, &s2, &a2);
+  var v1: int32 = merc_unify_var(u, s1, a1);
+  var v2: int32 = merc_unify_var(u, s2, a2);
+  if (v1 >= 0) {
+    if (v1 == v2) { return true; }
+    if (v2 < 0 && merc_unify_occurs(u, v1, s2, a2)) { return false; }
+    u->bound[v1] = 1;
+    u->to_side[v1] = s2;
+    u->to_at[v1] = a2;
+    return true;
+  }
+  if (v2 >= 0) {
+    if (merc_unify_occurs(u, v2, s1, a1)) { return false; }
+    u->bound[v2] = 1;
+    u->to_side[v2] = s1;
+    u->to_at[v2] = a1;
+    return true;
+  }
+  var p1: uint8* = u->term[s1];
+  var p2: uint8* = u->term[s2];
+  var tag: uint8 = p1[a1];
+  if (tag != p2[a2]) { return false; }
+  if (tag > 0xC0) {
+    var len: int32 = (int32)(tag & 63);
+    for k in 0..len {
+      if (p1[a1 + 1 + k] != p2[a2 + 1 + k]) { return false; }
+    }
+    return true;
+  }
+  var c1: int32 = a1 + 1;
+  var c2: int32 = a2 + 1;
+  for k2 in 0..(int32)tag {
+    if (!merc_unify_at(u, s1, c1, s2, c2)) { return false; }
+    c1 = c1 + (int32)merc_span(p1 + c1, u->size[s1] - (int64)c1);
+    c2 = c2 + (int32)merc_span(p2 + c2, u->size[s2] - (int64)c2);
+  }
+  return true;
+}
+
+export fn merc_unify(u: MercUnify*, a: string, b: string) -> bool {
+  u->term[0] = a.chars;
+  u->size[0] = (int64)a.length;
+  u->term[1] = b.chars;
+  u->size[1] = (int64)b.length;
+  for i in 0..128 {
+    u->bound[i] = 0;
+    u->out_id[i] = -1;
+  }
+  u->out_count = 0;
+  if (merc_span(a.chars, (int64)a.length) != (int64)a.length || a.length == 0) { return false; }
+  if (merc_span(b.chars, (int64)b.length) != (int64)b.length || b.length == 0) { return false; }
+  merc_unify_scan(u, 0);
+  merc_unify_scan(u, 1);
+  return merc_unify_at(u, 0, 0, 1, 0);
+}
+
+fn merc_unify_emit(u: MercUnify*, side: int32, at: int32, out: MercBuf*) {
+  var s: int32 = side;
+  var a: int32 = at;
+  merc_unify_walk(u, &s, &a);
+  var v: int32 = merc_unify_var(u, s, a);
+  if (v >= 0) {
+    if (u->out_id[v] < 0) {
+      u->out_id[v] = u->out_count;
+      u->out_count = u->out_count + 1;
+      merc_buf_push(out, 0xC0);
+    } else {
+      merc_buf_push(out, (uint8)(0x80 + (u->out_id[v] & 63)));
+    }
+    return;
+  }
+  var p: uint8* = u->term[s];
+  var tag: uint8 = p[a];
+  merc_buf_push(out, tag);
+  if (tag > 0xC0) {
+    merc_buf_add(out, p + a + 1, (int64)(tag & 63));
+    return;
+  }
+  if (tag >= 64) { return; }
+  var child: int32 = a + 1;
+  for k in 0..(int32)tag {
+    merc_unify_emit(u, s, child, out);
+    child = child + (int32)merc_span(p + child, u->size[s] - (int64)child);
+  }
+}
+
+// call before writing a new expression out. free variables number from zero again.
+export fn merc_unify_fresh(u: MercUnify*) {
+  for i in 0..128 { u->out_id[i] = -1; }
+  u->out_count = 0;
+}
+
+export fn merc_unify_out(u: MercUnify*, side: int32, number: int32, out: MercBuf*) -> bool {
+  if (side < 0 || side > 1 || number < 0 || number >= u->var_count[side]) { return false; }
+  merc_unify_emit(u, side, u->var_at[side * 64 + number], out);
+  return true;
+}
+
+// write shape with the variables of a filled in.
+// parse shape with the names a was parsed with.
+export fn merc_unify_fill(u: MercUnify*, shape: string, out: MercBuf*) -> bool {
+  return merc_unify_fill_from(u, shape, u->var_count[0], out);
+}
+
+export fn merc_unify_fill_from(u: MercUnify*, shape: string, base: int32, out: MercBuf*) -> bool {
+  var p: uint8* = shape.chars;
+  var n: int64 = (int64)shape.length;
+  if (n == 0 || merc_span(p, n) != n) { return false; }
+  var extra: int32[64];
+  for k in 0..64 { extra[k] = -1; }
+  var next: int32 = base;
+  var i: int64 = 0;
+  while (i < n) {
+    var tag: uint8 = p[i];
+    i = i + 1;
+    if (tag > 0xC0) {
+      merc_buf_push(out, tag);
+      merc_buf_add(out, p + i, (int64)(tag & 63));
+      i = i + (int64)(tag & 63);
+    } else if (tag < 64) {
+      merc_buf_push(out, tag);
+    } else {
+      var id: int32 = next;
+      if (tag == 0xC0) { next = next + 1; } else { id = (int32)(tag & 63); }
+      if (id < u->var_count[0]) {
+        merc_unify_emit(u, 0, u->var_at[id], out);
+      } else if (id < 64) {
+        if (extra[id] < 0) {
+          extra[id] = u->out_count;
+          u->out_count = u->out_count + 1;
+          merc_buf_push(out, 0xC0);
+        } else {
+          merc_buf_push(out, (uint8)(0x80 + (extra[id] & 63)));
+        }
+      }
+    }
+  }
+  return true;
+}

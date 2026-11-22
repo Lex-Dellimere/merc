@@ -1,0 +1,381 @@
+// pattern search. walks the pattern and the trie together with a zipper.
+// a pattern symbol takes that one byte. a pattern variable takes every
+// stored expression at that place. a stored variable can stand for a whole
+// pattern subexpression. the unifier has the last word when either side had
+// a variable the walk could not settle.
+// one frame per byte of depth, so it stops on a match and carries on later.
+
+import "std/mem";
+import "trie";
+import "expr";
+
+struct MercQFrame {
+  pi: int32;
+  praw: int32;
+  need: int32;
+  raw: int32;
+  tried: int32;
+  stage: int32;
+  nv: int32;
+  cur: int32;
+  loose: int32;
+}
+
+export struct MercQuery {
+  zip: MercZip;
+  pat: uint8*;
+  plen: int64;
+  pcap: int64;
+  frames: MercQFrame*;
+  fcap: int64;
+  from: int32[64];
+  to: int32[64];
+  nvars: int32;
+  has_ref: bool;
+  started: bool;
+  ended: bool;
+  exact: bool;
+  unified: bool;
+  uni: MercUnify;
+  pin: uint8*;
+  pin_len: int64;
+  limit: int64;
+  at_limit: bool;
+  steps: int64;
+  checks: int64;
+}
+
+fn merc_q_frame(q: MercQuery*, depth: int64) -> MercQFrame* {
+  if (depth >= q->fcap) {
+    var cap: int64 = q->fcap * 2;
+    if (cap < 64) { cap = 64; }
+    if (cap <= depth) { cap = depth + 1; }
+    var p: MercQFrame* = realloc(q->frames, cap * sizeof(MercQFrame));
+    if (p == 0) { return (MercQFrame*)0; }
+    q->frames = p;
+    q->fcap = cap;
+  }
+  return q->frames + depth;
+}
+
+fn merc_q_settle(q: MercQuery*, f: MercQFrame*, depth: int64) {
+  if (f->need != 0 || f->raw != 0 || f->praw != 0 || (int64)f->pi >= q->plen) { return; }
+  var p: uint8 = q->pat[f->pi];
+  if (p == 0xC0) {
+    if (f->nv < 64) { q->from[f->nv] = (int32)depth; }
+    f->cur = f->nv;
+    f->nv = f->nv + 1;
+    f->pi = f->pi + 1;
+    f->need = 1;
+  } else if (p >= 0x80 && p < 0xC0) {
+    f->cur = -1;
+    f->pi = f->pi + 1;
+    f->need = 1;
+  }
+}
+
+export fn merc_query_again(q: MercQuery*, pattern: string) -> bool {
+  merc_zip_reset(&q->zip);
+  q->started = false;
+  q->ended = true;
+  q->exact = false;
+  q->unified = false;
+  q->has_ref = false;
+  q->steps = 0;
+  q->checks = 0;
+  q->nvars = 0;
+  q->pin_len = 0;
+  q->limit = 0;
+  q->at_limit = false;
+  if (!merc_valid(pattern)) { return false; }
+  var n: int64 = (int64)pattern.length;
+  if (n > q->pcap) {
+    var p: uint8* = realloc(q->pat, n + 16);
+    if (p == 0) { return false; }
+    q->pat = p;
+    q->pcap = n + 16;
+  }
+  memcpy(q->pat, pattern.chars, n);
+  q->plen = n;
+  q->nvars = merc_var_count(pattern);
+  var i: int64 = 0;
+  while (i < n) {
+    var tag: uint8 = q->pat[i];
+    i = i + 1;
+    if (tag > 0xC0) { i = i + (int64)(tag & 63); }
+    else if (tag >= 0x80 && tag < 0xC0) { q->has_ref = true; }
+  }
+  q->ended = false;
+  return true;
+}
+
+export fn merc_query(t: MercTrie*, pattern: string) -> MercQuery {
+  var q: MercQuery;
+  q.zip = merc_zip(t);
+  merc_query_again(&q, pattern);
+  return q;
+}
+
+export fn merc_query_free(q: MercQuery*) {
+  merc_zip_free(&q->zip);
+  if (q->pat != 0) { free(q->pat); }
+  if (q->pin != 0) { free(q->pin); }
+  q->pin = (uint8*)0;
+  q->pin_len = 0;
+  if (q->frames != 0) { free(q->frames); }
+  q->pat = (uint8*)0;
+  q->pcap = 0;
+  q->frames = (MercQFrame*)0;
+  q->fcap = 0;
+  q->ended = true;
+}
+
+fn merc_q_enter(q: MercQuery*, depth: int64, pi: int32, praw: int32, need: int32, raw: int32, nv: int32, cur: int32, loose: int32) -> bool {
+  var f: MercQFrame* = merc_q_frame(q, depth);
+  if (f == 0) { return false; }
+  f->pi = pi;
+  f->praw = praw;
+  f->need = need;
+  f->raw = raw;
+  f->tried = -1;
+  f->stage = 0;
+  f->nv = nv;
+  f->cur = cur;
+  f->loose = loose;
+  if (need == 0 && raw == 0 && cur >= 0) {
+    if (cur < 64) { q->to[cur] = (int32)depth; }
+    f->cur = -1;
+  }
+  merc_q_settle(q, f, depth);
+  return true;
+}
+
+export fn merc_query_next(q: MercQuery*) -> bool {
+  if (q->ended) { return false; }
+  var z: MercZip* = &q->zip;
+  if (!q->started) {
+    q->started = true;
+    if (!merc_q_enter(q, 0, 0, 0, 0, 0, 0, -1, 0)) { q->ended = true; return false; }
+  }
+  q->unified = false;
+  q->at_limit = false;
+  while (true) {
+    var depth: int64 = merc_zip_depth(z);
+    var f: MercQFrame* = q->frames + depth;
+    var down: bool = false;
+    var allow: int32 = -1;
+    if (depth < q->pin_len) { allow = (int32)q->pin[depth]; }
+    if (q->limit > 0 && depth == q->limit) {
+      if (f->stage != 3) {
+        f->stage = 3;
+        q->at_limit = true;
+        return true;
+      }
+      merc_zip_back(z);
+      continue;
+    }
+    if (f->need > 0 || f->raw > 0) {
+      var b: int32 = merc_zip_next(z, f->tried + 1);
+      if (allow >= 0) {
+        b = -1;
+        if (f->tried < allow && merc_zip_next(z, allow) == allow) { b = allow; }
+      }
+      if (b >= 0) {
+        f->tried = b;
+        var need: int32 = f->need;
+        var raw: int32 = f->raw;
+        var loose: int32 = f->loose;
+        if (raw > 0) {
+          raw = raw - 1;
+        } else if (b < 64) {
+          need = need - 1 + b;
+        } else if (b > 0xC0) {
+          need = need - 1;
+          raw = b & 63;
+        } else {
+          need = need - 1;
+          if (b >= 0x80) { loose = 1; }
+        }
+        merc_zip_step(z, (uint8)b);
+        q->steps = q->steps + 1;
+        if (!merc_q_enter(q, depth + 1, f->pi, 0, need, raw, f->nv, f->cur, loose)) { q->ended = true; return false; }
+        down = true;
+      }
+    } else if ((int64)f->pi >= q->plen) {
+      if (f->stage == 0) {
+        f->stage = 2;
+        if (merc_zip_get(z, (uint64*)0)) {
+          if (f->loose == 0 && !q->has_ref) {
+            q->exact = true;
+            return true;
+          }
+          q->exact = false;
+          q->checks = q->checks + 1;
+          var pv: string;
+          pv.chars = q->pat;
+          pv.length = (uint64)q->plen;
+          if (merc_unify(&q->uni, pv, merc_zip_path(z))) {
+            q->unified = true;
+            return true;
+          }
+        }
+      }
+    } else {
+      var p: uint8 = q->pat[f->pi];
+      if (f->stage == 0) {
+        f->stage = 1;
+        if (f->praw > 0) { f->stage = 2; }
+        if ((allow < 0 || allow == (int32)p) && merc_zip_step(z, p)) {
+          q->steps = q->steps + 1;
+          var praw: int32 = 0;
+          if (f->praw > 0) { praw = f->praw - 1; }
+          else if (p > 0xC0) { praw = (int32)(p & 63); }
+          if (!merc_q_enter(q, depth + 1, f->pi + 1, praw, 0, 0, f->nv, -1, f->loose)) { q->ended = true; return false; }
+          down = true;
+        }
+      } else if (f->stage == 1) {
+        var lo: int32 = f->tried + 1;
+        if (lo < 0x80) { lo = 0x80; }
+        var v: int32 = merc_zip_next(z, lo);
+        if (allow >= 0) {
+          v = -1;
+          if (allow >= lo && merc_zip_next(z, allow) == allow) { v = allow; }
+        }
+        if (v >= 0 && v <= 0xC0) {
+          f->tried = v;
+          var skip: int64 = merc_span(q->pat + f->pi, q->plen - (int64)f->pi);
+          merc_zip_step(z, (uint8)v);
+          q->steps = q->steps + 1;
+          if (!merc_q_enter(q, depth + 1, f->pi + (int32)skip, 0, 0, 0, f->nv + merc_q_vars_in(q, f->pi, skip), -1, 1)) { q->ended = true; return false; }
+          down = true;
+        } else {
+          f->stage = 2;
+        }
+      }
+    }
+    if (down) { continue; }
+    if (f->need > 0 || f->raw > 0 || f->stage == 2 || (int64)f->pi >= q->plen) {
+      if (depth == 0) {
+        q->ended = true;
+        return false;
+      }
+      merc_zip_back(z);
+    }
+  }
+  return false;
+}
+
+fn merc_q_vars_in(q: MercQuery*, at: int32, n: int64) -> int32 {
+  var i: int64 = (int64)at;
+  var end: int64 = i + n;
+  var vars: int32 = 0;
+  while (i < end) {
+    var tag: uint8 = q->pat[i];
+    i = i + 1;
+    if (tag == 0xC0) { vars = vars + 1; }
+    else if (tag > 0xC0) { i = i + (int64)(tag & 63); }
+  }
+  return vars;
+}
+
+// splitting a search so its parts can run on other cores.
+// limit makes the walk stop at a depth and report each place it reached.
+// pin makes a walk take given bytes from the root.
+// run once with a limit and keep the paths, then run once per path pinned to it.
+export fn merc_query_limit(q: MercQuery*, depth: int64) { q->limit = depth; }
+
+export fn merc_query_edge(q: MercQuery*) -> bool { return q->at_limit; }
+
+export fn merc_query_pin(q: MercQuery*, path: string) -> bool {
+  var n: int64 = (int64)path.length;
+  var p: uint8* = realloc(q->pin, n + 1);
+  if (p == 0) { return false; }
+  memcpy(p, path.chars, n);
+  q->pin = p;
+  q->pin_len = n;
+  return true;
+}
+
+export fn merc_query_match(q: MercQuery*) -> string {
+  return merc_zip_path(&q->zip);
+}
+
+export fn merc_query_value(q: MercQuery*) -> uint64 {
+  var v: uint64 = 0;
+  merc_zip_get(&q->zip, &v);
+  return v;
+}
+
+export fn merc_query_vars(q: MercQuery*) -> int32 { return q->nvars; }
+
+fn merc_q_unify(q: MercQuery*) -> bool {
+  if (q->unified) { return true; }
+  var pv: string;
+  pv.chars = q->pat;
+  pv.length = (uint64)q->plen;
+  q->unified = merc_unify(&q->uni, pv, merc_zip_path(&q->zip));
+  return q->unified;
+}
+
+export fn merc_query_bind(q: MercQuery*, number: int32, out: MercBuf*) -> bool {
+  if (q->ended || number < 0 || number >= q->nvars) { return false; }
+  if (q->exact) {
+    return merc_buf_add(out, q->zip.path + q->from[number], (int64)(q->to[number] - q->from[number]));
+  }
+  if (!merc_q_unify(q)) { return false; }
+  merc_unify_fresh(&q->uni);
+  return merc_unify_out(&q->uni, 0, number, out);
+}
+
+export fn merc_query_fill(q: MercQuery*, shape: string, out: MercBuf*) -> bool {
+  if (q->ended || !merc_q_unify(q)) { return false; }
+  merc_unify_fresh(&q->uni);
+  return merc_unify_fill(&q->uni, shape, out);
+}
+
+export fn merc_add(t: MercTrie*, e: string, value: uint64) -> int32 {
+  if (!merc_valid(e)) { return MERC_FAILED; }
+  return merc_put(t, e, value);
+}
+
+export fn merc_match_count(t: MercTrie*, pattern: string) -> int64 {
+  var q: MercQuery = merc_query(t, pattern);
+  var n: int64 = 0;
+  while (merc_query_next(&q)) { n = n + 1; }
+  merc_query_free(&q);
+  return n;
+}
+
+// returns how many were new, or -1.
+export fn merc_transform(t: MercTrie*, pattern: string, shape: string, value: uint64) -> int64 {
+  var made: MercBuf;
+  var cuts: MercBuf;
+  var q: MercQuery = merc_query(t, pattern);
+  var bad: bool = false;
+  while (merc_query_next(&q)) {
+    var at: int64 = made.len;
+    if (!merc_query_fill(&q, shape, &made)) { bad = true; break; }
+    var size: int64 = made.len - at;
+    if (!merc_buf_add(&cuts, (uint8*)&size, 8)) { bad = true; break; }
+  }
+  merc_query_free(&q);
+  var added: int64 = 0;
+  if (!bad) {
+    var at2: int64 = 0;
+    var count: int64 = cuts.len / 8;
+    var sizes: int64* = (int64*)cuts.data;
+    for k: int64 in 0..count {
+      var e: string;
+      e.chars = made.data + at2;
+      e.length = (uint64)sizes[k];
+      var r: int32 = merc_put(t, e, value);
+      if (r == MERC_FAILED) { bad = true; break; }
+      if (r == MERC_ADDED) { added = added + 1; }
+      at2 = at2 + sizes[k];
+    }
+  }
+  merc_buf_free(&made);
+  merc_buf_free(&cuts);
+  if (bad) { return -1; }
+  return added;
+}

@@ -1,0 +1,9 @@
+/build/
+/.mbuild/
+/mettle.deps
+/mbuild.local.mettle
+/mbuild.lock
+/shots/
+/bench/
+/tests/
+/test_data/

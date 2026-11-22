@@ -1,0 +1,144 @@
+// the flat scan through alph. a search is one job for each million rows,
+// done on the gpu when there is one, where the rows stay between searches,
+// or on a core. alph starts on the first search that wants it and stays
+// for the rest of the process, so the gpu keeps one context. only
+// main.mettle imports this, the rest of merc never needs alph or a gpu.
+
+import "std/mem";
+import "std/time";
+import "std/gpu";
+import "alph/actor/actor";
+import "alph/machine/machine";
+import "trie";
+import "flat";
+
+const SCAN: Word = 0;
+const CHUNK: int64 = 16384;
+
+var g_m: AlphMachine;
+var g_state: int32 = 0;
+var g_gpu: int32 = 0;
+var g_f: MercFlat*;
+var g_first: int64 = 0;
+var g_count: int64 = 0;
+var g_masks: uint64*;
+var g_search: int64 = 0;
+var g_on_gpu: int64 = 0;
+var g_on_cores: int64 = 0;
+var g_dev_rows: int64 = 0;
+var g_dev_pat: int64 = 0;
+var g_dev_out: int64 = 0;
+var g_dev_gen: int64 = -1;
+var g_dev_search: int64 = -1;
+var g_job_ns: int64 = 0;
+
+kernel(block = 256) merc_scan_k(rows: int32*, pat: int32*, plen: int32, k: int32, outs: uint32*, total: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  var ok: bool = false;
+  if (i < total) {
+    ok = merc_flat_row_ok(rows + (int64)(i >> 6) * (int64)k * 64, i & 63, 64, k, pat, plen);
+  }
+  var m: uint32 = subgroup_ballot(ok, 0);
+  if ((thread.x & 31) == 0 && i < total) {
+    outs[i >> 5] = m;
+  }
+}
+
+fn chunk_of(job: AlphJob*, first: int64*) -> int64 {
+  *first = g_first + (int64)job->in * CHUNK;
+  var n: int64 = g_first + g_count - *first;
+  if (n > CHUNK) { n = CHUNK; }
+  return n;
+}
+
+fn on_core(job: AlphJob*) -> Word {
+  var t0: int64 = time_mono_ns();
+  var first: int64 = 0;
+  var n: int64 = chunk_of(job, &first);
+  merc_flat_scan_cpu(g_f, first, n, g_masks + (first - g_first));
+  g_job_ns = g_job_ns + time_mono_ns() - t0;
+  return 0;
+}
+
+// runs on the gpu's own core, the one thread that ever opens it.
+fn on_gpu(job: AlphJob*) -> Word {
+  if (g_gpu == 0) {
+    g_gpu = 2;
+    if (gpu_init() != 0) {
+      g_dev_pat = gpu_malloc(256);
+      g_dev_out = gpu_malloc(CHUNK * 8);
+      if (g_dev_pat != 0 && g_dev_out != 0) { g_gpu = 1; }
+    }
+    merc_flat_set_gpu(g_gpu);
+  }
+  if (g_gpu != 1) { return 1; }
+  var f: MercFlat* = g_f;
+  if (g_dev_gen != f->gen) {
+    if (g_dev_rows != 0) { gpu_free(g_dev_rows); }
+    var size: int64 = f->blocks * 64 * (int64)f->k * 4;
+    g_dev_rows = gpu_malloc(size);
+    g_dev_gen = -1;
+    if (g_dev_rows == 0 || gpu_to_device(g_dev_rows, (uint8*)f->rows, size) != 0) { return 1; }
+    g_dev_gen = f->gen;
+    g_dev_search = -1;
+  }
+  if (g_dev_search != g_search) {
+    if (gpu_to_device(g_dev_pat, (uint8*)&f->pat[0], (int64)f->plen * 4) != 0) { return 1; }
+    g_dev_search = g_search;
+  }
+  var t0: int64 = time_mono_ns();
+  var first: int64 = 0;
+  var n: int64 = chunk_of(job, &first);
+  var total: int32 = (int32)(n * 64);
+  dispatch merc_scan_k[work: total](g_dev_rows + first * (int64)f->k * 256, g_dev_pat, f->plen, f->k, g_dev_out, total);
+  if (gpu_sync() != 0 || gpu_to_host((uint8*)(g_masks + (first - g_first)), g_dev_out, n * 8) != 0) { return 1; }
+  g_job_ns = g_job_ns + time_mono_ns() - t0;
+  return 0;
+}
+
+fn fill(b: AlphBatch*, job: AlphJob*, piece: Word) {
+  var first: int64 = 0;
+  job->size = (Word)(chunk_of(job, &first) * 64);
+  if (g_gpu != 2) { job->home = ALPH_GPU; }
+}
+
+fn took(b: AlphBatch*, job: AlphJob*, piece: Word) {
+  if (job->way == ALPH_GPU) { g_on_gpu = g_on_gpu + 1; } else { g_on_cores = g_on_cores + 1; }
+}
+
+fn scan(f: MercFlat*, first: int64, count: int64, masks: uint64*) -> int32 {
+  if (g_state == 0) {
+    g_state = 2;
+    if (gpu_device_count() > 0) {
+      g_m.init(3, 0, true);
+      g_m.kind(SCAN, &on_core, &on_gpu);
+      g_state = 1;
+    } else {
+      merc_flat_set_gpu(2);
+    }
+  }
+  if (g_state != 1 || g_gpu == 2) { return 0; }
+  g_f = f;
+  g_first = first;
+  g_count = count;
+  g_masks = masks;
+  g_search = g_search + 1;
+  g_on_gpu = 0;
+  g_on_cores = 0;
+  var jobs: int64 = (count + CHUNK - 1) / CHUNK;
+  g_job_ns = 0;
+  var t0: int64 = time_mono_ns();
+  if (g_m.work(SCAN, (Word)jobs, &fill, &took, 0) != 0) { return 0; }
+  merc_flat_note(time_mono_ns() - t0, g_job_ns);
+  if (g_on_gpu > 0) { return 2; }
+  return 1;
+}
+
+export fn merc_scan_start() { merc_flat_set_scanner(&scan); }
+
+export fn merc_scan_stop() {
+  if (g_state == 1) {
+    g_m.shut();
+    g_state = 3;
+  }
+}

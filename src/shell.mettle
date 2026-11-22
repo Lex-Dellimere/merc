@@ -1,0 +1,1613 @@
+// the command language. the terminal tool and the viewer both run it.
+// a shell points at its own trie, so set it up in place with
+// merc_shell_init and never copy it.
+
+import "std/mem";
+import "std/file";
+import "std/time";
+import "std/fs";
+import "std/env";
+import "trie";
+import "expr";
+import "query";
+import "run";
+import "flat";
+
+export const MERC_DID_NOTHING: int32 = 0;
+export const MERC_DID_ADD: int32 = 1;
+export const MERC_DID_REMOVE: int32 = 2;
+export const MERC_DID_LOOKUP: int32 = 3;
+export const MERC_DID_SEARCH: int32 = 4;
+export const MERC_DID_ZIP: int32 = 5;
+export const MERC_DID_BULK: int32 = 6;
+export const MERC_DID_MISS: int32 = 7;
+
+export struct MercShell {
+  trie: MercTrie;
+  zip: MercZip;
+  out: MercBuf;
+  touched: MercBuf;
+  hits: MercBuf;        // keys the last search found, 4 bytes of length then the key
+  hit_count: int64;
+  kind: int32;
+  serial: int64;
+  took_ns: int64;
+  errors: int64;
+  quit: bool;
+  names: MercNames;
+  a: MercBuf;
+  b: MercBuf;
+  depth: int32;
+  rules: MercRun;
+}
+
+export fn merc_shell_init(sh: MercShell*) {
+  var blank: MercShell;
+  *sh = blank;
+  sh->zip = merc_zip(&sh->trie);
+  merc_run_init(&sh->rules, &sh->trie);
+}
+
+export fn merc_shell_free(sh: MercShell*) {
+  merc_zip_free(&sh->zip);
+  merc_run_free(&sh->rules);
+  merc_free(&sh->trie);
+  merc_buf_free(&sh->out);
+  merc_buf_free(&sh->touched);
+  merc_buf_free(&sh->hits);
+  merc_buf_free(&sh->a);
+  merc_buf_free(&sh->b);
+}
+
+struct ShCmd {
+  name: string;
+  args: string;
+  note: string;
+  basic: string;
+  section: int32;
+  run: fn(MercShell*, string) -> int32;
+}
+
+struct ShWord {
+  name: string;
+  args: string;
+  note: string;
+}
+
+const SH_CMDS: int32 = 21;
+const SH_MOVES: int32 = 10;
+
+var g_sh_help: MercBuf;
+
+fn sh_cmds() -> ShCmd* {
+  if (g_cmd_table[0].run == 0) { sh_fill_cmds(); }
+  return &g_cmd_table[0];
+}
+
+var g_cmd_table: ShCmd[21];
+var g_move_table: ShWord[10];
+
+fn sh_cmd(i: int32, name: string, args: string, note: string, basic: string, section: int32, run: fn(MercShell*, string) -> int32) {
+  g_cmd_table[i].name = name;
+  g_cmd_table[i].args = args;
+  g_cmd_table[i].note = note;
+  g_cmd_table[i].basic = basic;
+  g_cmd_table[i].section = section;
+  g_cmd_table[i].run = run;
+}
+
+fn sh_move(i: int32, name: string, args: string, note: string) {
+  g_move_table[i].name = name;
+  g_move_table[i].args = args;
+  g_move_table[i].note = note;
+}
+
+fn sh_fill_cmds() {
+  sh_cmd(0, "add", "EXPR [= N]", "store an expression (a bare (expr) line does the same)", "store one expression", 0, &sh_add);
+  sh_cmd(1, "del", "EXPR", "remove it", "", 0, &sh_del);
+  sh_cmd(2, "has", "EXPR", "is it stored", "", 0, &sh_has);
+  sh_cmd(3, "match", "PATTERN", "every stored expression the pattern unifies with, $x is a variable", "find stored expressions, $x matches anything", 0, &sh_c_match);
+  sh_cmd(4, "count", "PATTERN", "how many", "", 0, &sh_c_count);
+  sh_cmd(5, "transform", "PATTERN => SHAPE", "store SHAPE for every match, variables filled in", "", 0, &sh_transform);
+  sh_cmd(6, "list", "[N]", "the first N stored expressions (20)", "", 0, &sh_list);
+  sh_cmd(7, "load", "FILE", "store every expression in FILE, one or more a line", "read a file of expressions and rules", 1, &sh_load);
+  sh_cmd(8, "save", "FILE [PATTERN]", "write every stored expression to FILE, or only the ones PATTERN matches", "write everything stored to a file", 1, &sh_save);
+  sh_cmd(9, "run", "FILE", "run the commands in FILE", "", 1, &sh_run_file);
+  sh_cmd(10, "z", "", "where the zipper is and which bytes can follow", "", 2, &sh_zip);
+  sh_cmd(11, "rules", "[N]", "the rules waiting to run, first to run on top", "show the rules waiting to run", 3, &sh_rules);
+  sh_cmd(12, "step", "", "run the first rule and say what it did", "run one rule", 3, &sh_c_step);
+  sh_cmd(13, "go", "[N]", "run rules until none is left, or N of them", "run every rule until none is left", 3, &sh_go);
+  sh_cmd(14, "stats", "", "sizes", "", 4, &sh_c_stats);
+  sh_cmd(15, "gpu", "on|off|auto", "when match and count may scan a flat copy on the gpu", "", 4, &sh_gpu);
+  sh_cmd(16, "clear", "", "empty the trie", "", 4, &sh_c_clear);
+  sh_cmd(17, "help", "", "this list", "", 4, &sh_c_help);
+  sh_cmd(18, "quit", "", "", "", 4, &sh_c_quit);
+  sh_cmd(19, "exit", "", "", "", 5, &sh_c_quit);
+  sh_cmd(20, "help all", "", "", "every command", 5, &sh_c_help);
+  sh_move(0, "top", "", "back to the root");
+  sh_move(1, "arity", "N", "step onto a parent with N children");
+  sh_move(2, "sym", "NAME", "step onto the symbol NAME");
+  sh_move(3, "var", "", "step onto a stored variable");
+  sh_move(4, "byte", "HH", "step onto one byte, in hex");
+  sh_move(5, "expr", "EXPR", "step along a whole expression");
+  sh_move(6, "back", "[N]", "step back N bytes (1)");
+  sh_move(7, "set", "[N]", "store a value where the zipper is");
+  sh_move(8, "unset", "", "remove the value where the zipper is");
+  sh_move(9, "", "", "");
+}
+
+fn sh_pad(b: MercBuf*, from: int64, col: int64) {
+  merc_buf_push(b, 32);
+  while (b->len - from < col) { merc_buf_push(b, 32); }
+}
+
+fn sh_help_line(b: MercBuf*, name: string, args: string, note: string, col: int64) {
+  var from: int64 = b->len;
+  merc_buf_text(b, "  ");
+  merc_buf_text(b, name);
+  if (args.length > 0) {
+    merc_buf_text(b, " ");
+    merc_buf_text(b, args);
+  }
+  sh_pad(b, from, col);
+  merc_buf_text(b, note);
+  merc_buf_text(b, "\n");
+}
+
+export fn merc_shell_help() -> string {
+  var t: ShCmd* = sh_cmds();
+  merc_buf_clear(&g_sh_help);
+  merc_buf_text(&g_sh_help, "the basics\n");
+  var order: int32[9] = [7, 11, 12, 13, 3, 0, 8, 20, -1];
+  for k in 0..8 {
+    var c: ShCmd* = &t[order[k]];
+    var arg: string = c->args;
+    if (order[k] == 3) { arg = "PATTERN"; }
+    if (order[k] == 0) { arg = "EXPR"; }
+    if (order[k] == 8) { arg = "FILE"; }
+    if (order[k] == 11 || order[k] == 13) { arg = ""; }
+    sh_help_line(&g_sh_help, c->name, arg, c->basic, 19);
+  }
+  return merc_buf_view(&g_sh_help);
+}
+
+export fn merc_shell_help_all() -> string {
+  var t: ShCmd* = sh_cmds();
+  merc_buf_clear(&g_sh_help);
+  var heads: string[5] = ["expressions", "files", "zipper", "rules", "trie"];
+  for sec in 0..5 {
+    merc_buf_text(&g_sh_help, heads[sec]);
+    merc_buf_text(&g_sh_help, "\n");
+    for i in 0..SH_CMDS {
+      var c: ShCmd* = &t[i];
+      if (c->section != sec) { continue; }
+      if (i == 18) {
+        merc_buf_text(&g_sh_help, "  quit\n");
+        continue;
+      }
+      var col: int64 = 24;
+      if (i == 5) { col = 31; }
+      sh_help_line(&g_sh_help, c->name, c->args, c->note, col);
+      if (i == 10) {
+        for m in 0..SH_MOVES - 1 {
+          var mv: ShWord* = &g_move_table[m];
+          var nm: MercBuf;
+          merc_buf_text(&nm, "z ");
+          merc_buf_text(&nm, mv->name);
+          sh_help_line(&g_sh_help, merc_buf_view(&nm), mv->args, mv->note, 24);
+          merc_buf_free(&nm);
+        }
+      }
+    }
+  }
+  return merc_buf_view(&g_sh_help);
+}
+
+fn sh_say(sh: MercShell*, s: string) { merc_buf_text(&sh->out, s); }
+
+fn sh_num(sh: MercShell*, v: int64) {
+  var digits: uint8[24];
+  var n: int32 = 0;
+  var u: uint64 = (uint64)v;
+  if (v < 0) {
+    merc_buf_push(&sh->out, 45);
+    u = (uint64)(0 - v);
+  }
+  if (u == 0) {
+    digits[0] = 48;
+    n = 1;
+  }
+  while (u > 0) {
+    digits[n] = (uint8)(48 + (int32)(u % (uint64)10));
+    n = n + 1;
+    u = u / (uint64)10;
+  }
+  while (n > 0) {
+    n = n - 1;
+    merc_buf_push(&sh->out, digits[n]);
+  }
+}
+
+fn sh_hex(sh: MercShell*, b: uint8) {
+  var hi: int32 = (int32)(b >> 4);
+  var lo: int32 = (int32)(b & 15);
+  if (hi < 10) { merc_buf_push(&sh->out, (uint8)(48 + hi)); } else { merc_buf_push(&sh->out, (uint8)(87 + hi)); }
+  if (lo < 10) { merc_buf_push(&sh->out, (uint8)(48 + lo)); } else { merc_buf_push(&sh->out, (uint8)(87 + lo)); }
+}
+
+fn sh_fail(sh: MercShell*, why: string) -> int32 {
+  sh_say(sh, "error: ");
+  sh_say(sh, why);
+  sh_say(sh, "\n");
+  sh->errors = sh->errors + 1;
+  return 1;
+}
+
+fn sh_touch(sh: MercShell*, key: string, kind: int32) {
+  merc_buf_clear(&sh->touched);
+  merc_buf_text(&sh->touched, key);
+  sh->kind = kind;
+}
+
+fn sh_trim(s: string) -> string {
+  var p: uint8* = s.chars;
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  while (i < n && (p[i] == 32 || p[i] == 9 || p[i] == 13 || p[i] == 10)) { i = i + 1; }
+  while (n > i && (p[n - 1] == 32 || p[n - 1] == 9 || p[n - 1] == 13 || p[n - 1] == 10)) { n = n - 1; }
+  var r: string;
+  r.chars = p + i;
+  r.length = (uint64)(n - i);
+  return r;
+}
+
+fn sh_is(s: string, word: string) -> bool {
+  if (s.length != word.length) { return false; }
+  for i: int64 in 0..(int64)s.length {
+    if (s.chars[i] != word.chars[i]) { return false; }
+  }
+  return true;
+}
+
+fn sh_word(s: string*, word: string*) {
+  var t: string = sh_trim(*s);
+  var n: int64 = (int64)t.length;
+  var i: int64 = 0;
+  while (i < n && t.chars[i] != 32 && t.chars[i] != 9) { i = i + 1; }
+  var w: string;
+  w.chars = t.chars;
+  w.length = (uint64)i;
+  *word = w;
+  var rest: string;
+  rest.chars = t.chars + i;
+  rest.length = (uint64)(n - i);
+  *s = sh_trim(rest);
+}
+
+fn sh_int(s: string, v: int64*) -> bool {
+  var n: int64 = (int64)s.length;
+  if (n == 0 || n > 18) { return false; }
+  var r: int64 = 0;
+  for i: int64 in 0..n {
+    var c: int32 = (int32)s.chars[i];
+    if (c < 48 || c > 57) { return false; }
+    r = r * 10 + (int64)(c - 48);
+  }
+  *v = r;
+  return true;
+}
+
+fn sh_hexval(c: uint8) -> int32 {
+  if (c >= 48 && c <= 57) { return (int32)c - 48; }
+  if (c >= 97 && c <= 102) { return (int32)c - 87; }
+  if (c >= 65 && c <= 70) { return (int32)c - 55; }
+  return -1;
+}
+
+fn sh_parse(sh: MercShell*, text: string, into: MercBuf*, keep_names: bool) -> int64 {
+  merc_buf_clear(into);
+  if (!keep_names) { merc_names_clear(&sh->names); }
+  var n: int64 = merc_parse(text, into, &sh->names);
+  if (n < 0) {
+    sh_fail(sh, merc_parse_error(n));
+    return 0;
+  }
+  return n;
+}
+
+fn sh_show(sh: MercShell*, e: string, names: MercNames*) {
+  if (!merc_format(e, &sh->out, names)) {
+    sh_say(sh, "<");
+    for i: int64 in 0..(int64)e.length {
+      if (i > 0) { sh_say(sh, " "); }
+      sh_hex(sh, e.chars[i]);
+    }
+    sh_say(sh, ">");
+  }
+}
+
+fn sh_read_file(path: string, into: MercBuf*) -> bool {
+  var fd: int64 = file_open(path, FILE_READ);
+  if (fd < 0) { return false; }
+  var n: int64 = file_size(fd);
+  if (n < 0 || !merc_buf_room(into, n + 1)) {
+    file_close(fd);
+    return false;
+  }
+  var got: int64 = 0;
+  while (got < n) {
+    var k: int64 = file_read_at(fd, into->data + into->len + got, n - got, got);
+    if (k <= 0) { break; }
+    got = got + k;
+  }
+  into->len = into->len + got;
+  file_close(fd);
+  return true;
+}
+
+fn sh_resync(sh: MercShell*) {
+  var keep: MercBuf;
+  merc_buf_text(&keep, merc_zip_path(&sh->zip));
+  merc_zip_reset(&sh->zip);
+  merc_zip_descend(&sh->zip, merc_buf_view(&keep));
+  merc_buf_free(&keep);
+}
+
+// raw symbol bytes still due after path. 0 means the next byte is a tag.
+export fn merc_path_raw(path: string) -> int32 {
+  var p: uint8* = path.chars;
+  var n: int64 = (int64)path.length;
+  var i: int64 = 0;
+  while (i < n) {
+    var tag: uint8 = p[i];
+    i = i + 1;
+    if (tag > 0xC0) {
+      var len: int64 = (int64)(tag & 63);
+      if (i + len > n) { return (int32)(i + len - n); }
+      i = i + len;
+    }
+  }
+  return 0;
+}
+
+fn sh_byte_name(sh: MercShell*, b: int32, raw: int32) {
+  if (raw > 0) {
+    if (b > 32 && b < 127) {
+      sh_say(sh, "'");
+      merc_buf_push(&sh->out, (uint8)b);
+      sh_say(sh, "'");
+    } else {
+      sh_say(sh, "#");
+      sh_hex(sh, (uint8)b);
+    }
+    return;
+  }
+  if (b < 64) {
+    sh_say(sh, "arity ");
+    sh_num(sh, (int64)b);
+  } else if (b > 0xC0) {
+    sh_say(sh, "symbol of ");
+    sh_num(sh, (int64)(b & 63));
+  } else if (b == 0xC0) {
+    sh_say(sh, "variable");
+  } else if (b >= 0x80) {
+    sh_say(sh, "variable again #");
+    sh_num(sh, (int64)(b & 63));
+  } else {
+    sh_say(sh, "#");
+    sh_hex(sh, (uint8)b);
+  }
+}
+
+fn sh_where(sh: MercShell*) {
+  var z: MercZip* = &sh->zip;
+  var path: string = merc_zip_path(z);
+  sh_say(sh, "zipper at depth ");
+  sh_num(sh, merc_zip_depth(z));
+  sh_say(sh, ":");
+  for i: int64 in 0..(int64)path.length {
+    sh_say(sh, " ");
+    sh_hex(sh, path.chars[i]);
+  }
+  sh_say(sh, "\n");
+  if (!merc_zip_exists(z)) {
+    sh_say(sh, "  nothing is stored this way\n");
+    return;
+  }
+  var v: uint64 = 0;
+  if (merc_zip_get(z, &v)) {
+    sh_say(sh, "  holds ");
+    sh_show(sh, path, (MercNames*)0);
+    sh_say(sh, " = ");
+    sh_num(sh, (int64)v);
+    sh_say(sh, "\n");
+  }
+  var raw: int32 = merc_path_raw(path);
+  var kids: int32 = merc_zip_children(z);
+  sh_say(sh, "  ");
+  sh_num(sh, (int64)kids);
+  sh_say(sh, " can follow:");
+  var b: int32 = merc_zip_next(z, 0);
+  var shown: int32 = 0;
+  while (b >= 0 && shown < 24) {
+    sh_say(sh, " [");
+    sh_byte_name(sh, b, raw);
+    sh_say(sh, "]");
+    shown = shown + 1;
+    b = merc_zip_next(z, b + 1);
+  }
+  if (b >= 0) { sh_say(sh, " ..."); }
+  sh_say(sh, "\n");
+}
+
+fn sh_zip(sh: MercShell*, rest: string) -> int32 {
+  var z: MercZip* = &sh->zip;
+  var args: string = rest;
+  var word: string;
+  sh_word(&args, &word);
+  sh->kind = MERC_DID_ZIP;
+  if (word.length == 0) {
+    sh_where(sh);
+    return 0;
+  }
+  if (sh_is(word, "top")) {
+    merc_zip_reset(z);
+  } else if (sh_is(word, "back")) {
+    var n: int64 = 1;
+    if (args.length != 0 && !sh_int(args, &n)) { return sh_fail(sh, "z back takes a number"); }
+    for i: int64 in 0..n {
+      if (!merc_zip_back(z)) { break; }
+    }
+  } else if (sh_is(word, "arity")) {
+    var k: int64 = 0;
+    if (!sh_int(args, &k) || k > 63) { return sh_fail(sh, "z arity takes a number from 0 to 63"); }
+    merc_zip_push(z, (uint8)k);
+  } else if (sh_is(word, "sym")) {
+    if (args.length == 0 || args.length > 63) { return sh_fail(sh, "z sym takes a name of 1 to 63 bytes"); }
+    merc_zip_push(z, (uint8)(0xC0 + (int32)args.length));
+    merc_zip_descend(z, args);
+  } else if (sh_is(word, "var")) {
+    merc_zip_push(z, 0xC0);
+  } else if (sh_is(word, "byte")) {
+    if (args.length != 2 || sh_hexval(args.chars[0]) < 0 || sh_hexval(args.chars[1]) < 0) { return sh_fail(sh, "z byte takes two hex digits"); }
+    merc_zip_push(z, (uint8)(sh_hexval(args.chars[0]) * 16 + sh_hexval(args.chars[1])));
+  } else if (sh_is(word, "expr")) {
+    if (sh_parse(sh, args, &sh->a, false) == 0) { return 1; }
+    merc_zip_descend(z, merc_buf_view(&sh->a));
+  } else if (sh_is(word, "set")) {
+    var v: int64 = 1;
+    if (args.length != 0 && !sh_int(args, &v)) { return sh_fail(sh, "z set takes a number"); }
+    var r: int32 = merc_zip_set(z, (uint64)v);
+    if (r == MERC_FAILED) { return sh_fail(sh, "out of memory"); }
+    sh->serial = sh->serial + 1;
+    sh_touch(sh, merc_zip_path(z), MERC_DID_ADD);
+    if (r == MERC_ADDED) { sh_say(sh, "stored\n"); } else { sh_say(sh, "replaced\n"); }
+    return 0;
+  } else if (sh_is(word, "unset")) {
+    sh_touch(sh, merc_zip_path(z), MERC_DID_REMOVE);
+    if (!merc_zip_unset(z)) {
+      sh->kind = MERC_DID_MISS;
+      sh_say(sh, "no value here\n");
+      return 0;
+    }
+    sh->serial = sh->serial + 1;
+    sh_say(sh, "removed\n");
+    return 0;
+  } else {
+    return sh_fail(sh, "z: unknown move, try help");
+  }
+  sh_touch(sh, merc_zip_path(z), MERC_DID_ZIP);
+  sh_where(sh);
+  return 0;
+}
+
+fn sh_add(sh: MercShell*, rest: string) -> int32 {
+  var used: int64 = sh_parse(sh, rest, &sh->a, false);
+  if (used == 0) { return 1; }
+  var tail: string;
+  tail.chars = rest.chars + used;
+  tail.length = (uint64)((int64)rest.length - used);
+  tail = sh_trim(tail);
+  var value: int64 = 1;
+  if (tail.length != 0) {
+    if (tail.chars[0] != 61) { return sh_fail(sh, "after the expression only `= N` may follow"); }
+    tail.chars = tail.chars + 1;
+    tail.length = tail.length - (uint64)1;
+    if (!sh_int(sh_trim(tail), &value)) { return sh_fail(sh, "the value must be a whole number"); }
+  }
+  var r: int32 = merc_add(&sh->trie, merc_buf_view(&sh->a), (uint64)value);
+  if (r == MERC_FAILED) { return sh_fail(sh, "out of memory"); }
+  sh->serial = sh->serial + 1;
+  sh_touch(sh, merc_buf_view(&sh->a), MERC_DID_ADD);
+  sh_resync(sh);
+  if (r == MERC_ADDED) { sh_say(sh, "stored\n"); } else { sh_say(sh, "already there, value replaced\n"); }
+  return 0;
+}
+
+fn sh_del(sh: MercShell*, rest: string) -> int32 {
+  if (sh_parse(sh, rest, &sh->a, false) == 0) { return 1; }
+  sh_touch(sh, merc_buf_view(&sh->a), MERC_DID_REMOVE);
+  if (!merc_remove(&sh->trie, merc_buf_view(&sh->a))) {
+    sh->kind = MERC_DID_MISS;
+    sh_say(sh, "not stored\n");
+    return 0;
+  }
+  sh->serial = sh->serial + 1;
+  sh_resync(sh);
+  sh_say(sh, "removed\n");
+  return 0;
+}
+
+fn sh_has(sh: MercShell*, rest: string) -> int32 {
+  if (sh_parse(sh, rest, &sh->a, false) == 0) { return 1; }
+  var v: uint64 = 0;
+  if (merc_get(&sh->trie, merc_buf_view(&sh->a), &v)) {
+    sh_touch(sh, merc_buf_view(&sh->a), MERC_DID_LOOKUP);
+    sh_say(sh, "yes = ");
+    sh_num(sh, (int64)v);
+    sh_say(sh, "\n");
+  } else {
+    sh_touch(sh, merc_buf_view(&sh->a), MERC_DID_MISS);
+    sh_say(sh, "no\n");
+  }
+  return 0;
+}
+
+fn sh_match_rows(sh: MercShell*, rows: MercBuf*, found: int64, only_count: bool) -> int32 {
+  var f: MercFlat* = merc_flat_copy();
+  var pat: string = merc_buf_view(&sh->a);
+  merc_buf_clear(&sh->hits);
+  sh->hit_count = 0;
+  var q: MercQuery = merc_query(&sh->trie, pat);
+  for i: int64 in 0..(rows->len / 8) {
+    var m: string = merc_flat_row(f, ((int64*)rows->data)[i]);
+    var len: uint32 = (uint32)m.length;
+    merc_buf_add(&sh->hits, (uint8*)&len, 4);
+    merc_buf_text(&sh->hits, m);
+    sh->hit_count = sh->hit_count + 1;
+    if (only_count || i >= 50) { continue; }
+    sh_show(sh, m, (MercNames*)0);
+    sh_say(sh, "\n");
+    merc_query_again(&q, pat);
+    merc_query_pin(&q, m);
+    if (!merc_query_next(&q)) { continue; }
+    for v in 0..merc_query_vars(&q) {
+      merc_buf_clear(&sh->b);
+      if (!merc_query_bind(&q, v, &sh->b)) { continue; }
+      sh_say(sh, "    $");
+      sh_say(sh, merc_name(&sh->names, v));
+      sh_say(sh, " = ");
+      sh_show(sh, merc_buf_view(&sh->b), (MercNames*)0);
+      sh_say(sh, "\n");
+    }
+  }
+  merc_query_free(&q);
+  if (!only_count && found > 50) {
+    sh_say(sh, "... ");
+    sh_num(sh, found - 50);
+    sh_say(sh, " more\n");
+  }
+  sh_num(sh, found);
+  if (found == 1) { sh_say(sh, " match, "); } else { sh_say(sh, " matches, "); }
+  sh_say(sh, "0 bytes walked, ");
+  if (merc_flat_way() == 2) { sh_say(sh, "flat scan on the gpu\n"); } else { sh_say(sh, "flat scan on the cores\n"); }
+  sh_touch(sh, pat, MERC_DID_SEARCH);
+  return 0;
+}
+
+fn sh_match(sh: MercShell*, rest: string, only_count: bool) -> int32 {
+  if (sh_parse(sh, rest, &sh->a, false) == 0) { return 1; }
+  var rows: MercBuf;
+  var many: int64 = 0;
+  if (merc_flat_search(&sh->trie, sh->serial, merc_buf_view(&sh->a), &rows, 20000, &many)) {
+    var r: int32 = sh_match_rows(sh, &rows, many, only_count);
+    merc_buf_free(&rows);
+    return r;
+  }
+  merc_buf_free(&rows);
+  var q: MercQuery = merc_query(&sh->trie, merc_buf_view(&sh->a));
+  var found: int64 = 0;
+  merc_buf_clear(&sh->hits);
+  sh->hit_count = 0;
+  while (merc_query_next(&q)) {
+    found = found + 1;
+    var m: string = merc_query_match(&q);
+    if (sh->hit_count < 20000) {
+      var len: uint32 = (uint32)m.length;
+      merc_buf_add(&sh->hits, (uint8*)&len, 4);
+      merc_buf_text(&sh->hits, m);
+      sh->hit_count = sh->hit_count + 1;
+    }
+    if (only_count || found > 50) { continue; }
+    sh_show(sh, m, (MercNames*)0);
+    sh_say(sh, "\n");
+    for v in 0..merc_query_vars(&q) {
+      merc_buf_clear(&sh->b);
+      if (!merc_query_bind(&q, v, &sh->b)) { continue; }
+      sh_say(sh, "    $");
+      sh_say(sh, merc_name(&sh->names, v));
+      sh_say(sh, " = ");
+      sh_show(sh, merc_buf_view(&sh->b), (MercNames*)0);
+      sh_say(sh, "\n");
+    }
+  }
+  if (!only_count && found > 50) {
+    sh_say(sh, "... ");
+    sh_num(sh, found - 50);
+    sh_say(sh, " more\n");
+  }
+  sh_num(sh, found);
+  if (found == 1) { sh_say(sh, " match, "); } else { sh_say(sh, " matches, "); }
+  sh_num(sh, q.steps);
+  sh_say(sh, " bytes walked\n");
+  sh_touch(sh, merc_buf_view(&sh->a), MERC_DID_SEARCH);
+  merc_query_free(&q);
+  return 0;
+}
+
+fn sh_transform(sh: MercShell*, rest: string) -> int32 {
+  var used: int64 = sh_parse(sh, rest, &sh->a, false);
+  if (used == 0) { return 1; }
+  var tail: string;
+  tail.chars = rest.chars + used;
+  tail.length = (uint64)((int64)rest.length - used);
+  tail = sh_trim(tail);
+  if (tail.length < 2 || tail.chars[0] != 61 || tail.chars[1] != 62) { return sh_fail(sh, "write: transform PATTERN => SHAPE"); }
+  tail.chars = tail.chars + 2;
+  tail.length = tail.length - (uint64)2;
+  if (sh_parse(sh, tail, &sh->b, true) == 0) { return 1; }
+  var made: int64 = merc_transform(&sh->trie, merc_buf_view(&sh->a), merc_buf_view(&sh->b), 1);
+  if (made < 0) { return sh_fail(sh, "out of memory"); }
+  sh->serial = sh->serial + 1;
+  sh->kind = MERC_DID_BULK;
+  sh_resync(sh);
+  sh_num(sh, made);
+  sh_say(sh, " stored\n");
+  return 0;
+}
+
+fn sh_list(sh: MercShell*, rest: string) -> int32 {
+  var limit: int64 = 20;
+  if (rest.length != 0 && !sh_int(rest, &limit)) { return sh_fail(sh, "list takes a number"); }
+  var z: MercZip = merc_zip(&sh->trie);
+  var shown: int64 = 0;
+  var v: uint64 = 0;
+  var more: bool = merc_zip_get(&z, &v);
+  if (!more) { more = merc_zip_next_value(&z, 0); }
+  while (more && shown < limit) {
+    sh_show(sh, merc_zip_path(&z), (MercNames*)0);
+    sh_say(sh, "\n");
+    shown = shown + 1;
+    more = merc_zip_next_value(&z, 0);
+  }
+  merc_zip_free(&z);
+  sh_num(sh, shown);
+  sh_say(sh, " of ");
+  sh_num(sh, merc_count(&sh->trie));
+  sh_say(sh, "\n");
+  return 0;
+}
+
+fn sh_stats(sh: MercShell*) -> int32 {
+  var n: int64 = merc_count(&sh->trie);
+  sh_num(sh, n);
+  sh_say(sh, " expressions, ");
+  sh_num(sh, merc_node_count(&sh->trie));
+  sh_say(sh, " nodes, ");
+  sh_num(sh, merc_memory(&sh->trie));
+  sh_say(sh, " bytes");
+  if (n > 0) {
+    sh_say(sh, " (");
+    sh_num(sh, merc_memory(&sh->trie) / n);
+    sh_say(sh, " an expression)");
+  }
+  sh_say(sh, "\n");
+  merc_flat_stats(&sh->out);
+  return 0;
+}
+
+fn sh_gpu(sh: MercShell*, rest: string) -> int32 {
+  if (sh_is(rest, "on")) { merc_flat_set_mode(MERC_FLAT_ON); }
+  else if (sh_is(rest, "off")) { merc_flat_set_mode(MERC_FLAT_OFF); }
+  else if (sh_is(rest, "auto")) { merc_flat_set_mode(MERC_FLAT_AUTO); }
+  else if (rest.length != 0) { return sh_fail(sh, "gpu takes on, off or auto"); }
+  if (!merc_flat_ready()) { sh_say(sh, "no gpu in this program, searches use the trie\n"); return 0; }
+  var mode: int32 = merc_flat_mode();
+  if (mode == MERC_FLAT_ON) { sh_say(sh, "gpu on: every search with a variable scans the flat copy\n"); }
+  else if (mode == MERC_FLAT_OFF) { sh_say(sh, "gpu off: every search walks the trie\n"); }
+  else { sh_say(sh, "gpu auto: big searches with a variable first scan the flat copy\n"); }
+  return 0;
+}
+
+export fn merc_shell_load_text(sh: MercShell*, text: string) -> int64 {
+  var p: uint8* = text.chars;
+  var n: int64 = (int64)text.length;
+  var i: int64 = 0;
+  var added: int64 = 0;
+  var bad: int64 = 0;
+  while (i < n) {
+    while (i < n && (p[i] == 32 || p[i] == 9 || p[i] == 10 || p[i] == 13)) { i = i + 1; }
+    if (i >= n) { break; }
+    if (p[i] == 59) {
+      while (i < n && p[i] != 10) { i = i + 1; }
+      continue;
+    }
+    var rest: string;
+    rest.chars = p + i;
+    rest.length = (uint64)(n - i);
+    merc_buf_clear(&sh->a);
+    merc_names_clear(&sh->names);
+    var used: int64 = merc_parse(rest, &sh->a, &sh->names);
+    if (used <= 0) {
+      bad = bad + 1;
+      while (i < n && p[i] != 10) { i = i + 1; }
+      continue;
+    }
+    i = i + used;
+    var r: int32 = merc_put(&sh->trie, merc_buf_view(&sh->a), 1);
+    if (r == MERC_FAILED) { return -1; }
+    if (r == MERC_ADDED) { added = added + 1; }
+  }
+  sh->errors = sh->errors + bad;
+  if (bad > 0) {
+    sh_num(sh, bad);
+    sh_say(sh, " lines could not be read\n");
+  }
+  sh->serial = sh->serial + 1;
+  sh->kind = MERC_DID_BULK;
+  sh_resync(sh);
+  return added;
+}
+
+fn sh_load(sh: MercShell*, rest: string) -> int32 {
+  if (rest.length == 0) { return sh_fail(sh, "load takes a file name"); }
+  var text: MercBuf;
+  if (!sh_read_file(rest, &text)) {
+    merc_buf_free(&text);
+    return sh_fail(sh, "cannot read that file");
+  }
+  var added: int64 = merc_shell_load_text(sh, merc_buf_view(&text));
+  merc_buf_free(&text);
+  if (added < 0) { return sh_fail(sh, "out of memory"); }
+  sh_num(sh, added);
+  sh_say(sh, " stored, ");
+  sh_num(sh, merc_count(&sh->trie));
+  sh_say(sh, " in all\n");
+  return 0;
+}
+
+fn sh_run_file(sh: MercShell*, rest: string) -> int32 {
+  if (rest.length == 0) { return sh_fail(sh, "run takes a file name"); }
+  if (sh->depth >= 8) { return sh_fail(sh, "files run each other too deep"); }
+  var text: MercBuf;
+  if (!sh_read_file(rest, &text)) {
+    merc_buf_free(&text);
+    return sh_fail(sh, "cannot read that file");
+  }
+  sh->depth = sh->depth + 1;
+  var p: uint8* = text.data;
+  var n: int64 = text.len;
+  var i: int64 = 0;
+  var worst: int32 = 0;
+  while (i < n && !sh->quit) {
+    var from: int64 = i;
+    while (i < n && p[i] != 10) { i = i + 1; }
+    var line: string;
+    line.chars = p + from;
+    line.length = (uint64)(i - from);
+    i = i + 1;
+    var r: int32 = merc_shell_run(sh, line);
+    if (r > worst) { worst = r; }
+  }
+  sh->depth = sh->depth - 1;
+  merc_buf_free(&text);
+  return worst;
+}
+
+fn sh_flush(fd: int64, buf: MercBuf*, at: int64*) -> bool {
+  var done: int64 = 0;
+  while (done < buf->len) {
+    var k: int64 = file_write_at(fd, buf->data + done, buf->len - done, *at + done);
+    if (k <= 0) { return false; }
+    done = done + k;
+  }
+  *at = *at + buf->len;
+  merc_buf_clear(buf);
+  return true;
+}
+
+fn sh_save(sh: MercShell*, rest: string) -> int32 {
+  var args: string = rest;
+  var name: string;
+  sh_word(&args, &name);
+  if (name.length == 0) { return sh_fail(sh, "save takes a file name"); }
+  var some: bool = args.length != 0;
+  if (some && sh_parse(sh, args, &sh->a, false) == 0) { return 1; }
+  var fd: int64 = file_open(name, FILE_WRITE | FILE_CREATE | FILE_TRUNCATE);
+  if (fd < 0) { return sh_fail(sh, "cannot write that file"); }
+  var text: MercBuf;
+  var at: int64 = 0;
+  var wrote: int64 = 0;
+  var ok: bool = true;
+  if (some) {
+    var q: MercQuery = merc_query(&sh->trie, merc_buf_view(&sh->a));
+    while (ok && merc_query_next(&q)) {
+      merc_format(merc_query_match(&q), &text, (MercNames*)0);
+      merc_buf_push(&text, 10);
+      wrote = wrote + 1;
+      if (text.len > 60000) { ok = sh_flush(fd, &text, &at); }
+    }
+    merc_query_free(&q);
+  } else {
+    var z: MercZip = merc_zip(&sh->trie);
+    var more: bool = merc_zip_get(&z, (uint64*)0);
+    if (!more) { more = merc_zip_next_value(&z, 0); }
+    while (ok && more) {
+      merc_format(merc_zip_path(&z), &text, (MercNames*)0);
+      merc_buf_push(&text, 10);
+      wrote = wrote + 1;
+      if (text.len > 60000) { ok = sh_flush(fd, &text, &at); }
+      more = merc_zip_next_value(&z, 0);
+    }
+    merc_zip_free(&z);
+  }
+  if (ok) { ok = sh_flush(fd, &text, &at); }
+  file_close(fd);
+  merc_buf_free(&text);
+  if (!ok) { return sh_fail(sh, "the disk refused the write"); }
+  sh_num(sh, wrote);
+  sh_say(sh, " written to ");
+  sh_say(sh, name);
+  sh_say(sh, "\n");
+  return 0;
+}
+
+fn sh_first_rule(z: MercZip*) -> bool {
+  var head: uint8[6] = [4, 0xC4, 101, 120, 101, 99];
+  for i in 0..6 {
+    if (!merc_zip_step(z, head[i])) { return false; }
+  }
+  return merc_zip_next_value(z, 6);
+}
+
+fn sh_show_short(sh: MercShell*, e: string) {
+  var from: int64 = sh->out.len;
+  sh_show(sh, e, (MercNames*)0);
+  if (sh->out.len - from > 160) {
+    sh->out.len = from + 157;
+    sh_say(sh, "...");
+  }
+}
+
+fn sh_rules(sh: MercShell*, rest: string) -> int32 {
+  var limit: int64 = 20;
+  if (rest.length != 0 && !sh_int(rest, &limit)) { return sh_fail(sh, "rules takes a number"); }
+  var z: MercZip = merc_zip(&sh->trie);
+  var shown: int64 = 0;
+  var total: int64 = 0;
+  var more: bool = sh_first_rule(&z);
+  while (more) {
+    total = total + 1;
+    if (shown < limit) {
+      sh_show_short(sh, merc_zip_path(&z));
+      sh_say(sh, "\n");
+      shown = shown + 1;
+    }
+    more = merc_zip_next_value(&z, 6);
+  }
+  merc_zip_free(&z);
+  sh_num(sh, total);
+  if (total == 1) { sh_say(sh, " rule waiting\n"); } else { sh_say(sh, " rules waiting\n"); }
+  return 0;
+}
+
+fn sh_step(sh: MercShell*) -> int32 {
+  var z: MercZip = merc_zip(&sh->trie);
+  if (!sh_first_rule(&z)) {
+    merc_zip_free(&z);
+    sh_say(sh, "no rule left to run\n");
+    return 0;
+  }
+  sh_touch(sh, merc_zip_path(&z), MERC_DID_BULK);
+  sh_say(sh, "ran ");
+  sh_show_short(sh, merc_zip_path(&z));
+  sh_say(sh, "\n");
+  merc_zip_free(&z);
+  var r: MercRun* = &sh->rules;
+  var m0: int64 = r->matches;
+  var w0: int64 = r->writes;
+  var s0: int64 = r->skipped;
+  var n0: int64 = merc_count(&sh->trie);
+  var how: int32 = merc_run_step(r);
+  if (how < 0) { return sh_fail(sh, "out of memory"); }
+  sh->serial = sh->serial + 1;
+  sh_resync(sh);
+  if (r->skipped != s0) {
+    sh_say(sh, "  it uses a source or sink merc does not have yet, so it was dropped\n");
+    return 0;
+  }
+  sh_say(sh, "  ");
+  sh_num(sh, r->matches - m0);
+  sh_say(sh, " matches, ");
+  sh_num(sh, r->writes - w0);
+  sh_say(sh, " writes, ");
+  sh_num(sh, merc_count(&sh->trie) - n0 + 1);
+  sh_say(sh, " new, ");
+  sh_num(sh, merc_count(&sh->trie));
+  sh_say(sh, " stored\n");
+  return 0;
+}
+
+fn sh_go(sh: MercShell*, rest: string) -> int32 {
+  var limit: int64 = 1000000000000000;
+  if (rest.length != 0 && !sh_int(rest, &limit)) { return sh_fail(sh, "go takes a number"); }
+  var r: MercRun* = &sh->rules;
+  var m0: int64 = r->matches;
+  var w0: int64 = r->writes;
+  var s0: int64 = r->skipped;
+  var ran: int64 = merc_run(r, limit);
+  sh->serial = sh->serial + 1;
+  sh->kind = MERC_DID_BULK;
+  sh_resync(sh);
+  sh_num(sh, ran);
+  if (ran == 1) { sh_say(sh, " rule ran, "); } else { sh_say(sh, " rules ran, "); }
+  sh_num(sh, r->matches - m0);
+  sh_say(sh, " matches, ");
+  sh_num(sh, r->writes - w0);
+  sh_say(sh, " writes, ");
+  sh_num(sh, merc_count(&sh->trie));
+  sh_say(sh, " stored\n");
+  if (r->skipped != s0) {
+    sh_num(sh, r->skipped - s0);
+    sh_say(sh, " used a source or sink merc does not have yet and were dropped\n");
+  }
+  return 0;
+}
+
+fn sh_c_match(sh: MercShell*, rest: string) -> int32 { return sh_match(sh, rest, false); }
+fn sh_c_count(sh: MercShell*, rest: string) -> int32 { return sh_match(sh, rest, true); }
+fn sh_c_step(sh: MercShell*, rest: string) -> int32 { return sh_step(sh); }
+fn sh_c_stats(sh: MercShell*, rest: string) -> int32 { return sh_stats(sh); }
+
+fn sh_c_help(sh: MercShell*, rest: string) -> int32 {
+  if (sh_is(rest, "all")) { sh_say(sh, merc_shell_help_all()); } else { sh_say(sh, merc_shell_help()); }
+  return 0;
+}
+
+fn sh_c_clear(sh: MercShell*, rest: string) -> int32 {
+  merc_zip_free(&sh->zip);
+  merc_clear(&sh->trie);
+  sh->zip = merc_zip(&sh->trie);
+  sh->serial = sh->serial + 1;
+  sh->kind = MERC_DID_BULK;
+  sh_say(sh, "cleared\n");
+  return 0;
+}
+
+fn sh_c_quit(sh: MercShell*, rest: string) -> int32 {
+  sh->quit = true;
+  return 0;
+}
+
+fn sh_run_line(sh: MercShell*, line: string) -> int32 {
+  var rest: string = sh_trim(line);
+  sh->kind = MERC_DID_NOTHING;
+  if (rest.length == 0 || rest.chars[0] == 59) { return 0; }
+  if (rest.chars[0] == 40) { return sh_add(sh, rest); }
+  var word: string;
+  sh_word(&rest, &word);
+  var t: ShCmd* = sh_cmds();
+  for i in 0..SH_CMDS {
+    if (sh_is(word, t[i].name)) { return t[i].run(sh, rest); }
+  }
+  return sh_fail(sh, "unknown command, try help");
+}
+
+// runs one line. what it prints is added to sh->out. gives 0, or 1 when the
+// line was wrong. a blank line or a comment line does nothing.
+export fn merc_shell_run(sh: MercShell*, line: string) -> int32 {
+  var t0: int64 = time_mono_ns();
+  var r: int32 = sh_run_line(sh, line);
+  sh->took_ns = time_mono_ns() - t0;
+  return r;
+}
+
+export fn merc_shell_took(sh: MercShell*, out: MercBuf*) {
+  var ns: int64 = sh->took_ns;
+  var unit: string = " ns";
+  var whole: int64 = ns;
+  var frac: int64 = 0;
+  if (ns >= 1000000000) {
+    unit = " s";
+    whole = ns / 1000000000;
+    frac = ns / 10000000 % 100;
+  } else if (ns >= 1000000) {
+    unit = " ms";
+    whole = ns / 1000000;
+    frac = ns / 10000 % 100;
+  } else if (ns >= 1000) {
+    unit = " us";
+    whole = ns / 1000;
+    frac = ns / 10 % 100;
+  }
+  var digits: uint8[24];
+  var n: int32 = 0;
+  if (whole == 0) { digits[0] = 48; n = 1; }
+  while (whole > 0) {
+    digits[n] = (uint8)(48 + whole % 10);
+    n = n + 1;
+    whole = whole / 10;
+  }
+  while (n > 0) {
+    n = n - 1;
+    merc_buf_push(out, digits[n]);
+  }
+  if (ns >= 1000) {
+    merc_buf_push(out, 46);
+    merc_buf_push(out, (uint8)(48 + frac / 10));
+    merc_buf_push(out, (uint8)(48 + frac % 10));
+  }
+  merc_buf_text(out, unit);
+}
+
+// completion: what can come next at the cursor, for a command line that
+// offers it while you type. it reads the trie and never changes it or the
+// shell's zipper.
+
+export const MERC_CK_COMMAND: int32 = 1;
+export const MERC_CK_MOVE: int32 = 2;
+export const MERC_CK_PATH: int32 = 3;
+export const MERC_CK_SYMBOL: int32 = 4;
+export const MERC_CK_VARIABLE: int32 = 5;
+
+export const MERC_COMPLETE_MAX: int32 = 32;
+const CP_WORK: int64 = 20000;
+const CP_COUNT: int64 = 1000;
+const CP_STATES: int32 = 256;
+
+export struct MercCand {
+  kind: int32;
+  from: int64;
+  to: int64;
+  text_off: int64;
+  text_len: int64;
+  note_off: int64;
+  note_len: int64;
+  count: int64;
+  capped: bool;
+}
+
+export struct MercComplete {
+  c: MercCand[32];
+  n: int32;
+  buf: MercBuf;
+  more: bool;
+  work: int64;
+}
+
+export fn merc_complete_text(cm: MercComplete*, i: int32) -> string {
+  var s: string;
+  s.chars = cm->buf.data + cm->c[i].text_off;
+  s.length = (uint64)cm->c[i].text_len;
+  return s;
+}
+
+export fn merc_complete_note(cm: MercComplete*, i: int32) -> string {
+  var s: string;
+  s.chars = cm->buf.data + cm->c[i].note_off;
+  s.length = (uint64)cm->c[i].note_len;
+  return s;
+}
+
+fn cp_add(cm: MercComplete*, kind: int32, from: int64, to: int64, text: string, note: string, count: int64, capped: bool) {
+  for i in 0..cm->n {
+    var c: MercCand* = &cm->c[i];
+    if (c->kind == kind && c->text_len == (int64)text.length && memcmp((rawptr)(cm->buf.data + c->text_off), (rawptr)text.chars, (int64)text.length) == 0) {
+      c->count = c->count + count;
+      c->capped = c->capped || capped;
+      return;
+    }
+  }
+  if (cm->n >= MERC_COMPLETE_MAX) {
+    cm->more = true;
+    return;
+  }
+  var c2: MercCand* = &cm->c[cm->n];
+  c2->kind = kind;
+  c2->from = from;
+  c2->to = to;
+  c2->text_off = cm->buf.len;
+  merc_buf_text(&cm->buf, text);
+  c2->text_len = (int64)text.length;
+  c2->note_off = cm->buf.len;
+  merc_buf_text(&cm->buf, note);
+  c2->note_len = (int64)note.length;
+  c2->count = count;
+  c2->capped = capped;
+  cm->n = cm->n + 1;
+}
+
+fn cp_starts(s: string, p: string) -> bool {
+  if (s.length < p.length) { return false; }
+  for i in 0..(int64)p.length {
+    if (s.chars[i] != p.chars[i]) { return false; }
+  }
+  return true;
+}
+
+fn cp_sub(s: string, a: int64, b: int64) -> string {
+  var r: string;
+  r.chars = s.chars + a;
+  r.length = (uint64)(b - a);
+  return r;
+}
+
+fn cp_space(c: uint8) -> bool { return c == 32 || c == 9; }
+
+struct CpSt {
+  ni: int64;
+  j: int64;
+  d: int32;
+  n: int32[24];
+  c: int32[24];
+}
+
+var g_cp_a: CpSt*;
+var g_cp_b: CpSt*;
+var g_cp_stack: int64*;
+var g_cp_stack_cap: int64 = 0;
+
+fn cp_label_len(t: MercTrie*, ni: int64) -> int64 { return (int64)merc_node_label(t, (uint32)ni).length; }
+
+fn cp_step(t: MercTrie*, s: CpSt*, b: uint8) -> bool {
+  var lab: string = merc_node_label(t, (uint32)s->ni);
+  if (s->j < (int64)lab.length) {
+    if (lab.chars[s->j] != b) { return false; }
+    s->j = s->j + 1;
+    return true;
+  }
+  var c: int64 = merc_node_child(t, (uint32)s->ni, b);
+  if (c < 0) { return false; }
+  s->ni = c;
+  s->j = 0;
+  return true;
+}
+
+fn cp_next(t: MercTrie*, s: CpSt*, from: int32) -> int32 {
+  var lab: string = merc_node_label(t, (uint32)s->ni);
+  if (s->j < (int64)lab.length) {
+    var b: int32 = (int32)lab.chars[s->j];
+    if (b >= from) { return b; }
+    return -1;
+  }
+  return merc_node_next(t, (uint32)s->ni, from);
+}
+
+fn cp_count(t: MercTrie*, cm: MercComplete*, ni: int64, capped: bool*) -> int64 {
+  var sp: int64 = 0;
+  var n: int64 = 0;
+  if (g_cp_stack_cap == 0) {
+    g_cp_stack_cap = 4096;
+    g_cp_stack = (int64*)malloc(g_cp_stack_cap * 8);
+  }
+  g_cp_stack[sp] = ni;
+  sp = sp + 1;
+  *capped = false;
+  while (sp > 0) {
+    sp = sp - 1;
+    var x: int64 = g_cp_stack[sp];
+    cm->work = cm->work + 1;
+    if (merc_node_value(t, (uint32)x, (uint64*)0)) { n = n + 1; }
+    if (n >= CP_COUNT || cm->work > CP_WORK * 2) {
+      *capped = true;
+      return n;
+    }
+    var b: int32 = merc_node_next(t, (uint32)x, 0);
+    while (b >= 0) {
+      var c: int64 = merc_node_child(t, (uint32)x, (uint8)b);
+      if (c >= 0) {
+        if (sp == g_cp_stack_cap) {
+          *capped = true;
+          return n;
+        }
+        g_cp_stack[sp] = c;
+        sp = sp + 1;
+      }
+      b = merc_node_next(t, (uint32)x, b + 1);
+    }
+  }
+  return n;
+}
+
+fn cp_push(cm: MercComplete*, out: CpSt*, n: int32*, s: CpSt*) {
+  if (*n >= CP_STATES) {
+    cm->more = true;
+    return;
+  }
+  out[*n] = *s;
+  *n = *n + 1;
+}
+
+// every way to read one whole expression from s, each end kept as a state
+fn cp_any(t: MercTrie*, cm: MercComplete*, s: CpSt*, left: int64, raw: int64, out: CpSt*, n: int32*) {
+  if (cm->work > CP_WORK * 6 / 10 || *n >= CP_STATES) {
+    cm->more = true;
+    return;
+  }
+  if (left == 0 && raw == 0) {
+    cp_push(cm, out, n, s);
+    return;
+  }
+  var b: int32 = cp_next(t, s, 0);
+  while (b >= 0) {
+    var s2: CpSt = *s;
+    cm->work = cm->work + 1;
+    if (cp_step(t, &s2, (uint8)b)) {
+      if (raw > 0) {
+        cp_any(t, cm, &s2, left, raw - 1, out, n);
+      } else if (b < 64) {
+        cp_any(t, cm, &s2, left - 1 + (int64)b, 0, out, n);
+      } else if (b > 0xC0) {
+        cp_any(t, cm, &s2, left - 1, (int64)(b & 63), out, n);
+      } else {
+        cp_any(t, cm, &s2, left - 1, 0, out, n);
+      }
+    }
+    if (cm->more) { return; }
+    b = cp_next(t, s, b + 1);
+  }
+}
+
+fn cp_syms(t: MercTrie*, cm: MercComplete*, s: CpSt*, p: string, from: int64, to: int64) {
+  var b: int32 = cp_next(t, s, 0xC1);
+  while (b > 0xC0) {
+    var len: int64 = (int64)(b & 63);
+    if (len >= (int64)p.length) {
+      var s2: CpSt = *s;
+      if (cp_step(t, &s2, (uint8)b)) {
+        var word: uint8[64];
+        cp_sym_bytes(t, cm, &s2, p, len, 0, &word[0], from, to);
+      }
+    }
+    b = cp_next(t, s, b + 1);
+  }
+}
+
+fn cp_sym_bytes(t: MercTrie*, cm: MercComplete*, s: CpSt*, p: string, len: int64, at: int64, word: uint8*, from: int64, to: int64) {
+  if (cm->work > CP_WORK) {
+    cm->more = true;
+    return;
+  }
+  if (at == len) {
+    var w: string;
+    w.chars = word;
+    w.length = (uint64)len;
+    var capped: bool = false;
+    var cnt: int64 = cp_count(t, cm, s->ni, &capped);
+    cp_add(cm, MERC_CK_SYMBOL, from, to, w, "", cnt, capped);
+    return;
+  }
+  var b: int32 = cp_next(t, s, 0);
+  if (at < (int64)p.length) {
+    var want: int32 = (int32)p.chars[at];
+    b = cp_next(t, s, want);
+    if (b != want) { return; }
+  }
+  while (b >= 0) {
+    var s2: CpSt = *s;
+    cm->work = cm->work + 1;
+    if (cp_step(t, &s2, (uint8)b)) {
+      word[at] = (uint8)b;
+      cp_sym_bytes(t, cm, &s2, p, len, at + 1, word, from, to);
+    }
+    if (at < (int64)p.length) { return; }
+    b = cp_next(t, s, b + 1);
+  }
+}
+
+fn cp_expr(sh: MercShell*, cm: MercComplete*, line: string, start: int64, cursor: int64, pattern: bool) {
+  var t: MercTrie* = &sh->trie;
+  if (g_cp_a == 0) {
+    g_cp_a = (CpSt*)malloc((int64)CP_STATES * (int64)sizeof(CpSt));
+    g_cp_b = (CpSt*)malloc((int64)CP_STATES * (int64)sizeof(CpSt));
+  }
+  var na: int32 = 0;
+  var root: int64 = merc_node_root(t);
+  if (root < 0 || merc_count(t) == 0) { return; }
+  var s0: CpSt;
+  s0.ni = root;
+  s0.j = 0;
+  s0.d = 1;
+  s0.n[0] = 1;
+  s0.c[0] = 0;
+  g_cp_a[0] = s0;
+  na = 1;
+  var i: int64 = start;
+  var wstart: int64 = cursor;
+  while (i < cursor) {
+    var ch: uint8 = line.chars[i];
+    if (cp_space(ch)) {
+      i = i + 1;
+      continue;
+    }
+    var nb: int32 = 0;
+    if (ch == 40) {
+      for k in 0..na {
+        var st: CpSt* = &g_cp_a[k];
+        if (st->c[st->d - 1] >= st->n[st->d - 1] || st->d >= 24) { continue; }
+        var b: int32 = cp_next(t, st, 0);
+        while (b >= 0 && b < 64) {
+          var s2: CpSt = *st;
+          if (cp_step(t, &s2, (uint8)b)) {
+            s2.c[s2.d - 1] = s2.c[s2.d - 1] + 1;
+            s2.n[s2.d] = b;
+            s2.c[s2.d] = 0;
+            s2.d = s2.d + 1;
+            cp_push(cm, g_cp_b, &nb, &s2);
+          }
+          b = cp_next(t, st, b + 1);
+        }
+      }
+      i = i + 1;
+    } else if (ch == 41) {
+      for k2 in 0..na {
+        var st2: CpSt* = &g_cp_a[k2];
+        if (st2->d > 1 && st2->c[st2->d - 1] == st2->n[st2->d - 1]) {
+          var s3: CpSt = *st2;
+          s3.d = s3.d - 1;
+          cp_push(cm, g_cp_b, &nb, &s3);
+        }
+      }
+      i = i + 1;
+    } else {
+      var e: int64 = i;
+      while (e < (int64)line.length && !cp_space(line.chars[e]) && line.chars[e] != 40 && line.chars[e] != 41) { e = e + 1; }
+      if (e >= cursor) {
+        wstart = i;
+        break;
+      }
+      var word: string = cp_sub(line, i, e);
+      for k3 in 0..na {
+        var st3: CpSt* = &g_cp_a[k3];
+        if (st3->c[st3->d - 1] >= st3->n[st3->d - 1]) { continue; }
+        if (word.chars[0] == 36) {
+          var before: int32 = nb;
+          var s4: CpSt = *st3;
+          cp_any(t, cm, &s4, 1, 0, g_cp_b, &nb);
+          for q in before..nb { g_cp_b[q].c[g_cp_b[q].d - 1] = g_cp_b[q].c[g_cp_b[q].d - 1] + 1; }
+        } else {
+          if (word.length > 63) { continue; }
+          var s5: CpSt = *st3;
+          var ok: bool = cp_step(t, &s5, (uint8)(0xC0 + (int32)word.length));
+          var x: int64 = 0;
+          while (ok && x < (int64)word.length) {
+            ok = cp_step(t, &s5, word.chars[x]);
+            x = x + 1;
+          }
+          if (ok) {
+            s5.c[s5.d - 1] = s5.c[s5.d - 1] + 1;
+            cp_push(cm, g_cp_b, &nb, &s5);
+          }
+        }
+      }
+      i = e;
+    }
+    var sw: CpSt* = g_cp_a;
+    g_cp_a = g_cp_b;
+    g_cp_b = sw;
+    na = nb;
+    if (na == 0) { return; }
+  }
+  var p: string = cp_sub(line, wstart, cursor);
+  if (p.length > 0 && p.chars[0] == 36) { return; }
+  var room: bool = false;
+  for k5 in 0..na {
+    if (g_cp_a[k5].c[g_cp_a[k5].d - 1] < g_cp_a[k5].n[g_cp_a[k5].d - 1]) { room = true; }
+  }
+  if (pattern && p.length == 0 && room) { cp_add(cm, MERC_CK_VARIABLE, wstart, cursor, "$", "any expression", 0, false); }
+  for k4 in 0..na {
+    var st4: CpSt* = &g_cp_a[k4];
+    if (st4->c[st4->d - 1] >= st4->n[st4->d - 1]) { continue; }
+    cp_syms(t, cm, st4, p, wstart, cursor);
+  }
+}
+
+fn cp_path(cm: MercComplete*, line: string, start: int64, cursor: int64) {
+  var word: string = cp_sub(line, start, cursor);
+  var slash: int64 = -1;
+  for i in 0..(int64)word.length {
+    if (word.chars[i] == 47) { slash = i; }
+  }
+  var dir: MercBuf;
+  var base: string = word;
+  var base_at: int64 = start;
+  if (slash >= 0) {
+    var d: string = cp_sub(word, 0, slash + 1);
+    if (d.length > 0 && d.chars[0] == 126) {
+      merc_buf_text(&dir, env_get_or("HOME", ""));
+      merc_buf_text(&dir, cp_sub(d, 1, (int64)d.length));
+    } else {
+      merc_buf_text(&dir, d);
+    }
+    base = cp_sub(word, slash + 1, (int64)word.length);
+    base_at = start + slash + 1;
+  } else {
+    merc_buf_text(&dir, ".");
+  }
+  var fd: FsDir;
+  if (fs_dir_open(merc_buf_view(&dir), &fd) < 0) {
+    merc_buf_free(&dir);
+    return;
+  }
+  var names: MercBuf;
+  var offs: int64[256];
+  var lens: int64[256];
+  var rank: int32[256];
+  var nn: int32 = 0;
+  var e: FsDirEntry;
+  while (fs_dir_next(&fd, &e) > 0 && nn < 256) {
+    if (!cp_starts(e.name, base)) { continue; }
+    if (e.name.length > 0 && e.name.chars[0] == 46 && (base.length == 0 || base.chars[0] != 46)) { continue; }
+    var is_dir: bool = e.kind == FS_DIR;
+    if (e.kind == FS_SYMLINK) {
+      var full: MercBuf;
+      merc_buf_text(&full, merc_buf_view(&dir));
+      merc_buf_text(&full, "/");
+      merc_buf_text(&full, e.name);
+      is_dir = fs_is_dir(merc_buf_view(&full));
+      merc_buf_free(&full);
+    }
+    offs[nn] = names.len;
+    merc_buf_text(&names, e.name);
+    if (is_dir) { merc_buf_push(&names, 47); }
+    lens[nn] = names.len - offs[nn];
+    var nm: string = merc_buf_view(&names);
+    var r: int32 = 1;
+    if (is_dir) { r = 0; }
+    var tail: string = cp_sub(nm, offs[nn], offs[nn] + lens[nn]);
+    var tl: int64 = (int64)tail.length;
+    if (tl > 4 && cp_starts(cp_sub(tail, tl - 4, tl), ".mm2")) { r = 0; }
+    if (tl > 6 && cp_starts(cp_sub(tail, tl - 6, tl), ".metta")) { r = 0; }
+    rank[nn] = r;
+    nn = nn + 1;
+  }
+  fs_dir_close(&fd);
+  var order: int32[256];
+  for k in 0..nn { order[k] = k; }
+  for a in 1..nn {
+    var cur: int32 = order[a];
+    var b: int32 = a - 1;
+    while (b >= 0 && cp_before(&names, offs, lens, rank, cur, order[b])) {
+      order[b + 1] = order[b];
+      b = b - 1;
+    }
+    order[b + 1] = cur;
+  }
+  for k2 in 0..nn {
+    var o: int32 = order[k2];
+    var note: string = "";
+    if (names.data[offs[o] + lens[o] - 1] == 47) { note = "folder"; }
+    cp_add(cm, MERC_CK_PATH, base_at, cursor, cp_sub(merc_buf_view(&names), offs[o], offs[o] + lens[o]), note, 0, false);
+  }
+  merc_buf_free(&names);
+  merc_buf_free(&dir);
+}
+
+fn cp_before(names: MercBuf*, offs: int64*, lens: int64*, rank: int32*, a: int32, b: int32) -> bool {
+  if (rank[a] != rank[b]) { return rank[a] < rank[b]; }
+  var la: int64 = lens[a];
+  var lb: int64 = lens[b];
+  var n: int64 = la;
+  if (lb < n) { n = lb; }
+  for i in 0..n {
+    var ca: uint8 = names->data[offs[a] + i];
+    var cb: uint8 = names->data[offs[b] + i];
+    if (ca != cb) { return ca < cb; }
+  }
+  return la < lb;
+}
+
+fn cp_sort_syms(cm: MercComplete*) {
+  for a in 1..cm->n {
+    var cur: MercCand = cm->c[a];
+    var b: int32 = a - 1;
+    while (b >= 0 && cm->c[b].kind == MERC_CK_SYMBOL && cur.kind == MERC_CK_SYMBOL && cm->c[b].count < cur.count) {
+      cm->c[b + 1] = cm->c[b];
+      b = b - 1;
+    }
+    cm->c[b + 1] = cur;
+  }
+}
+
+fn cp_is_pattern(cmd: string) -> bool {
+  return sh_is(cmd, "match") || sh_is(cmd, "count") || sh_is(cmd, "transform") || sh_is(cmd, "save");
+}
+
+export fn merc_shell_complete(sh: MercShell*, line: string, cursor: int64, out: MercComplete*) {
+  out->n = 0;
+  out->more = false;
+  out->work = 0;
+  merc_buf_clear(&out->buf);
+  var cur: int64 = cursor;
+  if (cur > (int64)line.length) { cur = (int64)line.length; }
+  if (cur < 0) { cur = 0; }
+  var i: int64 = 0;
+  while (i < cur && cp_space(line.chars[i])) { i = i + 1; }
+  if (i < cur && line.chars[i] == 40) {
+    cp_expr(sh, out, line, i, cur, false);
+    cp_sort_syms(out);
+    return;
+  }
+  var w0: int64 = i;
+  while (i < (int64)line.length && !cp_space(line.chars[i])) { i = i + 1; }
+  if (cur <= i) {
+    var p: string = cp_sub(line, w0, cur);
+    var t: ShCmd* = sh_cmds();
+    for k in 0..SH_CMDS {
+      if (k >= 19) { continue; }
+      if (cp_starts(t[k].name, p)) {
+        var note: string = t[k].basic;
+        if (note.length == 0) { note = t[k].note; }
+        cp_add(out, MERC_CK_COMMAND, w0, cur, t[k].name, note, 0, false);
+      }
+    }
+    return;
+  }
+  var cmd: string = cp_sub(line, w0, i);
+  while (i < cur && cp_space(line.chars[i])) { i = i + 1; }
+  var a0: int64 = i;
+  if (sh_is(cmd, "z")) {
+    var e: int64 = a0;
+    while (e < (int64)line.length && !cp_space(line.chars[e])) { e = e + 1; }
+    if (cur <= e) {
+      var mp: string = cp_sub(line, a0, cur);
+      for m in 0..SH_MOVES - 1 {
+        if (cp_starts(g_move_table[m].name, mp)) { cp_add(out, MERC_CK_MOVE, a0, cur, g_move_table[m].name, g_move_table[m].note, 0, false); }
+      }
+      return;
+    }
+    if (sh_is(cp_sub(line, a0, e), "expr")) {
+      var x0: int64 = e;
+      while (x0 < cur && cp_space(line.chars[x0])) { x0 = x0 + 1; }
+      cp_expr(sh, out, line, x0, cur, false);
+      cp_sort_syms(out);
+    }
+    return;
+  }
+  if (sh_is(cmd, "gpu") || sh_is(cmd, "help")) {
+    var gp: string = cp_sub(line, a0, cur);
+    for g in 0..cur - a0 { if (cp_space(gp.chars[g])) { return; } }
+    if (sh_is(cmd, "gpu")) {
+      var opts: string[3] = ["on", "off", "auto"];
+      var notes: string[3] = ["always scan the flat copy", "always walk the trie", "scan when it pays"];
+      for o in 0..3 { if (cp_starts(opts[o], gp)) { cp_add(out, MERC_CK_MOVE, a0, cur, opts[o], notes[o], 0, false); } }
+    } else if (cp_starts("all", gp)) {
+      cp_add(out, MERC_CK_MOVE, a0, cur, "all", "every command", 0, false);
+    }
+    return;
+  }
+  if (sh_is(cmd, "load") || sh_is(cmd, "save") || sh_is(cmd, "run")) {
+    var fe: int64 = a0;
+    while (fe < (int64)line.length && !cp_space(line.chars[fe])) { fe = fe + 1; }
+    if (cur <= fe) {
+      cp_path(out, line, a0, cur);
+      return;
+    }
+    if (sh_is(cmd, "save")) {
+      var s0: int64 = fe;
+      while (s0 < cur && cp_space(line.chars[s0])) { s0 = s0 + 1; }
+      cp_expr(sh, out, line, s0, cur, true);
+      cp_sort_syms(out);
+    }
+    return;
+  }
+  if (sh_is(cmd, "add") || sh_is(cmd, "del") || sh_is(cmd, "has") || cp_is_pattern(cmd)) {
+    if (sh_is(cmd, "transform")) {
+      for q in a0..cur - 1 {
+        if (line.chars[q] == 61 && line.chars[q + 1] == 62) { return; }
+      }
+    }
+    cp_expr(sh, out, line, a0, cur, cp_is_pattern(cmd));
+    cp_sort_syms(out);
+  }
+}

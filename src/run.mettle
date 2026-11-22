@@ -1,0 +1,1748 @@
+// running rules. a rule is an expression stored like any other:
+//   (exec place (, pattern pattern) (, shape shape))
+// one step takes the first rule in key order out of the trie, finds every
+// way all its patterns match at once, and stores each shape with the
+// variables filled in. a rule can see itself while it runs, and nothing it
+// stores is seen until the step is over. same meaning as MORK.
+
+import "std/mem";
+import "trie";
+import "expr";
+import "query";
+import "pure";
+
+const RUN_MAX: int64 = 16;
+const RUN_SHAPES: int64 = 64;
+const RUN_RANGES: int64 = 256;
+
+const K_ADD: uint8 = 1;
+const K_DEL: uint8 = 2;
+const K_COUNT: uint8 = 3;
+const K_SUM: uint8 = 4;
+const K_AND: uint8 = 5;
+const K_PURE: uint8 = 6;
+const K_HEAD: uint8 = 7;
+const K_TAIL: uint8 = 8;
+const K_FSUM: uint8 = 9;
+const K_FMIN: uint8 = 10;
+const K_FMAX: uint8 = 11;
+const K_FPROD: uint8 = 12;
+
+struct Seek {
+  trie: MercTrie*;
+  rule: uint8*;
+  pats: uint8*;
+  q: MercQuery*;
+  u: MercUnify*;
+  live: uint8[16];
+  zips: MercZip*;
+  zlive: uint8[16];
+  zfloor: int64[16];
+  zstate: int32[16];
+  ztail: int32[16];
+  found: MercBuf[16];
+  ptup: MercBuf;
+  dtup: MercBuf;
+  ask: MercBuf;
+  made: MercBuf;
+  cuts: MercBuf;
+  ops: MercBuf;
+  addb: MercBuf;
+  adda: MercBuf;
+  aord: MercBuf;
+  astart: int64[257];
+  nadds: int64;
+  batch: bool;
+  pstate: int32;        // 0 take the next kept prefix, 1 search below it, 2 walk below it
+  pfloor: int64;
+  matches: int64;
+  unifies: int64;
+}
+
+fn seek_new(t: MercTrie*) -> Seek* {
+  var s: Seek* = (Seek*)calloc(1, sizeof(Seek));
+  if (s == 0) { return s; }
+  s->trie = t;
+  s->q = (MercQuery*)calloc(RUN_MAX, sizeof(MercQuery));
+  s->u = (MercUnify*)calloc(RUN_MAX + 1, sizeof(MercUnify));
+  s->zips = (MercZip*)calloc(RUN_MAX, sizeof(MercZip));
+  return s;
+}
+
+fn seek_free(s: Seek*) {
+  if (s == 0) { return; }
+  for i: int64 in 0..RUN_MAX {
+    if (s->live[i] != 0) { merc_query_free(s->q + i); }
+    if (s->zlive[i] != 0) { merc_zip_free(s->zips + i); }
+    merc_buf_free(&s->found[i]);
+  }
+  if (s->q != 0) { free(s->q); }
+  if (s->u != 0) { free(s->u); }
+  if (s->zips != 0) { free(s->zips); }
+  merc_buf_free(&s->ptup);
+  merc_buf_free(&s->dtup);
+  merc_buf_free(&s->ask);
+  merc_buf_free(&s->made);
+  merc_buf_free(&s->cuts);
+  merc_buf_free(&s->ops);
+  merc_buf_free(&s->addb);
+  merc_buf_free(&s->adda);
+  merc_buf_free(&s->aord);
+  free(s);
+}
+
+export struct MercRun {
+  trie: MercTrie*;
+  main: rawptr;
+  parts: rawptr*;
+  part_cap: int64;
+  part_lo: MercBuf;
+  plan: rawptr;
+  first: MercBuf;
+  first_at: MercBuf;
+  rule: MercBuf;
+  same: MercBuf;
+  pats: MercBuf;
+  order: MercBuf;
+  spare: MercBuf;
+  extra: MercBuf;
+  // when set, runs merc_run_part for parts 0 to n on any cores and returns once all are done.
+  spread: fn(MercRun*, int64) -> bool;
+  wide_min: int64;
+  used: int64;
+  phase: int32;         // what merc_run_part does: 0 search, 1 sort into ranges, 2 build a range
+  by_prefix: bool;
+  tail_walk: bool;
+  floor0: int64;
+  tail0: int32;
+  ranges: int64;
+  range_trie: MercTrie*;
+  cut_bytes: MercBuf;
+  cut_at: MercBuf;
+  steps: int64;
+  matches: int64;
+  unifies: int64;
+  writes: int64;
+  skipped: int64;
+}
+
+export fn merc_run_init(r: MercRun*, t: MercTrie*) -> bool {
+  var blank: MercRun;
+  *r = blank;
+  r->trie = t;
+  r->wide_min = 64;
+  r->main = (rawptr)seek_new(t);
+  return r->main != 0;
+}
+
+export fn merc_run_free(r: MercRun*) {
+  seek_free((Seek*)r->main);
+  for i: int64 in 0..r->part_cap { seek_free((Seek*)r->parts[i]); }
+  if (r->parts != 0) { free(r->parts); }
+  merc_buf_free(&r->part_lo);
+  if (r->range_trie != 0) {
+    for q: int64 in 0..RUN_RANGES { merc_free(r->range_trie + q); }
+    free(r->range_trie);
+  }
+  merc_buf_free(&r->cut_bytes);
+  merc_buf_free(&r->cut_at);
+  merc_buf_free(&r->first);
+  merc_buf_free(&r->first_at);
+  merc_buf_free(&r->rule);
+  merc_buf_free(&r->same);
+  merc_buf_free(&r->pats);
+  merc_buf_free(&r->order);
+  merc_buf_free(&r->spare);
+  merc_buf_free(&r->extra);
+}
+
+fn run_view(p: uint8*, n: int64) -> string {
+  var s: string;
+  s.chars = p;
+  s.length = (uint64)n;
+  return s;
+}
+
+// adds e to out with its variables numbered from first. gives how many
+// variables e has, or -1 past 64.
+fn run_shift(e: string, first: int32, out: MercBuf*) -> int32 {
+  var p: uint8* = e.chars;
+  var n: int64 = (int64)e.length;
+  var i: int64 = 0;
+  var vars: int32 = 0;
+  while (i < n) {
+    var tag: uint8 = p[i];
+    i = i + 1;
+    if (tag > 0xC0) {
+      merc_buf_push(out, tag);
+      merc_buf_add(out, p + i, (int64)(tag & 63));
+      i = i + (int64)(tag & 63);
+    } else if (tag == 0xC0) {
+      merc_buf_push(out, tag);
+      vars = vars + 1;
+    } else if (tag >= 0x80) {
+      var id: int32 = (int32)(tag & 63) + first;
+      if (id > 63) { return -1; }
+      merc_buf_push(out, (uint8)(0x80 + id));
+    } else {
+      merc_buf_push(out, tag);
+    }
+  }
+  if (first + vars > 64) { return -1; }
+  return vars;
+}
+
+fn run_unify(r: Seek*, pats: uint8*, pat_end: int64*, upto: int64) -> bool {
+  merc_buf_clear(&r->ptup);
+  merc_buf_clear(&r->dtup);
+  merc_buf_push(&r->ptup, (uint8)(upto + 1));
+  merc_buf_push(&r->ptup, 0xC1);
+  merc_buf_push(&r->ptup, 44);
+  merc_buf_add(&r->ptup, pats, pat_end[upto - 1]);
+  merc_buf_push(&r->dtup, (uint8)(upto + 1));
+  merc_buf_push(&r->dtup, 0xC1);
+  merc_buf_push(&r->dtup, 44);
+  var vars: int32 = 0;
+  for i: int64 in 0..upto {
+    var got: int32 = run_shift(merc_buf_view(&r->found[i]), vars, &r->dtup);
+    if (got < 0) { return false; }
+    vars = vars + got;
+  }
+  r->unifies = r->unifies + 1;
+  return merc_unify(r->u + upto, merc_buf_view(&r->ptup), merc_buf_view(&r->dtup));
+}
+
+fn run_newvars(p: uint8*, n: int64) -> int32 {
+  return merc_var_count(run_view(p, n));
+}
+
+fn run_is(p: uint8*, arity: uint8, name: string) -> bool {
+  if (p[0] != arity || p[1] != (uint8)(0xC0 + name.length)) { return false; }
+  for k: int64 in 0..(int64)name.length {
+    if (p[2 + k] != name.chars[k]) { return false; }
+  }
+  return true;
+}
+
+fn run_sink(s: uint8*, n: int64, skip: int64*) -> uint8 {
+  if (n >= 4 && s[0] == 2 && s[1] == 0xC1 && s[2] == 43) { *skip = 3; return K_ADD; }
+  if (n >= 4 && s[0] == 2 && s[1] == 0xC1 && s[2] == 45) { *skip = 3; return K_DEL; }
+  if (n > 7 && run_is(s, 4, "count")) { *skip = 7; return K_COUNT; }
+  if (n > 5 && run_is(s, 4, "sum")) { *skip = 5; return K_SUM; }
+  if (n > 5 && run_is(s, 4, "and")) { *skip = 5; return K_AND; }
+  if (n > 6 && run_is(s, 4, "pure")) { *skip = 6; return K_PURE; }
+  if (n > 6 && run_is(s, 4, "fsum")) { *skip = 6; return K_FSUM; }
+  if (n > 6 && run_is(s, 4, "fmin")) { *skip = 6; return K_FMIN; }
+  if (n > 6 && run_is(s, 4, "fmax")) { *skip = 6; return K_FMAX; }
+  if (n > 7 && run_is(s, 4, "fprod")) { *skip = 7; return K_FPROD; }
+  var head: bool = run_is(s, 3, "head");
+  if (n > 7 && (head || run_is(s, 3, "tail"))) {
+    var tag: uint8 = s[6];
+    if (tag <= 0xC0) { return 0; }
+    var len: int64 = (int64)(tag & 63);
+    var max: int64 = 0;
+    for k: int64 in 0..len {
+      var c: uint8 = s[7 + k];
+      if (c < 48 || c > 57) { return 0; }
+      max = max * 10 + (int64)(c - 48);
+    }
+    if (max == 0) { return 0; }
+    *skip = 7 + len;
+    if (head) { return K_HEAD; }
+    return K_TAIL;
+  }
+  return 0;
+}
+
+struct Plan {
+  k: int64;
+  pat_at: int64[16];
+  pat_end: int64[16];
+  before: int32[17];
+  rel: uint8[16];      // 1 same expression as relto, 2 a different one
+  relto: int64[16];
+  pat_vars: int32;
+  m: int64;
+  tpl_at: int64[64];
+  tpl_n: int64[64];
+  kind: uint8[64];
+  skip: int64[64];
+  base: int32[64];
+  moved: bool;
+  req_at: int64[64];
+  req_n: int64[64];
+  root: int64[64];
+}
+
+fn run_prefix(p: uint8*, n: int64, less: int64) -> int64 {
+  var i: int64 = 0;
+  while (i < n) {
+    var tag: uint8 = p[i];
+    if (tag >= 0x80 && tag <= 0xC0) { return i; }
+    i = i + 1;
+    if (tag > 0xC0) { i = i + (int64)(tag & 63); }
+  }
+  return n - less;
+}
+
+fn bits(x: uint64) -> int64 {
+  var n: int64 = 0;
+  var v: uint64 = x;
+  while (v != (uint64)0) {
+    v = v & (v - (uint64)1);
+    n = n + 1;
+  }
+  return n;
+}
+
+// the set of matches does not depend on the order the patterns run in, so
+// each next pattern is the one with the fewest new variables, then the most
+// fixed parts. variables are numbered again for that order, in the patterns
+// and in the shapes, and every write comes out the same.
+fn run_reorder(r: MercRun*, pl: Plan*, tpl: int64, tpl_n: int64) {
+  var k: int64 = pl->k;
+  var p: uint8* = r->pats.data;
+  var uses: uint64[16];
+  var fixed: int64[16];
+  for i: int64 in 0..k {
+    uses[i] = 0;
+    fixed[i] = 0;
+    var cnt: int32 = pl->before[i];
+    var at: int64 = pl->pat_at[i];
+    while (at < pl->pat_end[i]) {
+      var tag: uint8 = p[at];
+      at = at + 1;
+      if (tag > 0xC0) { fixed[i] = fixed[i] + 1; at = at + (int64)(tag & 63); }
+      else if (tag == 0xC0) { uses[i] = uses[i] | ((uint64)1 << (uint64)cnt); cnt = cnt + 1; }
+      else if (tag >= 0x80) { uses[i] = uses[i] | ((uint64)1 << (uint64)(tag & 63)); }
+    }
+  }
+  var perm: int64[16];
+  var taken: bool[16];
+  for i2: int64 in 0..k { taken[i2] = false; }
+  var bound: uint64 = 0;
+  var moved: bool = false;
+  for step: int64 in 0..k {
+    var best: int64 = -1;
+    var best_new: int64 = 0;
+    var best_fix: int64 = 0;
+    for c: int64 in 0..k {
+      if (taken[c]) { continue; }
+      var fresh: int64 = bits(uses[c] & ~bound);
+      var fix: int64 = fixed[c] + bits(uses[c] & bound);
+      if (best < 0 || fresh < best_new || (fresh == best_new && fix > best_fix)) {
+        best = c;
+        best_new = fresh;
+        best_fix = fix;
+      }
+    }
+    perm[step] = best;
+    taken[best] = true;
+    bound = bound | uses[best];
+    if (best != step) { moved = true; }
+  }
+  pl->moved = moved;
+  if (!moved) { return; }
+  var newid: int32[64];
+  for v: int64 in 0..64 { newid[v] = -1; }
+  var next: int32 = 0;
+  var out: MercBuf* = &r->extra;
+  merc_buf_clear(out);
+  var at2: int64[16];
+  var end2: int64[16];
+  for s2: int64 in 0..k {
+    var i3: int64 = perm[s2];
+    at2[s2] = out->len;
+    var cnt2: int32 = pl->before[i3];
+    var a: int64 = pl->pat_at[i3];
+    while (a < pl->pat_end[i3]) {
+      var tag2: uint8 = p[a];
+      a = a + 1;
+      if (tag2 > 0xC0) {
+        merc_buf_push(out, tag2);
+        merc_buf_add(out, p + a, (int64)(tag2 & 63));
+        a = a + (int64)(tag2 & 63);
+      } else if (tag2 < 0x80) {
+        merc_buf_push(out, tag2);
+      } else {
+        var g: int32 = (int32)(tag2 & 63);
+        if (tag2 == 0xC0) {
+          g = cnt2;
+          cnt2 = cnt2 + 1;
+        }
+        if (newid[g] < 0) {
+          newid[g] = next;
+          next = next + 1;
+          merc_buf_push(out, 0xC0);
+        } else {
+          merc_buf_push(out, (uint8)(0x80 + newid[g]));
+        }
+      }
+    }
+    end2[s2] = out->len;
+  }
+  merc_buf_clear(&r->pats);
+  merc_buf_add(&r->pats, out->data, out->len);
+  for s3: int64 in 0..k {
+    pl->pat_at[s3] = at2[s3];
+    pl->pat_end[s3] = end2[s3];
+  }
+  var q: uint8* = r->pats.data;
+  for i4: int64 in 0..k {
+    pl->before[i4 + 1] = pl->before[i4] + run_newvars(q + pl->pat_at[i4], pl->pat_end[i4] - pl->pat_at[i4]);
+  }
+  merc_buf_clear(&r->same);
+  merc_buf_add(&r->same, r->rule.data, r->rule.len);
+  var t: uint8* = r->same.data;
+  var b: int64 = tpl + 3;
+  while (b < tpl + tpl_n) {
+    var tag3: uint8 = t[b];
+    if (tag3 > 0xC0) { b = b + 1 + (int64)(tag3 & 63); continue; }
+    if (tag3 >= 0x80 && tag3 < 0xC0 && (int32)(tag3 & 63) < pl->pat_vars) {
+      t[b] = (uint8)(0x80 + newid[(int32)(tag3 & 63)]);
+    }
+    b = b + 1;
+  }
+}
+
+// one rule. gives 1 when it ran, 2 when merc cannot run its kind, 0 when the
+// expression is not a rule at all.
+fn run_plan(r: MercRun*, pl: Plan*) -> int32 {
+  var e: uint8* = r->rule.data;
+  var n: int64 = r->rule.len;
+  var at: int64 = 6;
+  var loc: int64 = merc_span(e + at, n - at);
+  if (loc < 0) { return 0; }
+  var pat: int64 = at + loc;
+  var pat_n: int64 = merc_span(e + pat, n - pat);
+  if (pat_n < 3) { return 0; }
+  var tpl: int64 = pat + pat_n;
+  var tpl_n: int64 = merc_span(e + tpl, n - tpl);
+  if (tpl_n < 3 || tpl + tpl_n != n) { return 0; }
+  if (e[pat] == 0 || e[pat] >= 64 || e[pat + 1] != 0xC1) { return 0; }
+  if (e[tpl] == 0 || e[tpl] >= 64 || e[tpl + 1] != 0xC1) { return 0; }
+  var src: bool = e[pat + 2] == 73;
+  if (e[pat + 2] != 44 && !src) { return 0; }
+  var sink: bool = e[tpl + 2] == 79;
+  if (e[tpl + 2] != 44 && !sink) { return 0; }
+  var items: int64 = (int64)e[pat] - 1;
+  var m: int64 = (int64)e[tpl] - 1;
+  if (m > RUN_SHAPES) { return 2; }
+
+  // the patterns one after another. a source's wrapper holds no variables,
+  // so taking it off keeps the numbering.
+  merc_buf_clear(&r->pats);
+  var k: int64 = 0;
+  var p_at: int64 = pat + 3;
+  for i: int64 in 0..items {
+    var s_n: int64 = merc_span(e + p_at, n - p_at);
+    if (!src) {
+      if (k >= RUN_MAX) { return 2; }
+      pl->rel[k] = 0;
+      pl->pat_at[k] = r->pats.len;
+      merc_buf_add(&r->pats, e + p_at, s_n);
+      pl->pat_end[k] = r->pats.len;
+      k = k + 1;
+    } else if (s_n > 5 && run_is(e + p_at, 2, "BTM")) {
+      if (k >= RUN_MAX) { return 2; }
+      pl->rel[k] = 0;
+      pl->pat_at[k] = r->pats.len;
+      merc_buf_add(&r->pats, e + p_at + 5, s_n - 5);
+      pl->pat_end[k] = r->pats.len;
+      k = k + 1;
+    } else if (s_n > 4 && e[p_at] == 3 && e[p_at + 1] == 0xC2 && (e[p_at + 2] == 33 || e[p_at + 2] == 61) && e[p_at + 3] == 61) {
+      if (k + 2 > RUN_MAX) { return 2; }
+      var a_at: int64 = p_at + 4;
+      var a_n: int64 = merc_span(e + a_at, n - a_at);
+      pl->rel[k] = 0;
+      pl->pat_at[k] = r->pats.len;
+      merc_buf_add(&r->pats, e + a_at, a_n);
+      pl->pat_end[k] = r->pats.len;
+      pl->rel[k + 1] = 1;
+      if (e[p_at + 2] == 33) { pl->rel[k + 1] = 2; }
+      pl->relto[k + 1] = k;
+      pl->pat_at[k + 1] = r->pats.len;
+      merc_buf_add(&r->pats, e + a_at + a_n, s_n - 4 - a_n);
+      pl->pat_end[k + 1] = r->pats.len;
+      k = k + 2;
+    } else {
+      return 2;
+    }
+    p_at = p_at + s_n;
+  }
+  pl->k = k;
+  var pats: uint8* = r->pats.data;
+  pl->before[0] = 0;
+  for i2: int64 in 0..k {
+    pl->before[i2 + 1] = pl->before[i2] + run_newvars(pats + pl->pat_at[i2], pl->pat_end[i2] - pl->pat_at[i2]);
+  }
+  pl->pat_vars = pl->before[k];
+
+  pl->m = m;
+  var t_at: int64 = tpl + 3;
+  var base: int32 = pl->pat_vars;
+  for j: int64 in 0..m {
+    var t_n: int64 = merc_span(e + t_at, n - t_at);
+    pl->tpl_at[j] = t_at;
+    pl->tpl_n[j] = t_n;
+    pl->base[j] = base;
+    if (sink) {
+      var skip: int64 = 0;
+      var kind: uint8 = run_sink(e + t_at, t_n, &skip);
+      if (kind == 0) { return 2; }
+      pl->kind[j] = kind;
+      pl->skip[j] = skip;
+    } else {
+      pl->kind[j] = K_ADD;
+      pl->skip[j] = 0;
+    }
+    if (sink && pl->kind[j] == K_PURE) {
+      var tt: int64 = t_at + 6;
+      var tt_n: int64 = merc_span(e + tt, n - tt);
+      pl->req_at[j] = tt;
+      pl->req_n[j] = run_prefix(e + tt, tt_n, 1);
+    } else {
+      var less: int64 = 1;
+      if (pl->kind[j] == K_ADD) { less = 0; }
+      pl->req_at[j] = t_at + pl->skip[j];
+      pl->req_n[j] = run_prefix(e + t_at, t_n, less) - pl->skip[j];
+    }
+    base = base + run_newvars(e + t_at, t_n);
+    t_at = t_at + t_n;
+  }
+  for j2: int64 in 0..m {
+    pl->root[j2] = j2;
+    for c: int64 in 0..m {
+      var cn: int64 = pl->req_n[c];
+      var best: int64 = pl->root[j2];
+      if (cn <= pl->req_n[j2] && memcmp(e + pl->req_at[c], e + pl->req_at[j2], cn) == 0 && cn < pl->req_n[best]) {
+        pl->root[j2] = c;
+      }
+    }
+  }
+  pl->moved = false;
+  if (!src && k >= 2) { run_reorder(r, pl, tpl, tpl_n); }
+  return 1;
+}
+
+struct Binds {
+  at: uint8*[64];
+  len: int64[64];
+  extra: int32[64];
+  fresh: int32;
+}
+
+fn fast_fill(b: Binds*, shape: uint8*, n: int64, base: int32, bound: int32, out: MercBuf*) {
+  for k in 0..64 { b->extra[k] = -1; }
+  b->fresh = 0;
+  var next: int32 = base;
+  var i: int64 = 0;
+  while (i < n) {
+    var tag: uint8 = shape[i];
+    i = i + 1;
+    if (tag > 0xC0) {
+      var len: int64 = (int64)(tag & 63);
+      merc_buf_room(out, len + 1);
+      out->data[out->len] = tag;
+      memcpy(out->data + out->len + 1, shape + i, len);
+      out->len = out->len + len + 1;
+      i = i + len;
+    } else if (tag < 64) {
+      merc_buf_push(out, tag);
+    } else {
+      var id: int32 = next;
+      if (tag == 0xC0) { next = next + 1; } else { id = (int32)(tag & 63); }
+      if (id < bound) {
+        merc_buf_add(out, b->at[id], b->len[id]);
+      } else if (b->extra[id] < 0) {
+        b->extra[id] = b->fresh;
+        b->fresh = b->fresh + 1;
+        merc_buf_push(out, 0xC0);
+      } else {
+        merc_buf_push(out, (uint8)(0x80 + b->extra[id]));
+      }
+    }
+  }
+}
+
+fn fast_ask(b: Binds*, shape: uint8*, n: int64, first: int32, out: MercBuf*) {
+  var i: int64 = 0;
+  while (i < n) {
+    var tag: uint8 = shape[i];
+    i = i + 1;
+    if (tag > 0xC0) {
+      var len: int64 = (int64)(tag & 63);
+      merc_buf_push(out, tag);
+      merc_buf_add(out, shape + i, len);
+      i = i + len;
+    } else if (tag < 0x80) {
+      merc_buf_push(out, tag);
+    } else if (tag == 0xC0) {
+      merc_buf_push(out, tag);
+    } else {
+      var id: int32 = (int32)(tag & 63);
+      if (id < first) {
+        merc_buf_add(out, b->at[id], b->len[id]);
+      } else {
+        merc_buf_push(out, (uint8)(0x80 + id - first));
+      }
+    }
+  }
+}
+
+fn run_ask(r: Seek*, level: int64, ask: string) {
+  if (r->live[level] == 0) {
+    r->q[level] = merc_query(r->trie, ask);
+    r->live[level] = 1;
+  } else {
+    merc_query_again(r->q + level, ask);
+  }
+}
+
+// a pattern that is plain keys, maybe ending in new variables, is
+// walked straight down the trie. gives false when a stored variable sits
+// where the walk would pass, and then the search has to do it.
+fn probe_start(r: Seek*, level: int64, ask: string) -> bool {
+  if (r->zlive[level] == 0) {
+    r->zips[level] = merc_zip(r->trie);
+    r->zlive[level] = 1;
+  }
+  var z: MercZip* = r->zips + level;
+  merc_zip_reset(z);
+  var p: uint8* = ask.chars;
+  var n: int64 = (int64)ask.length;
+  var end: int64 = n;
+  while (end > 0 && p[end - 1] == 0xC0) { end = end - 1; }
+  var tail: bool = end < n;
+  r->ztail[level] = (int32)(n - end);
+  var i: int64 = 0;
+  var gone: bool = false;
+  while (i < end) {
+    var tag: uint8 = p[i];
+    if (tag >= 0x80 && tag <= 0xC0) { return false; }
+    if (!gone) {
+      var v: int32 = merc_zip_next(z, 0x80);
+      if (v >= 0x80 && v <= 0xC0) { return false; }
+      if (!merc_zip_step(z, tag)) { gone = true; }
+    }
+    i = i + 1;
+    if (tag > 0xC0) {
+      var len: int64 = (int64)(tag & 63);
+      if (!gone && !merc_zip_descend(z, run_view(p + i, len))) { gone = true; }
+      i = i + len;
+    }
+  }
+  if (tail && !gone) {
+    var v2: int32 = merc_zip_next(z, 0x80);
+    if (v2 >= 0x80 && v2 <= 0xC0) { return false; }
+  }
+  r->zfloor[level] = merc_zip_depth(z);
+  r->zstate[level] = 0;
+  if (tail) { r->zstate[level] = 1; }
+  if (gone) { r->zstate[level] = 2; }
+  return true;
+}
+
+fn has_var(p: uint8*, n: int64) -> bool {
+  var i: int64 = 0;
+  while (i < n) {
+    var tag: uint8 = p[i];
+    i = i + 1;
+    if (tag >= 0x80 && tag <= 0xC0) { return true; }
+    if (tag > 0xC0) { i = i + (int64)(tag & 63); }
+  }
+  return false;
+}
+
+fn probe_next(r: Seek*, level: int64, exact: bool*) -> bool {
+  var z: MercZip* = r->zips + level;
+  var st: int32 = r->zstate[level];
+  if (st == 2) { return false; }
+  if (st == 0) {
+    r->zstate[level] = 2;
+    *exact = true;
+    return merc_zip_get(z, (uint64*)0);
+  }
+  if (!merc_zip_next_value(z, r->zfloor[level])) {
+    r->zstate[level] = 2;
+    return false;
+  }
+  var path: string = merc_zip_path(z);
+  var fl: int64 = r->zfloor[level];
+  *exact = !has_var(path.chars + fl, (int64)path.length - fl);
+  return true;
+}
+
+fn tail_bind(b: Binds*, first: int32, vars: int32, p: uint8*, from: int64, to: int64) {
+  var at: int64 = from;
+  for v in 0..vars {
+    var n: int64 = merc_span(p + at, to - at);
+    b->at[first + v] = p + at;
+    b->len[first + v] = n;
+    at = at + n;
+  }
+}
+
+fn same_bytes(a: MercBuf*, b: MercBuf*) -> bool {
+  if (a->len != b->len) { return false; }
+  return memcmp(a->data, b->data, a->len) == 0;
+}
+
+fn keep_first(r: MercRun*, f: MercBuf*, exact: bool, nv: int32, from: int32*, to: int32*) {
+  var at: int64 = r->first_at.len / 8;
+  var start: int64 = r->first.len;
+  merc_buf_add(&r->first_at, (uint8*)&start, 8);
+  var head: int64[4];
+  head[0] = f->len;
+  head[1] = 0;
+  if (exact) { head[1] = 1; }
+  head[2] = (int64)nv;
+  head[3] = 0;
+  merc_buf_add(&r->first, (uint8*)&head[0], 32);
+  merc_buf_add(&r->first, f->data, f->len);
+  for v in 0..nv {
+    var ft: int64[2];
+    ft[0] = (int64)from[v];
+    ft[1] = (int64)to[v];
+    merc_buf_add(&r->first, (uint8*)&ft[0], 16);
+  }
+}
+
+fn prefix_next(s: Seek*, r: MercRun*, pat0: string, at: int64*, hi: int64) -> bool {
+  while (true) {
+    if (s->pstate == 1) {
+      if (merc_query_next(s->q)) { return true; }
+      s->pstate = 0;
+    }
+    if (s->pstate == 2) {
+      if (merc_zip_next_value(s->zips, s->pfloor)) { return true; }
+      s->pstate = 0;
+    }
+    if (*at >= hi) { return false; }
+    var rec: int64* = (int64*)r->first_at.data;
+    if (r->tail_walk) {
+      if (s->zlive[0] == 0) {
+        s->zips[0] = merc_zip(s->trie);
+        s->zlive[0] = 1;
+      }
+      var z: MercZip* = s->zips;
+      merc_zip_reset(z);
+      merc_zip_descend(z, run_view(r->first.data + rec[2 * *at], rec[2 * *at + 1]));
+      *at = *at + 1;
+      s->pstate = 2;
+      s->pfloor = merc_zip_depth(z);
+      if (merc_zip_get(z, (uint64*)0)) { return true; }
+      continue;
+    }
+    run_ask(s, 0, pat0);
+    merc_query_pin(s->q, run_view(r->first.data + rec[2 * *at], rec[2 * *at + 1]));
+    *at = *at + 1;
+    s->pstate = 1;
+  }
+  return false;
+}
+
+fn fixed_walk(z: MercZip*, p: uint8*, n: int64) -> bool {
+  merc_zip_reset(z);
+  var i: int64 = 0;
+  while (i < n) {
+    var tag: uint8 = p[i];
+    if (tag >= 0x80 && tag <= 0xC0) { return true; }
+    var v: int32 = merc_zip_next(z, 0x80);
+    if (v >= 0x80 && v <= 0xC0) { return false; }
+    if (!merc_zip_step(z, tag)) { return true; }
+    i = i + 1;
+    if (tag > 0xC0) {
+      var len: int64 = (int64)(tag & 63);
+      if (!merc_zip_descend(z, run_view(p + i, len))) { return true; }
+      i = i + len;
+    }
+  }
+  return true;
+}
+
+fn cut_prefixes(r: MercRun*, s: Seek*) -> int64 {
+  var z: MercZip* = s->zips;
+  var start: string = merc_zip_path(z);
+  merc_buf_clear(&r->first);
+  merc_buf_clear(&r->first_at);
+  var pe: int64[2];
+  pe[0] = 0;
+  pe[1] = (int64)start.length;
+  merc_buf_text(&r->first, start);
+  merc_buf_add(&r->first_at, (uint8*)&pe[0], 16);
+  var n: int64 = 1;
+  for round in 0..12 {
+    if (n >= 2048) { break; }
+    merc_buf_clear(&r->extra);
+    merc_buf_clear(&r->spare);
+    var grew: bool = false;
+    var rec: int64* = (int64*)r->first_at.data;
+    for i: int64 in 0..n {
+      var pb: uint8* = r->first.data + rec[2 * i];
+      var pn: int64 = rec[2 * i + 1];
+      merc_zip_reset(z);
+      merc_zip_descend(z, run_view(pb, pn));
+      var c: int32 = -1;
+      if (!merc_zip_get(z, (uint64*)0)) { c = merc_zip_next(z, 0); }
+      if (c < 0) {
+        var ne: int64[2];
+        ne[0] = r->extra.len;
+        ne[1] = pn;
+        merc_buf_add(&r->extra, pb, pn);
+        merc_buf_add(&r->spare, (uint8*)&ne[0], 16);
+        continue;
+      }
+      while (c >= 0) {
+        var ce: int64[2];
+        ce[0] = r->extra.len;
+        ce[1] = pn + 1;
+        merc_buf_add(&r->extra, pb, pn);
+        merc_buf_push(&r->extra, (uint8)c);
+        merc_buf_add(&r->spare, (uint8*)&ce[0], 16);
+        grew = true;
+        c = merc_zip_next(z, c + 1);
+      }
+    }
+    n = r->spare.len / 16;
+    merc_buf_clear(&r->first);
+    merc_buf_add(&r->first, r->extra.data, r->extra.len);
+    merc_buf_clear(&r->first_at);
+    merc_buf_add(&r->first_at, r->spare.data, r->spare.len);
+    if (!grew) { break; }
+  }
+  merc_zip_reset(z);
+  return n;
+}
+
+fn run_match(r: Seek*, pl: Plan*, list: MercRun*, lo: int64, hi: int64) {
+  var e: uint8* = r->rule;
+  var k: int64 = pl->k;
+  var m: int64 = pl->m;
+  var pats: uint8* = r->pats;
+  var b: Binds;
+  var fast: bool[17];
+  var probe: bool[17];
+  fast[0] = true;
+  probe[0] = false;
+  var level: int64 = 0;
+  var at0: int64 = lo;
+  if (k == 0) {
+    merc_buf_clear(&r->ptup);
+    merc_buf_push(&r->ptup, 1);
+    merc_buf_push(&r->ptup, 0xC1);
+    merc_buf_push(&r->ptup, 44);
+    merc_unify(r->u, merc_buf_view(&r->ptup), merc_buf_view(&r->ptup));
+  } else if (list == 0) {
+    probe[0] = probe_start(r, 0, run_view(pats, pl->pat_end[0]));
+    if (!probe[0]) { run_ask(r, 0, run_view(pats, pl->pat_end[0])); }
+  }
+  var going: bool = true;
+  while (going) {
+    var whole: bool = k == 0;
+    var quick: bool = k == 0;
+    if (k > 0) {
+      var q: MercQuery* = r->q + level;
+      var exact: bool = false;
+      var got: bool = false;
+      var f: MercBuf* = &r->found[level];
+      if (level == 0 && list != 0 && list->by_prefix) {
+        if (!prefix_next(r, list, run_view(pats, pl->pat_end[0]), &at0, hi)) { break; }
+        merc_buf_clear(f);
+        if (list->tail_walk) {
+          merc_buf_text(f, merc_zip_path(r->zips));
+          quick = !has_var(f->data + list->floor0, f->len - list->floor0);
+          if (quick) { tail_bind(&b, 0, list->tail0, f->data, list->floor0, f->len); }
+          else if (!run_unify(r, pats, &pl->pat_end[0], 1)) { continue; }
+        } else {
+        merc_buf_text(f, merc_query_match(q));
+        quick = q->exact;
+        if (quick) {
+          for v1 in 0..q->nvars {
+            b.at[v1] = f->data + q->from[v1];
+            b.len[v1] = (int64)(q->to[v1] - q->from[v1]);
+          }
+        } else if (!run_unify(r, pats, &pl->pat_end[0], 1)) {
+          continue;
+        }
+        }
+      } else if (level == 0 && list != 0) {
+        if (at0 >= hi) { break; }
+        var rec: uint8* = list->first.data + ((int64*)list->first_at.data)[at0];
+        at0 = at0 + 1;
+        var head: int64* = (int64*)rec;
+        merc_buf_clear(f);
+        merc_buf_add(f, rec + 32, head[0]);
+        exact = head[1] != 0;
+        quick = exact;
+        if (quick) {
+          var ft: int64* = (int64*)(rec + 32 + head[0]);
+          for v0: int64 in 0..head[2] {
+            b.at[v0] = f->data + ft[2 * v0];
+            b.len[v0] = ft[2 * v0 + 1] - ft[2 * v0];
+          }
+        } else if (!run_unify(r, pats, &pl->pat_end[0], 1)) {
+          continue;
+        }
+      } else {
+        if (probe[level]) { got = probe_next(r, level, &exact); }
+        else {
+          got = merc_query_next(q);
+          exact = q->exact;
+        }
+        if (!got) {
+          if (level == 0) { break; }
+          level = level - 1;
+          continue;
+        }
+        merc_buf_clear(f);
+        if (probe[level]) { merc_buf_text(f, merc_zip_path(r->zips + level)); }
+        else { merc_buf_text(f, merc_query_match(q)); }
+        if (pl->rel[level] == 1 && !same_bytes(f, &r->found[pl->relto[level]])) { continue; }
+        if (pl->rel[level] == 2 && same_bytes(f, &r->found[pl->relto[level]])) { continue; }
+        quick = fast[level] && exact;
+        if (quick && probe[level]) {
+          tail_bind(&b, pl->before[level], r->ztail[level], f->data, r->zfloor[level], f->len);
+        } else if (quick) {
+          var first: int32 = pl->before[level];
+          for v in 0..q->nvars {
+            b.at[first + v] = f->data + q->from[v];
+            b.len[first + v] = (int64)(q->to[v] - q->from[v]);
+          }
+        } else if (!run_unify(r, pats, &pl->pat_end[0], level + 1)) {
+          continue;
+        }
+      }
+      if (level + 1 < k) {
+        var next: int64 = level + 1;
+        merc_buf_clear(&r->ask);
+        var p_at: int64 = pl->pat_at[next];
+        var p_n: int64 = pl->pat_end[next] - p_at;
+        if (quick) {
+          fast_ask(&b, pats + p_at, p_n, pl->before[next], &r->ask);
+        } else {
+          merc_unify_fresh(r->u + next);
+          merc_unify_fill_from(r->u + next, run_view(pats + p_at, p_n), pl->before[next], &r->ask);
+        }
+        fast[next] = quick;
+        probe[next] = quick && probe_start(r, next, merc_buf_view(&r->ask));
+        if (!probe[next]) { run_ask(r, next, merc_buf_view(&r->ask)); }
+        level = next;
+        continue;
+      }
+      whole = true;
+    }
+    if (whole) {
+      r->matches = r->matches + 1;
+      var u: MercUnify* = r->u + k;
+      for j: int64 in 0..m {
+        if (quick && r->batch && pl->kind[j] == K_ADD) {
+          var a0: int64 = r->addb.len;
+          fast_fill(&b, e + pl->tpl_at[j], pl->tpl_n[j], pl->base[j], pl->pat_vars, &r->addb);
+          var sk0: int64 = pl->skip[j];
+          if (sk0 > 0) {
+            memmove(r->addb.data + a0, r->addb.data + a0 + sk0, r->addb.len - a0 - sk0);
+            r->addb.len = r->addb.len - sk0;
+          }
+          var ab0: int64[2];
+          ab0[0] = a0;
+          ab0[1] = r->addb.len - a0;
+          merc_buf_add(&r->adda, (uint8*)&ab0[0], 16);
+          r->nadds = r->nadds + 1;
+          continue;
+        }
+        var start: int64 = r->made.len;
+        if (quick) {
+          fast_fill(&b, e + pl->tpl_at[j], pl->tpl_n[j], pl->base[j], pl->pat_vars, &r->made);
+        } else {
+          merc_unify_fresh(u);
+          merc_unify_fill_from(u, run_view(e + pl->tpl_at[j], pl->tpl_n[j]), pl->base[j], &r->made);
+        }
+        var size: int64 = r->made.len - start;
+        if (r->batch && pl->kind[j] == K_ADD) {
+          var sk: int64 = pl->skip[j];
+          var ab: int64[2];
+          ab[0] = r->addb.len;
+          ab[1] = size - sk;
+          merc_buf_add(&r->addb, r->made.data + start + sk, size - sk);
+          merc_buf_add(&r->adda, (uint8*)&ab[0], 16);
+          r->nadds = r->nadds + 1;
+          r->made.len = start;
+          continue;
+        }
+        merc_buf_add(&r->cuts, (uint8*)&size, 8);
+        merc_buf_push(&r->ops, (uint8)j);
+      }
+      if (k == 0) { going = false; }
+    }
+  }
+}
+
+fn gather_first(r: MercRun*, s: Seek*, pl: Plan*) -> int64 {
+  merc_buf_clear(&r->first);
+  merc_buf_clear(&r->first_at);
+  var pats: uint8* = s->pats;
+  var ask: string = run_view(pats, pl->pat_end[0]);
+  var probe: bool = probe_start(s, 0, ask);
+  if (!probe) { run_ask(s, 0, ask); }
+  var f: MercBuf* = &s->found[0];
+  var n: int64 = 0;
+  var one: int32[64];
+  var end: int32[64];
+  while (true) {
+    var exact: bool = false;
+    if (probe) {
+      if (!probe_next(s, 0, &exact)) { break; }
+      merc_buf_clear(f);
+      merc_buf_text(f, merc_zip_path(s->zips));
+      var at: int64 = s->zfloor[0];
+      var nv: int32 = s->ztail[0];
+      for v in 0..nv {
+        var sp: int64 = merc_span(f->data + at, f->len - at);
+        one[v] = (int32)at;
+        end[v] = (int32)(at + sp);
+        at = at + sp;
+      }
+      keep_first(r, f, exact, nv, &one[0], &end[0]);
+    } else {
+      if (!merc_query_next(s->q)) { break; }
+      merc_buf_clear(f);
+      merc_buf_text(f, merc_query_match(s->q));
+      keep_first(r, f, s->q->exact, s->q->nvars, &s->q->from[0], &s->q->to[0]);
+    }
+    n = n + 1;
+  }
+  return n;
+}
+
+fn range_of(r: MercRun*, k: uint8*, n: int64) -> int64 {
+  var lo: int64 = 0;
+  var hi: int64 = r->ranges - 1;
+  var cut: int64* = (int64*)r->cut_at.data;
+  while (lo < hi) {
+    var mid: int64 = (lo + hi) / 2;
+    if (bcmp(r->cut_bytes.data + cut[2 * mid], cut[2 * mid + 1], k, n) <= 0) { lo = mid + 1; } else { hi = mid; }
+  }
+  return lo;
+}
+
+fn part_ranges(r: MercRun*, s: Seek*) {
+  var n: int64 = s->nadds;
+  var at: int64* = (int64*)s->adda.data;
+  merc_buf_clear(&s->aord);
+  merc_buf_room(&s->aord, n * 8);
+  var which: int32* = (int32*)s->aord.data;
+  for q: int64 in 0..(RUN_RANGES + 1) { s->astart[q] = 0; }
+  merc_buf_clear(&r->extra);
+  for e: int64 in 0..n {
+    var w: int64 = range_of(r, s->addb.data + at[2 * e], at[2 * e + 1]);
+    s->astart[w + 1] = s->astart[w + 1] + 1;
+    which[e] = (int32)w;
+  }
+  for q2: int64 in 0..RUN_RANGES { s->astart[q2 + 1] = s->astart[q2 + 1] + s->astart[q2]; }
+  var fill: int64[256];
+  for q3: int64 in 0..RUN_RANGES { fill[q3] = s->astart[q3]; }
+  var ord: int32* = (int32*)malloc(n * 4 + 4);
+  for e2: int64 in 0..n {
+    var w2: int64 = (int64)which[e2];
+    ord[fill[w2]] = (int32)e2;
+    fill[w2] = fill[w2] + 1;
+  }
+  memcpy(s->aord.data, ord, n * 4);
+  s->aord.len = n * 4;
+  free(ord);
+}
+
+fn build_range(r: MercRun*, w: int64) {
+  var t: MercTrie* = r->range_trie + w;
+  merc_clear(t);
+  var cnt: int64 = 0;
+  for p0: int64 in 0..r->used {
+    var s0: Seek* = (Seek*)r->parts[p0];
+    cnt = cnt + s0->astart[w + 1] - s0->astart[w];
+  }
+  merc_reserve(t, (uint64)(cnt * 12));
+  for p: int64 in 0..r->used {
+    var s: Seek* = (Seek*)r->parts[p];
+    var at: int64* = (int64*)s->adda.data;
+    var ord: int32* = (int32*)s->aord.data;
+    for x: int64 in s->astart[w]..s->astart[w + 1] {
+      var e: int64 = (int64)ord[x];
+      merc_put(t, run_view(s->addb.data + at[2 * e], at[2 * e + 1]), 1);
+    }
+  }
+}
+
+export fn merc_run_part(r: MercRun*, i: int64) -> bool {
+  if (r->phase == 1) {
+    part_ranges(r, (Seek*)r->parts[i]);
+    return true;
+  }
+  if (r->phase == 2) {
+    build_range(r, i);
+    return true;
+  }
+  var s: Seek* = (Seek*)r->parts[i];
+  var lo: int64 = ((int64*)r->part_lo.data)[i];
+  var hi: int64 = ((int64*)r->part_lo.data)[i + 1];
+  run_match(s, (Plan*)r->plan, r, lo, hi);
+  return true;
+}
+
+// what the parts store goes in as one set, their other writes in part order.
+fn run_search(r: MercRun*, s: Seek*, pl: Plan*) {
+  if (r->spread == 0 || pl->k < 1) {
+    run_match(s, pl, (MercRun*)0, 0, 0);
+    return;
+  }
+  r->by_prefix = false;
+  var n: int64 = 0;
+  if (s->zlive[0] == 0) {
+    s->zips[0] = merc_zip(s->trie);
+    s->zlive[0] = 1;
+  }
+  r->tail_walk = probe_start(s, 0, run_view(s->pats, pl->pat_end[0])) && s->zstate[0] == 1;
+  r->floor0 = s->zfloor[0];
+  r->tail0 = s->ztail[0];
+  if (r->tail_walk || (fixed_walk(s->zips, s->pats, pl->pat_end[0]) && merc_zip_exists(s->zips))) {
+    n = cut_prefixes(r, s);
+    if (n < r->wide_min) {
+      run_match(s, pl, (MercRun*)0, 0, 0);
+      return;
+    }
+    r->by_prefix = true;
+  } else {
+    n = gather_first(r, s, pl);
+    if (n < r->wide_min) {
+      run_match(s, pl, r, 0, n);
+      return;
+    }
+  }
+  var parts: int64 = n;
+  if (parts > 64) { parts = 64; }
+  if (parts > r->part_cap) {
+    var p: rawptr* = (rawptr*)realloc(r->parts, parts * 8);
+    if (p == 0) {
+      run_match(s, pl, r, 0, n);
+      return;
+    }
+    r->parts = p;
+    while (r->part_cap < parts) {
+      r->parts[r->part_cap] = (rawptr)seek_new(r->trie);
+      r->part_cap = r->part_cap + 1;
+    }
+  }
+  merc_buf_clear(&r->part_lo);
+  for i: int64 in 0..(parts + 1) {
+    var lo: int64 = n * i / parts;
+    merc_buf_add(&r->part_lo, (uint8*)&lo, 8);
+  }
+  for i2: int64 in 0..parts {
+    var ps: Seek* = (Seek*)r->parts[i2];
+    ps->rule = s->rule;
+    ps->pats = s->pats;
+    merc_buf_clear(&ps->made);
+    merc_buf_clear(&ps->cuts);
+    merc_buf_clear(&ps->ops);
+    merc_buf_clear(&ps->addb);
+    merc_buf_clear(&ps->adda);
+    ps->nadds = 0;
+    ps->pstate = 0;
+    ps->batch = true;
+    ps->matches = 0;
+    ps->unifies = 0;
+  }
+  r->plan = (rawptr)pl;
+  r->used = parts;
+  r->phase = 0;
+  if (!r->spread(r, parts)) {
+    for i3: int64 in 0..parts { merc_run_part(r, i3); }
+  }
+  for i4: int64 in 0..parts {
+    var ps2: Seek* = (Seek*)r->parts[i4];
+    merc_buf_add(&s->made, ps2->made.data, ps2->made.len);
+    merc_buf_add(&s->cuts, ps2->cuts.data, ps2->cuts.len);
+    merc_buf_add(&s->ops, ps2->ops.data, ps2->ops.len);
+    s->matches = s->matches + ps2->matches;
+    s->unifies = s->unifies + ps2->unifies;
+  }
+}
+
+fn put(r: MercRun*, p: uint8*, n: int64) -> bool {
+  r->writes = r->writes + 1;
+  return merc_put(r->trie, run_view(p, n), 1) != MERC_FAILED;
+}
+
+fn bcmp(a: uint8*, an: int64, b: uint8*, bn: int64) -> int32 {
+  var n: int64 = an;
+  if (bn < n) { n = bn; }
+  var c: int32 = memcmp(a, b, n);
+  if (c != 0) { return c; }
+  if (an < bn) { return -1; }
+  if (an > bn) { return 1; }
+  return 0;
+}
+
+fn sort_entries(base: uint8*, ent: int64*, tmp: int64*, count: int64) {
+  var width: int64 = 1;
+  var src: int64* = ent;
+  var dst: int64* = tmp;
+  while (width < count) {
+    var lo: int64 = 0;
+    while (lo < count) {
+      var mid: int64 = lo + width;
+      if (mid > count) { mid = count; }
+      var hi: int64 = lo + 2 * width;
+      if (hi > count) { hi = count; }
+      var i: int64 = lo;
+      var j: int64 = mid;
+      var o: int64 = lo;
+      while (i < mid || j < hi) {
+        var take_i: bool = j >= hi;
+        if (i < mid && j < hi) {
+          take_i = bcmp(base + src[2 * i], src[2 * i + 1], base + src[2 * j], src[2 * j + 1]) <= 0;
+        }
+        if (take_i) {
+          dst[2 * o] = src[2 * i];
+          dst[2 * o + 1] = src[2 * i + 1];
+          i = i + 1;
+        } else {
+          dst[2 * o] = src[2 * j];
+          dst[2 * o + 1] = src[2 * j + 1];
+          j = j + 1;
+        }
+        o = o + 1;
+      }
+      lo = hi;
+    }
+    var sw: int64* = src;
+    src = dst;
+    dst = sw;
+    width = width * 2;
+  }
+  if (src != ent) { memcpy(ent, src, count * 16); }
+}
+
+fn subst(t: uint8*, tn: int64, idx: int32, base: int32, sub: uint8*, sn: int64, out: MercBuf*) {
+  var var_count: int32 = 0;
+  var m: int32 = 0;
+  var i: int64 = 0;
+  while (i < tn) {
+    var tag: uint8 = t[i];
+    i = i + 1;
+    if (tag > 0xC0) {
+      var len: int64 = (int64)(tag & 63);
+      merc_buf_push(out, tag);
+      merc_buf_add(out, t + i, len);
+      i = i + len;
+    } else if (tag < 64) {
+      merc_buf_push(out, tag);
+    } else if (tag == 0xC0) {
+      if (var_count == idx) {
+        var j: int64 = 0;
+        m = 0;
+        while (j < sn) {
+          var s: uint8 = sub[j];
+          j = j + 1;
+          if (s > 0xC0) {
+            merc_buf_push(out, s);
+            merc_buf_add(out, sub + j, (int64)(s & 63));
+            j = j + (int64)(s & 63);
+          } else if (s == 0xC0) {
+            merc_buf_push(out, s);
+            m = m + 1;
+          } else if (s >= 0x80) {
+            var ri: int32 = (int32)(s & 63);
+            if (ri >= base) { ri = ri - base + idx; }
+            merc_buf_push(out, (uint8)(0x80 + ri));
+          } else {
+            merc_buf_push(out, s);
+          }
+        }
+      } else {
+        merc_buf_push(out, 0xC0);
+      }
+      var_count = var_count + 1;
+    } else {
+      var r: int32 = (int32)(tag & 63);
+      if (r == idx) {
+        var j2: int64 = 0;
+        var own: int32 = 0;
+        while (j2 < sn) {
+          var s2: uint8 = sub[j2];
+          j2 = j2 + 1;
+          if (s2 > 0xC0) {
+            merc_buf_push(out, s2);
+            merc_buf_add(out, sub + j2, (int64)(s2 & 63));
+            j2 = j2 + (int64)(s2 & 63);
+          } else if (s2 == 0xC0) {
+            merc_buf_push(out, (uint8)(0x80 + idx + own));
+            own = own + 1;
+          } else if (s2 >= 0x80) {
+            var r2: int32 = (int32)(s2 & 63);
+            if (r2 >= base) { r2 = idx + r2 - base; }
+            merc_buf_push(out, (uint8)(0x80 + r2));
+          } else {
+            merc_buf_push(out, s2);
+          }
+        }
+      } else if (r < idx) {
+        merc_buf_push(out, tag);
+      } else {
+        merc_buf_push(out, (uint8)(0x80 + r - 1 + m));
+      }
+    }
+  }
+}
+
+fn put_number(out: MercBuf*, v: uint64) {
+  var d: uint8[24];
+  var k: int32 = 0;
+  var u: uint64 = v;
+  if (u == (uint64)0) { d[0] = 48; k = 1; }
+  while (u > (uint64)0) {
+    d[k] = (uint8)(48 + (int32)(u % (uint64)10));
+    u = u / (uint64)10;
+    k = k + 1;
+  }
+  merc_buf_push(out, (uint8)(0xC0 + k));
+  while (k > 0) { k = k - 1; merc_buf_push(out, d[k]); }
+}
+
+fn sum_term(p: uint8*, n: int64, v: uint32*) -> bool {
+  if (n < 2) { return false; }
+  var acc: uint64 = 0;
+  for k: int64 in 1..n {
+    var c: uint8 = p[k];
+    if (c < 48 || c > 57) { return false; }
+    acc = acc * (uint64)10 + (uint64)(c - 48);
+    if (acc > (uint64)4294967295) { return false; }
+  }
+  *v = (uint32)acc;
+  return true;
+}
+
+fn fold_group(r: MercRun*, kind: uint8, base: uint8*, ent: int64*, lo: int64, hi: int64, tn: int64, root: uint8*, root_n: int64) -> bool {
+  var t: uint8* = base + ent[2 * lo];
+  if (kind == K_COUNT) {
+    var cnt: MercBuf* = &r->extra;
+    merc_buf_clear(cnt);
+    put_number(cnt, (uint64)(hi - lo));
+    var wrote_fixed: bool = false;
+    var any_new: bool = false;
+    var least: uint8 = 255;
+    for i: int64 in lo..hi {
+      var rp: uint8* = base + ent[2 * i] + tn;
+      var rn: int64 = ent[2 * i + 1] - tn;
+      if (rp[0] < least) { least = rp[0]; }
+      if (rp[0] == 0xC0) { any_new = true; }
+      if (rn >= cnt->len && memcmp(rp, cnt->data, cnt->len) == 0) { wrote_fixed = true; }
+    }
+    if (wrote_fixed && !put(r, t, tn)) { return false; }
+    if (any_new && !put(r, t, tn)) { return false; }
+    if (least >= 0x80 && least < 0xC0) {
+      merc_buf_clear(&r->spare);
+      subst(t, tn, (int32)(least & 63), 0, cnt->data, cnt->len, &r->spare);
+      if (!put(r, r->spare.data, r->spare.len)) { return false; }
+    }
+    return true;
+  }
+  // sum and and: one total for each distinct number V, then one for a V that refers back.
+  var i2: int64 = lo;
+  var least2: uint8 = 255;
+  var any_new2: bool = false;
+  for i3: int64 in lo..hi {
+    var f: uint8 = base[ent[2 * i3] + tn];
+    if (f < least2) { least2 = f; }
+    if (f == 0xC0) { any_new2 = true; }
+  }
+  while (i2 < hi) {
+    var rp2: uint8* = base + ent[2 * i2] + tn;
+    if (rp2[0] <= 0xC0) { i2 = i2 + 1; continue; }
+    var vn: int64 = 1 + (int64)(rp2[0] & 63);
+    var j: int64 = i2;
+    var total: uint32 = 0;
+    var mask: uint8 = 255;
+    while (j < hi && memcmp(base + ent[2 * j] + tn, rp2, vn) == 0) {
+      var sp: uint8* = base + ent[2 * j] + tn + vn;
+      var sn: int64 = ent[2 * j + 1] - tn - vn;
+      if (kind == K_SUM) {
+        var v: uint32 = 0;
+        if (!sum_term(sp, sn, &v)) { return true; }
+        total = total + v;
+      } else {
+        if (sn < 2) { return true; }
+        mask = mask & sp[1];
+      }
+      j = j + 1;
+    }
+    var want: MercBuf* = &r->extra;
+    merc_buf_clear(want);
+    if (kind == K_SUM) { put_number(want, (uint64)total); } else { merc_buf_push(want, 0xC1); merc_buf_push(want, mask); }
+    // this one MORK writes below its write root, so the root's bytes come first.
+    if (want->len == vn && memcmp(want->data, rp2, vn) == 0) {
+      merc_buf_clear(&r->spare);
+      merc_buf_add(&r->spare, root, root_n);
+      merc_buf_add(&r->spare, t, tn);
+      if (!put(r, r->spare.data, r->spare.len)) { return false; }
+    }
+    i2 = j;
+  }
+  if (any_new2 && !put(r, t, tn)) { return false; }
+  if (least2 >= 0x80 && least2 < 0xC0) {
+    var total2: uint32 = 0;
+    var mask2: uint8 = 255;
+    for i4: int64 in lo..hi {
+      var rp4: uint8* = base + ent[2 * i4] + tn;
+      if (rp4[0] != least2) { continue; }
+      var sp2: uint8* = rp4 + 1;
+      var sn2: int64 = ent[2 * i4 + 1] - tn - 1;
+      if (kind == K_SUM) {
+        var v2: uint32 = 0;
+        if (!sum_term(sp2, sn2, &v2)) { return true; }
+        total2 = total2 + v2;
+      } else {
+        if (sn2 < 2) { return true; }
+        mask2 = mask2 & sp2[1];
+      }
+    }
+    var w2: MercBuf* = &r->extra;
+    merc_buf_clear(w2);
+    if (kind == K_SUM) { put_number(w2, (uint64)total2); } else { merc_buf_push(w2, 0xC1); merc_buf_push(w2, mask2); }
+    merc_buf_clear(&r->spare);
+    subst(t, tn, (int32)(least2 & 63), 0, w2->data, w2->len, &r->spare);
+    if (!put(r, r->spare.data, r->spare.len)) { return false; }
+  }
+  return true;
+}
+
+fn float_term(p: uint8*, n: int64, v: float64*) -> bool {
+  if (n < 2) { return false; }
+  return merc_pure_parse_f64(p + 1, n - 1, v);
+}
+
+fn fnan(x: float64) -> bool {
+  return (__mtl_f64_bits(x) & 0x7FFFFFFFFFFFFFFF) > 0x7FF0000000000000;
+}
+
+fn fold_float(kind: uint8, acc: float64, x: float64) -> float64 {
+  if (kind == K_FSUM) { return acc + x; }
+  if (kind == K_FPROD) { return acc * x; }
+  if (fnan(x)) { return acc; }
+  if (fnan(acc)) { return x; }
+  if (kind == K_FMIN && x < acc) { return x; }
+  if (kind == K_FMAX && x > acc) { return x; }
+  return acc;
+}
+
+fn float_start(kind: uint8) -> float64 {
+  if (kind == K_FPROD) { return 1.0; }
+  if (kind == K_FMIN) { return 1.7976931348623157e308; }
+  if (kind == K_FMAX) { return -1.7976931348623157e308; }
+  return 0.0;
+}
+
+fn float_group(r: MercRun*, kind: uint8, base: uint8*, ent: int64*, lo: int64, hi: int64, tn: int64, root: uint8*, root_n: int64) -> bool {
+  var t: uint8* = base + ent[2 * lo];
+  var least: uint8 = 255;
+  var any_new: bool = false;
+  for i: int64 in lo..hi {
+    var f: uint8 = base[ent[2 * i] + tn];
+    if (f < least) { least = f; }
+    if (f == 0xC0) { any_new = true; }
+  }
+  var i2: int64 = lo;
+  while (i2 < hi) {
+    var rp: uint8* = base + ent[2 * i2] + tn;
+    if (rp[0] <= 0xC0) { i2 = i2 + 1; continue; }
+    var vn: int64 = 1 + (int64)(rp[0] & 63);
+    var j: int64 = i2;
+    var total: float64 = float_start(kind);
+    while (j < hi && memcmp(base + ent[2 * j] + tn, rp, vn) == 0) {
+      var x: float64 = 0.0;
+      if (!float_term(base + ent[2 * j] + tn + vn, ent[2 * j + 1] - tn - vn, &x)) { return true; }
+      total = fold_float(kind, total, x);
+      j = j + 1;
+    }
+    merc_buf_clear(&r->extra);
+    merc_pure_float_plain(total, &r->extra);
+    if (r->extra.len == vn - 1 && memcmp(r->extra.data, rp + 1, vn - 1) == 0) {
+      merc_buf_clear(&r->spare);
+      merc_buf_add(&r->spare, root, root_n);
+      merc_buf_add(&r->spare, t, tn);
+      if (!put(r, r->spare.data, r->spare.len)) { return false; }
+    }
+    i2 = j;
+  }
+  if (any_new && !put(r, t, tn)) { return false; }
+  if (least >= 0x80 && least < 0xC0) {
+    var total2: float64 = float_start(kind);
+    for i3: int64 in lo..hi {
+      var rp3: uint8* = base + ent[2 * i3] + tn;
+      if (rp3[0] != least) { continue; }
+      var x2: float64 = 0.0;
+      if (!float_term(rp3 + 1, ent[2 * i3 + 1] - tn - 1, &x2)) { return true; }
+      total2 = fold_float(kind, total2, x2);
+    }
+    var txt: MercBuf;
+    merc_pure_float_plain(total2, &txt);
+    merc_buf_clear(&r->extra);
+    merc_buf_push(&r->extra, (uint8)(0xC0 + txt.len));
+    merc_buf_add(&r->extra, txt.data, txt.len);
+    merc_buf_free(&txt);
+    merc_buf_clear(&r->spare);
+    subst(t, tn, (int32)(least & 63), 0, r->extra.data, r->extra.len, &r->spare);
+    if (!put(r, r->spare.data, r->spare.len)) { return false; }
+  }
+  return true;
+}
+
+fn pure_group(r: MercRun*, base: uint8*, ent: int64*, lo: int64, hi: int64, tn: int64) -> bool {
+  var t: uint8* = base + ent[2 * lo];
+  var least: uint8 = 255;
+  var any_new: bool = false;
+  for i: int64 in lo..hi {
+    var f: uint8 = base[ent[2 * i] + tn];
+    if (f < least) { least = f; }
+    if (f == 0xC0) { any_new = true; }
+  }
+  if (any_new && !put(r, t, tn)) { return false; }
+  if (least < 0x80 || least >= 0xC0) { return true; }
+  var tv: int32 = run_newvars(t, tn);
+  for i2: int64 in lo..hi {
+    var rp: uint8* = base + ent[2 * i2] + tn;
+    if (rp[0] != least) { continue; }
+    merc_buf_clear(&r->extra);
+    if (!merc_pure_eval(run_view(rp + 1, ent[2 * i2 + 1] - tn - 1), &r->extra)) { continue; }
+    merc_buf_clear(&r->spare);
+    subst(t, tn, (int32)(least & 63), tv, r->extra.data, r->extra.len, &r->spare);
+    if (!put(r, r->spare.data, r->spare.len)) { return false; }
+  }
+  return true;
+}
+
+fn finish_sink(r: MercRun*, pl: Plan*, j: int64) -> bool {
+  var sk: Seek* = (Seek*)r->main;
+  var kind: uint8 = pl->kind[j];
+  var count: int64 = sk->cuts.len / 8;
+  var sizes: int64* = (int64*)sk->cuts.data;
+  var base: uint8* = sk->made.data;
+  var skip: int64 = pl->skip[j];
+  if (kind == K_DEL) {
+    var at: int64 = 0;
+    for i: int64 in 0..count {
+      if ((int64)sk->ops.data[i] == j) {
+        merc_remove(r->trie, run_view(base + at + skip, sizes[i] - skip));
+        r->writes = r->writes + 1;
+      }
+      at = at + sizes[i];
+    }
+    return true;
+  }
+  merc_buf_clear(&r->order);
+  var at2: int64 = 0;
+  for i2: int64 in 0..count {
+    if ((int64)sk->ops.data[i2] == j) {
+      var off: int64 = at2 + skip;
+      var len: int64 = sizes[i2] - skip;
+      merc_buf_add(&r->order, (uint8*)&off, 8);
+      merc_buf_add(&r->order, (uint8*)&len, 8);
+    }
+    at2 = at2 + sizes[i2];
+  }
+  var n: int64 = r->order.len / 16;
+  if (n == 0) { return true; }
+  merc_buf_clear(&r->spare);
+  merc_buf_room(&r->spare, n * 16);
+  sort_entries(base, (int64*)r->order.data, (int64*)r->spare.data, n);
+  var ent: int64* = (int64*)r->order.data;
+  var w: int64 = 0;
+  for i3: int64 in 0..n {
+    if (w > 0 && bcmp(base + ent[2 * (w - 1)], ent[2 * (w - 1) + 1], base + ent[2 * i3], ent[2 * i3 + 1]) == 0) { continue; }
+    ent[2 * w] = ent[2 * i3];
+    ent[2 * w + 1] = ent[2 * i3 + 1];
+    w = w + 1;
+  }
+  n = w;
+  if (kind == K_HEAD || kind == K_TAIL) {
+    var max: int64 = 0;
+    var s: uint8* = r->rule.data + pl->tpl_at[j];
+    for k: int64 in 0..(int64)(s[6] & 63) { max = max * 10 + (int64)(s[7 + k] - 48); }
+    var from: int64 = 0;
+    var to: int64 = n;
+    if (n > max) {
+      if (kind == K_HEAD) { to = max; } else { from = n - max; }
+    }
+    for i4: int64 in from..to {
+      if (!put(r, base + ent[2 * i4], ent[2 * i4 + 1])) { return false; }
+    }
+    return true;
+  }
+  var lo: int64 = 0;
+  while (lo < n) {
+    var tn: int64 = merc_span(base + ent[2 * lo], ent[2 * lo + 1]);
+    var hi: int64 = lo + 1;
+    while (hi < n && ent[2 * hi + 1] > tn && memcmp(base + ent[2 * hi], base + ent[2 * lo], tn) == 0 && merc_span(base + ent[2 * hi], ent[2 * hi + 1]) == tn) {
+      hi = hi + 1;
+    }
+    var ok: bool = true;
+    if (kind == K_PURE) { ok = pure_group(r, base, ent, lo, hi, tn); }
+    else if (kind >= K_FSUM) {
+      var fj: int64 = pl->root[j];
+      ok = float_group(r, kind, base, ent, lo, hi, tn, r->rule.data + pl->req_at[fj], pl->req_n[fj]);
+    }
+    else {
+      var rj: int64 = pl->root[j];
+      ok = fold_group(r, kind, base, ent, lo, hi, tn, r->rule.data + pl->req_at[rj], pl->req_n[rj]);
+    }
+    if (!ok) { return false; }
+    lo = hi;
+  }
+  return true;
+}
+
+// what the parts store. a big batch is cut into ranges of keys by a sample,
+// each range is built into its own small trie on any core, and the ranges
+// are merged into the store in key order, mostly whole branches at a time.
+fn store_parts(r: MercRun*) -> bool {
+  var total: int64 = 0;
+  for p: int64 in 0..r->used { total = total + ((Seek*)r->parts[p])->nadds; }
+  r->writes = r->writes + total;
+  if (total < 20000 || r->spread == 0) {
+    for p2: int64 in 0..r->used {
+      var s: Seek* = (Seek*)r->parts[p2];
+      var at: int64* = (int64*)s->adda.data;
+      for e: int64 in 0..s->nadds {
+        if (merc_put(r->trie, run_view(s->addb.data + at[2 * e], at[2 * e + 1]), 1) == MERC_FAILED) { return false; }
+      }
+    }
+    return true;
+  }
+  if (r->range_trie == 0) {
+    r->range_trie = (MercTrie*)calloc(RUN_RANGES, sizeof(MercTrie));
+    if (r->range_trie == 0) { return false; }
+  }
+  var want: int64 = RUN_RANGES * 32;
+  merc_buf_clear(&r->cut_bytes);
+  merc_buf_clear(&r->order);
+  for p3: int64 in 0..r->used {
+    var s3: Seek* = (Seek*)r->parts[p3];
+    var take: int64 = s3->nadds * want / total + 1;
+    var at3: int64* = (int64*)s3->adda.data;
+    for x: int64 in 0..take {
+      if (s3->nadds == 0) { break; }
+      var e3: int64 = x * s3->nadds / take;
+      var se: int64[2];
+      se[0] = r->cut_bytes.len;
+      se[1] = at3[2 * e3 + 1];
+      merc_buf_add(&r->cut_bytes, s3->addb.data + at3[2 * e3], se[1]);
+      merc_buf_add(&r->order, (uint8*)&se[0], 16);
+    }
+  }
+  var got: int64 = r->order.len / 16;
+  merc_buf_clear(&r->spare);
+  merc_buf_room(&r->spare, got * 16);
+  sort_entries(r->cut_bytes.data, (int64*)r->order.data, (int64*)r->spare.data, got);
+  merc_buf_clear(&r->cut_at);
+  var ent: int64* = (int64*)r->order.data;
+  for c: int64 in 1..RUN_RANGES {
+    var pick: int64 = c * got / RUN_RANGES;
+    merc_buf_add(&r->cut_at, (uint8*)&ent[2 * pick], 16);
+  }
+  r->ranges = RUN_RANGES;
+  r->phase = 1;
+  if (!r->spread(r, r->used)) {
+    for p4: int64 in 0..r->used { merc_run_part(r, p4); }
+  }
+  r->phase = 2;
+  if (!r->spread(r, RUN_RANGES)) {
+    for w: int64 in 0..RUN_RANGES { merc_run_part(r, w); }
+  }
+  r->phase = 0;
+  for w2: int64 in 0..RUN_RANGES {
+    if (!merc_merge_in(r->trie, r->range_trie + w2)) { return false; }
+  }
+  return true;
+}
+
+// runs the first rule in the trie. 1 when a rule ran, 0 when none is left,
+// -1 when memory ran out.
+export fn merc_run_step(r: MercRun*) -> int32 {
+  var t: MercTrie* = r->trie;
+  var z: MercZip = merc_zip(t);
+  var head: uint8[6] = [4, 0xC4, 101, 120, 101, 99];
+  var there: bool = true;
+  for i in 0..6 {
+    if (!merc_zip_step(&z, head[i])) { there = false; break; }
+  }
+  if (!there || !merc_zip_next_value(&z, 6)) {
+    merc_zip_free(&z);
+    return 0;
+  }
+  merc_buf_clear(&r->rule);
+  merc_buf_text(&r->rule, merc_zip_path(&z));
+  merc_zip_free(&z);
+
+  var pl: Plan;
+  var w: Seek* = (Seek*)r->main;
+  merc_buf_clear(&w->made);
+  merc_buf_clear(&w->cuts);
+  merc_buf_clear(&w->ops);
+  w->matches = 0;
+  w->unifies = 0;
+  r->used = 0;
+  var kind: int32 = run_plan(r, &pl);
+  if (kind == 1) {
+    w->rule = r->rule.data;
+    if (pl.moved) { w->rule = r->same.data; }
+    w->pats = r->pats.data;
+    run_search(r, w, &pl);
+    r->matches = r->matches + w->matches;
+    r->unifies = r->unifies + w->unifies;
+  }
+  merc_remove(t, merc_buf_view(&r->rule));
+  r->steps = r->steps + 1;
+  if (kind == 2) { r->skipped = r->skipped + 1; }
+  if (kind != 1) { return 1; }
+
+  // what + and a plain shape store goes in while the matching runs in MORK,
+  // and the other sinks finish after it, in the order they are written.
+  if (r->used > 0 && !store_parts(r)) { return -1; }
+  var count: int64 = w->cuts.len / 8;
+  var sizes: int64* = (int64*)w->cuts.data;
+  var at: int64 = 0;
+  for i2: int64 in 0..count {
+    var j: int64 = (int64)w->ops.data[i2];
+    if (pl.kind[j] == K_ADD) {
+      if (!put(r, w->made.data + at + pl.skip[j], sizes[i2] - pl.skip[j])) { return -1; }
+    }
+    at = at + sizes[i2];
+  }
+  for j2: int64 in 0..pl.m {
+    if (pl.kind[j2] != K_ADD && !finish_sink(r, &pl, j2)) { return -1; }
+  }
+  return 1;
+}
+
+export fn merc_run(r: MercRun*, limit: int64) -> int64 {
+  var ran: int64 = 0;
+  while (ran < limit) {
+    var how: int32 = merc_run_step(r);
+    if (how <= 0) { break; }
+    ran = ran + 1;
+  }
+  return ran;
+}
+
+// mork run --steps N. MORK checks the count after it runs a rule, so it runs
+// one more than N when that many are there. gives the count MORK prints.
+export fn merc_run_steps(r: MercRun*, steps: int64) -> int64 {
+  var ran: int64 = 0;
+  while (true) {
+    var how: int32 = merc_run_step(r);
+    if (how <= 0) { break; }
+    if (ran >= steps) { break; }
+    ran = ran + 1;
+  }
+  return ran;
+}

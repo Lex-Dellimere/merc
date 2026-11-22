@@ -1,0 +1,23 @@
+// project file for merc. it builds one program, merc.
+
+import "mbuild/api";
+
+fn project() {
+  mb_package("merc", "0.1.0");
+  mb_meta("description", "a store for symbolic expressions. load them, search them with patterns, run rules over them");
+  mb_meta("repository", "https://github.com/Lex-Dellimere/merc");
+  mb_import_root("src");
+  mb_targets("linux");
+  mb_bin("merc", "src/main.mettle");
+  mb_link_libs("c");
+
+  // alph needs the port for this machine.
+  mb_for_bin("merc");
+  mb_set_list("flags", "-I, ../mettle/alph/ports/host");
+}
+
+// alph, mythic_ui and glint sit in a folder named mettle beside merc, see the readme.
+fn deps() {
+  mb_dep_path("mythic", "../mettle/mythic_ui");
+  mb_dep_path("alph", "../mettle/alph");
+}

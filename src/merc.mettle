@@ -1,0 +1,9 @@
+// merc. import "merc/merc" and you get the trie, the expression bytes,
+// the search and the command language. every name starts with merc_, Merc or MERC_.
+
+import "merc/trie";
+import "merc/expr";
+import "merc/query";
+import "merc/pure";
+import "merc/run";
+import "merc/shell";

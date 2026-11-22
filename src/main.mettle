@@ -1,0 +1,236 @@
+// merc. with nothing after it, it opens the window.
+// merc run FILE runs a program of rules and prints what is left, like mork run.
+// merc shell is the command line in a terminal.
+
+import "std/io";
+import "std/mem";
+import "std/file";
+import "std/time";
+import "merc/merc";
+import "wide";
+import "scan";
+import "window";
+
+var g_shell: MercShell;
+
+fn flush() {
+  if (g_shell.out.len > 0) {
+    if (g_shell.took_ns >= 100000) {
+      merc_buf_text(&g_shell.out, "  took ");
+      merc_shell_took(&g_shell, &g_shell.out);
+      merc_buf_push(&g_shell.out, 10);
+    }
+    print(merc_buf_view(&g_shell.out));
+    merc_buf_clear(&g_shell.out);
+  }
+}
+
+fn is_terminal() -> bool {
+  var probe: uint8[64];
+  return syscall(16, 0, 0x5401, &probe[0]) == 0;
+}
+
+fn arg(argv: cstring*, i: int32) -> string {
+  var p: uint8* = (uint8*)argv[i];
+  var n: int64 = 0;
+  while (p[n] != 0) { n = n + 1; }
+  var s: string;
+  s.chars = p;
+  s.length = (uint64)n;
+  return s;
+}
+
+fn is_word(s: string, w: string) -> bool {
+  if (s.length != w.length) { return false; }
+  for i: int64 in 0..(int64)s.length {
+    if (s.chars[i] != w.chars[i]) { return false; }
+  }
+  return true;
+}
+
+fn load_file(path: string) -> bool {
+  var fd: int64 = file_open(path, FILE_READ);
+  if (fd < 0) { return false; }
+  var n: int64 = file_size(fd);
+  var text: MercBuf;
+  merc_buf_room(&text, n + 1);
+  var got: int64 = 0;
+  while (got < n) {
+    var k: int64 = file_read_at(fd, text.data + got, n - got, got);
+    if (k <= 0) { break; }
+    got = got + k;
+  }
+  file_close(fd);
+  text.len = got;
+  merc_shell_load_text(&g_shell, merc_buf_view(&text));
+  merc_buf_free(&text);
+  return true;
+}
+
+fn number(d: string) -> int64 {
+  var v: int64 = 0;
+  for k: int64 in 0..(int64)d.length { v = v * 10 + (int64)(d.chars[k] - 48); }
+  return v;
+}
+
+var g_out_fd: int64 = -1;
+var g_out_at: int64 = 0;
+
+fn emit(p: uint8*, n: int64) {
+  if (g_out_fd >= 0) {
+    file_write_at(g_out_fd, p, n, g_out_at);
+    g_out_at = g_out_at + n;
+    return;
+  }
+  var s: string;
+  s.chars = p;
+  s.length = (uint64)n;
+  print(s);
+}
+
+// merc run IN [--aux-path FILE]... [--steps N] [--cores N] [OUT]. loads, runs the
+// rules and prints what is left, or writes it to OUT one expression a line.
+fn run_program(argc: int32, argv: cstring*) -> int32 {
+  var steps: int64 = 1000000000000000;
+  var cores: int64 = 8;
+  var loaded: bool = false;
+  var positional: int32 = 0;
+  var out_path: string = "";
+  var i: int32 = 2;
+  while (i < argc) {
+    var a: string = arg(argv, i);
+    if (is_word(a, "--steps") && i + 1 < argc) {
+      steps = number(arg(argv, i + 1));
+      i = i + 2;
+      continue;
+    }
+    if (is_word(a, "--cores") && i + 1 < argc) {
+      cores = number(arg(argv, i + 1));
+      i = i + 2;
+      continue;
+    }
+    var aux: bool = false;
+    if (is_word(a, "--aux-path") && i + 1 < argc) {
+      a = arg(argv, i + 1);
+      i = i + 1;
+      aux = true;
+    }
+    if (!aux && positional == 1) {
+      out_path = a;
+      positional = 2;
+      i = i + 1;
+      continue;
+    }
+    if (!aux) { positional = positional + 1; }
+    if (!load_file(a)) {
+      println("cannot read {a}");
+      return 1;
+    }
+    loaded = true;
+    i = i + 1;
+  }
+  if (!loaded) {
+    println("merc run IN [--aux-path FILE] [--steps N] [--cores N] [OUT]");
+    return 1;
+  }
+  var t: MercTrie* = &g_shell.trie;
+  println("loaded {merc_count(t)} expressions");
+  var r: MercRun;
+  merc_run_init(&r, t);
+  merc_wide_start(&r, cores);
+  var t0: int64 = time_mono_ns();
+  var ran: int64 = merc_run_steps(&r, steps);
+  var us: int64 = (time_mono_ns() - t0) / 1000;
+  println("executing {ran} steps took {us / 1000}.{us % 1000 / 100}{us % 100 / 10}{us % 10} ms ({r.matches} matches, {r.unifies} unifications, {r.writes} writes)");
+  if (r.skipped > 0) { println("{r.skipped} rules use a source or sink merc does not have yet and were dropped"); }
+  println("dumping {merc_count(t)} expressions");
+  var fd: int64 = -1;
+  if (out_path.length > 0) {
+    fd = file_open(out_path, FILE_WRITE | FILE_CREATE | FILE_TRUNCATE);
+    if (fd < 0) {
+      println("cannot write {out_path}");
+      merc_wide_stop();
+      merc_run_free(&r);
+      return 1;
+    }
+  } else {
+    println("result:");
+  }
+  g_out_fd = fd;
+  g_out_at = 0;
+  merc_wide_print(t, &emit);
+  if (fd >= 0) { file_close(fd); }
+  merc_wide_stop();
+  merc_run_free(&r);
+  return 0;
+}
+
+var g_argv: cstring[256];
+
+// --no-gpu anywhere keeps every search on the trie. it is taken out before
+fn main(argc_in: int32, argv_in: cstring*) -> int32 {
+  var argc: int32 = 0;
+  var gpu: bool = true;
+  for i0: int32 in 0..argc_in {
+    if (is_word(arg(argv_in, i0), "--no-gpu")) {
+      gpu = false;
+    } else if (argc < 255) {
+      g_argv[argc] = argv_in[i0];
+      argc = argc + 1;
+    }
+  }
+  g_argv[argc] = (cstring)0;
+  var argv: cstring* = &g_argv[0];
+  merc_shell_init(&g_shell);
+  if (argc > 1 && is_word(arg(argv, 1), "run")) { return run_program(argc, argv); }
+  if (gpu) { merc_scan_start(); }
+  if (argc < 2 || !is_word(arg(argv, 1), "shell")) {
+    var shown: int32 = merc_view(argc, argv);
+    merc_scan_stop();
+    return shown;
+  }
+  merc_wide_start(&g_shell.rules, 8);
+  var worst: int32 = 0;
+  for i in 2..argc {
+    var name: MercBuf;
+    merc_buf_text(&name, "run ");
+    var arg: uint8* = (uint8*)argv[i];
+    var n: int64 = 0;
+    while (arg[n] != 0) { n = n + 1; }
+    merc_buf_add(&name, arg, n);
+    var r: int32 = merc_shell_run(&g_shell, merc_buf_view(&name));
+    if (r > worst) { worst = r; }
+    merc_buf_free(&name);
+    flush();
+  }
+  var prompt: bool = is_terminal();
+  var line: MercBuf;
+  var chunk: uint8[4096];
+  var done: bool = g_shell.quit;
+  if (prompt && !done) { print("merc. help lists the commands.\n> "); }
+  while (!done) {
+    var got: int64 = syscall(0, 0, &chunk[0], 4096);
+    if (got <= 0) { break; }
+    for k: int64 in 0..got {
+      if (chunk[k] != 10) {
+        merc_buf_push(&line, chunk[k]);
+        continue;
+      }
+      var r2: int32 = merc_shell_run(&g_shell, merc_buf_view(&line));
+      if (r2 > worst) { worst = r2; }
+      merc_buf_clear(&line);
+      flush();
+      if (g_shell.quit) { done = true; break; }
+      if (prompt) { print("> "); }
+    }
+  }
+  if (!g_shell.quit && line.len > 0) {
+    var r3: int32 = merc_shell_run(&g_shell, merc_buf_view(&line));
+    if (r3 > worst) { worst = r3; }
+    flush();
+  }
+  merc_wide_stop();
+  merc_scan_stop();
+  merc_shell_free(&g_shell);
+  return worst;
+}
