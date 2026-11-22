@@ -10,6 +10,7 @@ import "std/mem";
 import "trie";
 import "expr";
 import "run";
+import "find";
 
 const WIDE_MAX: int64 = 16;
 
@@ -226,7 +227,10 @@ export fn merc_wide_start(r: MercRun*, cores: int64) {
       if (g_wide_handles[i] != 0) { g_wide_count = g_wide_count + 1; }
     }
   }
-  if (g_wide_count > 0) { r->spread = &wide_spread; }
+  if (g_wide_count > 0) {
+    r->spread = &wide_spread;
+    merc_find_spread(&wide_each);
+  }
 }
 
 export fn merc_wide_stop() {

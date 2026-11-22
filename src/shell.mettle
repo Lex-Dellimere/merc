@@ -12,6 +12,7 @@ import "expr";
 import "query";
 import "run";
 import "flat";
+import "find";
 
 export const MERC_DID_NOTHING: int32 = 0;
 export const MERC_DID_ADD: int32 = 1;
@@ -39,6 +40,9 @@ export struct MercShell {
   b: MercBuf;
   depth: int32;
   rules: MercRun;
+  find: MercFind;
+  inside: bool;
+  spans: MercBuf;       // after find, for each hit: its number, how many places, their offsets
 }
 
 export fn merc_shell_init(sh: MercShell*) {
@@ -46,6 +50,7 @@ export fn merc_shell_init(sh: MercShell*) {
   *sh = blank;
   sh->zip = merc_zip(&sh->trie);
   merc_run_init(&sh->rules, &sh->trie);
+  merc_find_init(&sh->find);
 }
 
 export fn merc_shell_free(sh: MercShell*) {
@@ -55,6 +60,8 @@ export fn merc_shell_free(sh: MercShell*) {
   merc_buf_free(&sh->out);
   merc_buf_free(&sh->touched);
   merc_buf_free(&sh->hits);
+  merc_buf_free(&sh->spans);
+  merc_find_free(&sh->find);
   merc_buf_free(&sh->a);
   merc_buf_free(&sh->b);
 }
@@ -74,7 +81,7 @@ struct ShWord {
   note: string;
 }
 
-const SH_CMDS: int32 = 21;
+const SH_CMDS: int32 = 22;
 const SH_MOVES: int32 = 10;
 
 var g_sh_help: MercBuf;
@@ -84,7 +91,7 @@ fn sh_cmds() -> ShCmd* {
   return &g_cmd_table[0];
 }
 
-var g_cmd_table: ShCmd[21];
+var g_cmd_table: ShCmd[22];
 var g_move_table: ShWord[10];
 
 fn sh_cmd(i: int32, name: string, args: string, note: string, basic: string, section: int32, run: fn(MercShell*, string) -> int32) {
@@ -124,6 +131,7 @@ fn sh_fill_cmds() {
   sh_cmd(18, "quit", "", "", "", 4, &sh_c_quit);
   sh_cmd(19, "exit", "", "", "", 5, &sh_c_quit);
   sh_cmd(20, "help all", "", "", "every command", 5, &sh_c_help);
+  sh_cmd(21, "find", "PATTERN", "every place inside a stored expression the pattern unifies with", "find a pattern anywhere inside", 0, &sh_find);
   sh_move(0, "top", "", "back to the root");
   sh_move(1, "arity", "N", "step onto a parent with N children");
   sh_move(2, "sym", "NAME", "step onto the symbol NAME");
@@ -158,11 +166,11 @@ export fn merc_shell_help() -> string {
   var t: ShCmd* = sh_cmds();
   merc_buf_clear(&g_sh_help);
   merc_buf_text(&g_sh_help, "the basics\n");
-  var order: int32[9] = [7, 11, 12, 13, 3, 0, 8, 20, -1];
-  for k in 0..8 {
+  var order: int32[10] = [7, 11, 12, 13, 3, 21, 0, 8, 20, -1];
+  for k in 0..9 {
     var c: ShCmd* = &t[order[k]];
     var arg: string = c->args;
-    if (order[k] == 3) { arg = "PATTERN"; }
+    if (order[k] == 3 || order[k] == 21) { arg = "PATTERN"; }
     if (order[k] == 0) { arg = "EXPR"; }
     if (order[k] == 8) { arg = "FILE"; }
     if (order[k] == 11 || order[k] == 13) { arg = ""; }
@@ -597,6 +605,8 @@ fn sh_match_rows(sh: MercShell*, rows: MercBuf*, found: int64, only_count: bool)
 
 fn sh_match(sh: MercShell*, rest: string, only_count: bool) -> int32 {
   if (sh_parse(sh, rest, &sh->a, false) == 0) { return 1; }
+  sh->inside = false;
+  merc_buf_clear(&sh->spans);
   var rows: MercBuf;
   var many: int64 = 0;
   if (merc_flat_search(&sh->trie, sh->serial, merc_buf_view(&sh->a), &rows, 20000, &many)) {
@@ -642,6 +652,138 @@ fn sh_match(sh: MercShell*, rest: string, only_count: bool) -> int32 {
   sh_say(sh, " bytes walked\n");
   sh_touch(sh, merc_buf_view(&sh->a), MERC_DID_SEARCH);
   merc_query_free(&q);
+  return 0;
+}
+
+fn sh_sort64(a: uint64*, lo: int64, hi: int64) {
+  var l: int64 = lo;
+  var h: int64 = hi;
+  while (l < h) {
+    var pivot: uint64 = a[(l + h) / 2];
+    var i: int64 = l;
+    var j: int64 = h;
+    while (i <= j) {
+      while (a[i] < pivot) { i = i + 1; }
+      while (a[j] > pivot) { j = j - 1; }
+      if (i <= j) {
+        var t: uint64 = a[i];
+        a[i] = a[j];
+        a[j] = t;
+        i = i + 1;
+        j = j - 1;
+      }
+    }
+    if (j - l < h - i) {
+      if (l < j) { sh_sort64(a, l, j); }
+      l = i;
+    } else {
+      if (i < h) { sh_sort64(a, i, h); }
+      h = j;
+    }
+  }
+}
+
+fn sh_show_cut(sh: MercShell*, e: string, most: int64) {
+  merc_buf_clear(&sh->b);
+  if (!merc_format(e, &sh->b, (MercNames*)0)) {
+    sh_show(sh, e, (MercNames*)0);
+    return;
+  }
+  if (sh->b.len > most) {
+    sh->b.len = most;
+    merc_buf_text(&sh->b, "...");
+  }
+  merc_buf_add(&sh->out, sh->b.data, sh->b.len);
+}
+
+fn sh_find(sh: MercShell*, rest: string) -> int32 {
+  if (sh_parse(sh, rest, &sh->a, false) == 0) { return 1; }
+  var f: MercFind* = &sh->find;
+  var t0: int64 = time_mono_ns();
+  if (merc_find_ready(f, &sh->trie, sh->serial) && merc_find_count(f) > 0) {
+    sh_say(sh, "indexed ");
+    sh_num(sh, merc_find_places(f));
+    sh_say(sh, " places as ");
+    sh_num(sh, merc_find_keys(f));
+    sh_say(sh, " keys, ");
+    sh_num(sh, merc_find_memory(f) / 1048576);
+    sh_say(sh, " MB, ");
+    sh_num(sh, (time_mono_ns() - t0) / 1000000);
+    sh_say(sh, " ms\n");
+  }
+  merc_find_start(f, merc_buf_view(&sh->a));
+  var count: int64 = merc_find_count(f);
+  var seen: uint8* = (uint8*)calloc(count / 8 + 1, 1);
+  var pairs: MercBuf;
+  var found: int64 = 0;
+  var exprs: int64 = 0;
+  var bind: MercBuf;
+  while (merc_find_next(f)) {
+    found = found + 1;
+    var id: int64 = merc_find_id(f);
+    if ((seen[id / 8] & (uint8)(1 << (id % 8))) == 0) {
+      seen[id / 8] = seen[id / 8] | (uint8)(1 << (id % 8));
+      exprs = exprs + 1;
+    }
+    if (pairs.len < 1600000) {
+      var pk: uint64 = ((uint64)id << (uint64)32) | (uint64)merc_find_offset(f);
+      merc_buf_add(&pairs, (uint8*)&pk, 8);
+    }
+    if (found > 50) { continue; }
+    sh_show_cut(sh, merc_find_expr(f, id), 160);
+    sh_say(sh, "\n    at ");
+    sh_show(sh, merc_find_place(f), (MercNames*)0);
+    sh_say(sh, "\n");
+    for v in 0..merc_find_vars(f) {
+      merc_buf_clear(&bind);
+      if (!merc_find_bind(f, v, &bind)) { continue; }
+      sh_say(sh, "    $");
+      sh_say(sh, merc_name(&sh->names, v));
+      sh_say(sh, " = ");
+      sh_show(sh, merc_buf_view(&bind), (MercNames*)0);
+      sh_say(sh, "\n");
+    }
+  }
+  merc_buf_free(&bind);
+  free((rawptr)seen);
+  if (found > 50) {
+    sh_say(sh, "... ");
+    sh_num(sh, found - 50);
+    sh_say(sh, " more\n");
+  }
+  sh_num(sh, found);
+  if (found == 1) { sh_say(sh, " place in "); } else { sh_say(sh, " places in "); }
+  sh_num(sh, exprs);
+  if (exprs == 1) { sh_say(sh, " expression\n"); } else { sh_say(sh, " expressions\n"); }
+  var pn: int64 = pairs.len / 8;
+  var pv: uint64* = (uint64*)pairs.data;
+  if (pn > 1) { sh_sort64(pv, 0, pn - 1); }
+  merc_buf_clear(&sh->hits);
+  merc_buf_clear(&sh->spans);
+  sh->hit_count = 0;
+  var k: int64 = 0;
+  while (k < pn && sh->hit_count < 20000) {
+    var id2: int64 = (int64)(pv[k] >> (uint64)32);
+    var e: string = merc_find_expr(f, id2);
+    var len: uint32 = (uint32)e.length;
+    merc_buf_add(&sh->hits, (uint8*)&len, 4);
+    merc_buf_text(&sh->hits, e);
+    var j: int64 = k;
+    while (j < pn && (int64)(pv[j] >> (uint64)32) == id2) { j = j + 1; }
+    var head: uint32[2];
+    head[0] = (uint32)id2;
+    head[1] = (uint32)(j - k);
+    merc_buf_add(&sh->spans, (uint8*)&head[0], 8);
+    for m: int64 in k..j {
+      var off: uint32 = (uint32)(pv[m] & (uint64)0xFFFFFFFF);
+      merc_buf_add(&sh->spans, (uint8*)&off, 4);
+    }
+    sh->hit_count = sh->hit_count + 1;
+    k = j;
+  }
+  merc_buf_free(&pairs);
+  sh->inside = true;
+  sh_touch(sh, merc_buf_view(&sh->a), MERC_DID_SEARCH);
   return 0;
 }
 
@@ -1520,7 +1662,7 @@ fn cp_sort_syms(cm: MercComplete*) {
 }
 
 fn cp_is_pattern(cmd: string) -> bool {
-  return sh_is(cmd, "match") || sh_is(cmd, "count") || sh_is(cmd, "transform") || sh_is(cmd, "save");
+  return sh_is(cmd, "match") || sh_is(cmd, "find") || sh_is(cmd, "count") || sh_is(cmd, "transform") || sh_is(cmd, "save");
 }
 
 export fn merc_shell_complete(sh: MercShell*, line: string, cursor: int64, out: MercComplete*) {
@@ -1544,7 +1686,7 @@ export fn merc_shell_complete(sh: MercShell*, line: string, cursor: int64, out: 
     var p: string = cp_sub(line, w0, cur);
     var t: ShCmd* = sh_cmds();
     for k in 0..SH_CMDS {
-      if (k >= 19) { continue; }
+      if (k == 19 || k == 20) { continue; }
       if (cp_starts(t[k].name, p)) {
         var note: string = t[k].basic;
         if (note.length == 0) { note = t[k].note; }

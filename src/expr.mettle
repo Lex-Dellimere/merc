@@ -337,6 +337,12 @@ export fn merc_format(e: string, out: MercBuf*, names: MercNames*) -> bool {
   return true;
 }
 
+export const MERC_UNIFY_CAP: int32 = 2048;
+const MERC_UCAP: int32 = 2048;
+
+// up to MERC_UCAP bytes a side the unifier keeps, for every place, where its
+// subexpression ends, which variable sits there and how many variables come
+// before it. a longer term goes the slow way.
 export struct MercUnify {
   term: uint8*[2];
   size: int64[2];
@@ -347,6 +353,69 @@ export struct MercUnify {
   to_at: int32[128];
   out_id: int32[128];
   out_count: int32;
+  fast: bool[2];
+  ends: int16[4096];
+  vid: uint8[4096];
+  vpre: int16[4098];
+  stk_at: int16[2048];
+  stk_left: uint8[2048];
+  trail: int32[128];
+  trail_n: int32;
+  bound_n: int32[2];
+}
+
+fn merc_unify_table(u: MercUnify*, side: int32) -> bool {
+  var p: uint8* = u->term[side];
+  var n: int32 = (int32)u->size[side];
+  var base: int32 = side * MERC_UCAP;
+  var vb: int32 = side * (MERC_UCAP + 1);
+  var i: int32 = 0;
+  var sp: int32 = 0;
+  var vars: int32 = 0;
+  var cnt: int32 = 0;
+  while (true) {
+    if (i >= n) { return false; }
+    var tag: uint8 = p[i];
+    var at: int32 = i;
+    i = i + 1;
+    u->vpre[vb + at] = (int16)cnt;
+    u->vid[base + at] = 255;
+    if (tag > 0xC0) {
+      i = i + (int32)(tag & 63);
+    } else if (tag == 0xC0) {
+      if (vars < 64) {
+        u->var_at[side * 64 + vars] = at;
+        u->vid[base + at] = (uint8)vars;
+      }
+      vars = vars + 1;
+      cnt = cnt + 1;
+    } else if (tag >= 0x80) {
+      u->vid[base + at] = tag & 63;
+      cnt = cnt + 1;
+    } else if (tag >= 64) {
+      return false;
+    } else if (tag > 0) {
+      u->stk_at[sp] = (int16)at;
+      u->stk_left[sp] = tag;
+      sp = sp + 1;
+      continue;
+    }
+    if (i > n) { return false; }
+    u->ends[base + at] = (int16)i;
+    while (sp > 0) {
+      var left: uint8 = u->stk_left[sp - 1] - 1;
+      u->stk_left[sp - 1] = left;
+      if (left != 0) { break; }
+      u->ends[base + (int32)u->stk_at[sp - 1]] = (int16)i;
+      sp = sp - 1;
+    }
+    if (sp == 0) { break; }
+  }
+  if (i != n) { return false; }
+  u->vpre[vb + n] = (int16)cnt;
+  if (vars > 64) { vars = 64; }
+  u->var_count[side] = vars;
+  return true;
 }
 
 fn merc_unify_scan(u: MercUnify*, side: int32) {
@@ -366,7 +435,25 @@ fn merc_unify_scan(u: MercUnify*, side: int32) {
   u->var_count[side] = vars;
 }
 
+@inline fn merc_unify_span(u: MercUnify*, side: int32, at: int32) -> int32 {
+  if (u->fast[side]) { return (int32)u->ends[side * MERC_UCAP + at] - at; }
+  return (int32)merc_span(u->term[side] + at, u->size[side] - (int64)at);
+}
+
+// true when the subexpression at has no variable in it.
+@inline fn merc_unify_ground(u: MercUnify*, side: int32, at: int32) -> bool {
+  if (!u->fast[side]) { return false; }
+  var vb: int32 = side * (MERC_UCAP + 1);
+  var e: int32 = (int32)u->ends[side * MERC_UCAP + at];
+  return u->vpre[vb + e] == u->vpre[vb + at];
+}
+
 fn merc_unify_var(u: MercUnify*, side: int32, at: int32) -> int32 {
+  if (u->fast[side]) {
+    var id: uint8 = u->vid[side * MERC_UCAP + at];
+    if (id == 255) { return -1; }
+    return side * 64 + (int32)id;
+  }
   var tag: uint8 = u->term[side][at];
   if (tag == 0xC0) {
     for v in 0..u->var_count[side] {
@@ -393,13 +480,16 @@ fn merc_unify_occurs(u: MercUnify*, v: int32, side: int32, at: int32) -> bool {
   merc_unify_walk(u, &s, &a);
   var w: int32 = merc_unify_var(u, s, a);
   if (w >= 0) { return w == v; }
+  if (merc_unify_ground(u, s, a)) { return false; }
+  // nothing on this side is bound, so nothing below leads back to v.
+  if (s != (v >> 6) && u->bound_n[s] == 0) { return false; }
   var p: uint8* = u->term[s];
   var tag: uint8 = p[a];
   if (tag >= 64) { return false; }
   var child: int32 = a + 1;
   for k in 0..(int32)tag {
     if (merc_unify_occurs(u, v, s, child)) { return true; }
-    child = child + (int32)merc_span(p + child, u->size[s] - (int64)child);
+    child = child + merc_unify_span(u, s, child);
   }
   return false;
 }
@@ -417,6 +507,9 @@ fn merc_unify_at(u: MercUnify*, side1: int32, at1: int32, side2: int32, at2: int
     if (v1 == v2) { return true; }
     if (v2 < 0 && merc_unify_occurs(u, v1, s2, a2)) { return false; }
     u->bound[v1] = 1;
+    u->bound_n[v1 >> 6] = u->bound_n[v1 >> 6] + 1;
+    u->trail[u->trail_n & 127] = v1;
+    u->trail_n = u->trail_n + 1;
     u->to_side[v1] = s2;
     u->to_at[v1] = a2;
     return true;
@@ -424,6 +517,9 @@ fn merc_unify_at(u: MercUnify*, side1: int32, at1: int32, side2: int32, at2: int
   if (v2 >= 0) {
     if (merc_unify_occurs(u, v2, s1, a1)) { return false; }
     u->bound[v2] = 1;
+    u->bound_n[v2 >> 6] = u->bound_n[v2 >> 6] + 1;
+    u->trail[u->trail_n & 127] = v2;
+    u->trail_n = u->trail_n + 1;
     u->to_side[v2] = s1;
     u->to_at[v2] = a1;
     return true;
@@ -439,13 +535,31 @@ fn merc_unify_at(u: MercUnify*, side1: int32, at1: int32, side2: int32, at2: int
     }
     return true;
   }
+  if (merc_unify_ground(u, s1, a1) && merc_unify_ground(u, s2, a2)) {
+    var n1: int32 = merc_unify_span(u, s1, a1);
+    if (n1 != merc_unify_span(u, s2, a2)) { return false; }
+    return memcmp(p1 + a1, p2 + a2, (int64)n1) == 0;
+  }
   var c1: int32 = a1 + 1;
   var c2: int32 = a2 + 1;
   for k2 in 0..(int32)tag {
     if (!merc_unify_at(u, s1, c1, s2, c2)) { return false; }
-    c1 = c1 + (int32)merc_span(p1 + c1, u->size[s1] - (int64)c1);
-    c2 = c2 + (int32)merc_span(p2 + c2, u->size[s2] - (int64)c2);
+    c1 = c1 + merc_unify_span(u, s1, c1);
+    c2 = c2 + merc_unify_span(u, s2, c2);
   }
+  return true;
+}
+
+fn merc_unify_side(u: MercUnify*, side: int32) -> bool {
+  var n: int64 = u->size[side];
+  if (n == 0) { return false; }
+  if (n <= (int64)MERC_UCAP) {
+    u->fast[side] = true;
+    return merc_unify_table(u, side);
+  }
+  u->fast[side] = false;
+  if (merc_span(u->term[side], n) != n) { return false; }
+  merc_unify_scan(u, side);
   return true;
 }
 
@@ -459,11 +573,107 @@ export fn merc_unify(u: MercUnify*, a: string, b: string) -> bool {
     u->out_id[i] = -1;
   }
   u->out_count = 0;
-  if (merc_span(a.chars, (int64)a.length) != (int64)a.length || a.length == 0) { return false; }
-  if (merc_span(b.chars, (int64)b.length) != (int64)b.length || b.length == 0) { return false; }
-  merc_unify_scan(u, 0);
-  merc_unify_scan(u, 1);
+  u->trail_n = 0;
+  u->bound_n[0] = 0;
+  u->bound_n[1] = 0;
+  if (!merc_unify_side(u, 0) || !merc_unify_side(u, 1)) { return false; }
   return merc_unify_at(u, 0, 0, 1, 0);
+}
+
+// unifying a list one item at a time. both terms are lists of whole items
+// that only ever grow at the end, the tables and bindings of the items
+// before stay, and undo takes them back to a mark. each side has to fit in
+// MERC_UNIFY_CAP bytes.
+export fn merc_unify_reset(u: MercUnify*, a_from: int64, b_from: int64) {
+  for i in 0..128 {
+    u->bound[i] = 0;
+    u->out_id[i] = -1;
+  }
+  u->out_count = 0;
+  u->trail_n = 0;
+  u->bound_n[0] = 0;
+  u->bound_n[1] = 0;
+  u->var_count[0] = 0;
+  u->var_count[1] = 0;
+  u->fast[0] = true;
+  u->fast[1] = true;
+  u->vpre[(int32)a_from] = 0;
+  u->vpre[MERC_UCAP + 1 + (int32)b_from] = 0;
+}
+
+export fn merc_unify_mark(u: MercUnify*) -> int32 { return u->trail_n; }
+
+export fn merc_unify_undo(u: MercUnify*, mark: int32, a_vars: int32, b_vars: int32) {
+  while (u->trail_n > mark) {
+    u->trail_n = u->trail_n - 1;
+    var v: int32 = u->trail[u->trail_n & 127];
+    u->bound[v] = 0;
+    u->bound_n[v >> 6] = u->bound_n[v >> 6] - 1;
+  }
+  u->var_count[0] = a_vars;
+  u->var_count[1] = b_vars;
+}
+
+fn merc_unify_table_from(u: MercUnify*, side: int32, from: int32) -> bool {
+  var p: uint8* = u->term[side];
+  var n: int32 = (int32)u->size[side];
+  var base: int32 = side * MERC_UCAP;
+  var vb: int32 = side * (MERC_UCAP + 1);
+  var i: int32 = from;
+  var sp: int32 = 0;
+  var vars: int32 = u->var_count[side];
+  var cnt: int32 = (int32)u->vpre[vb + from];
+  while (i < n) {
+    var tag: uint8 = p[i];
+    var at: int32 = i;
+    i = i + 1;
+    u->vpre[vb + at] = (int16)cnt;
+    u->vid[base + at] = 255;
+    if (tag > 0xC0) {
+      i = i + (int32)(tag & 63);
+    } else if (tag == 0xC0) {
+      if (vars >= 64) { return false; }
+      u->var_at[side * 64 + vars] = at;
+      u->vid[base + at] = (uint8)vars;
+      vars = vars + 1;
+      cnt = cnt + 1;
+    } else if (tag >= 0x80) {
+      u->vid[base + at] = tag & 63;
+      cnt = cnt + 1;
+    } else if (tag >= 64) {
+      return false;
+    } else if (tag > 0) {
+      u->stk_at[sp] = (int16)at;
+      u->stk_left[sp] = tag;
+      sp = sp + 1;
+      continue;
+    }
+    if (i > n) { return false; }
+    u->ends[base + at] = (int16)i;
+    while (sp > 0) {
+      var left: uint8 = u->stk_left[sp - 1] - 1;
+      u->stk_left[sp - 1] = left;
+      if (left != 0) { break; }
+      u->ends[base + (int32)u->stk_at[sp - 1]] = (int16)i;
+      sp = sp - 1;
+    }
+  }
+  if (sp != 0 || i != n) { return false; }
+  u->vpre[vb + n] = (int16)cnt;
+  u->var_count[side] = vars;
+  return true;
+}
+
+// adds the item at a_from in a and the one at b_from in b, which run to the
+// ends of a and b, and unifies them with what is there.
+export fn merc_unify_item(u: MercUnify*, a: string, a_from: int64, b: string, b_from: int64) -> bool {
+  if ((int64)a.length > (int64)MERC_UCAP || (int64)b.length > (int64)MERC_UCAP) { return false; }
+  u->term[0] = a.chars;
+  u->size[0] = (int64)a.length;
+  u->term[1] = b.chars;
+  u->size[1] = (int64)b.length;
+  if (!merc_unify_table_from(u, 0, (int32)a_from) || !merc_unify_table_from(u, 1, (int32)b_from)) { return false; }
+  return merc_unify_at(u, 0, (int32)a_from, 1, (int32)b_from);
 }
 
 fn merc_unify_emit(u: MercUnify*, side: int32, at: int32, out: MercBuf*) {
@@ -482,6 +692,10 @@ fn merc_unify_emit(u: MercUnify*, side: int32, at: int32, out: MercBuf*) {
     return;
   }
   var p: uint8* = u->term[s];
+  if (merc_unify_ground(u, s, a)) {
+    merc_buf_add(out, p + a, (int64)merc_unify_span(u, s, a));
+    return;
+  }
   var tag: uint8 = p[a];
   merc_buf_push(out, tag);
   if (tag > 0xC0) {
@@ -492,7 +706,7 @@ fn merc_unify_emit(u: MercUnify*, side: int32, at: int32, out: MercBuf*) {
   var child: int32 = a + 1;
   for k in 0..(int32)tag {
     merc_unify_emit(u, s, child, out);
-    child = child + (int32)merc_span(p + child, u->size[s] - (int64)child);
+    child = child + merc_unify_span(u, s, child);
   }
 }
 

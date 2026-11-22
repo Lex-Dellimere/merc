@@ -67,6 +67,28 @@ fn load_file(path: string) -> bool {
   return true;
 }
 
+// a time the way a person reads it: 850 ns, 24.56 ms, 9.85 s, 1 min 23.4 s.
+fn add_time(b: MercBuf*, ns: int64) {
+  var t: string = "";
+  if (ns < 1000) {
+    t = "{ns} ns";
+  } else if (ns < 1000000) {
+    var c: int64 = ns / 10;
+    t = "{c / 100}.{c % 100 / 10}{c % 10} us";
+  } else if (ns < 1000000000) {
+    var c2: int64 = ns / 10000;
+    t = "{c2 / 100}.{c2 % 100 / 10}{c2 % 10} ms";
+  } else if (ns < 60000000000) {
+    var c3: int64 = ns / 10000000;
+    t = "{c3 / 100}.{c3 % 100 / 10}{c3 % 10} s";
+  } else {
+    var d: int64 = ns / 100000000;
+    t = "{d / 600} min {d % 600 / 10}.{d % 10} s";
+  }
+  merc_buf_text(b, t);
+  free(t.chars);
+}
+
 fn number(d: string) -> int64 {
   var v: int64 = 0;
   for k: int64 in 0..(int64)d.length { v = v * 10 + (int64)(d.chars[k] - 48); }
@@ -140,8 +162,12 @@ fn run_program(argc: int32, argv: cstring*) -> int32 {
   merc_wide_start(&r, cores);
   var t0: int64 = time_mono_ns();
   var ran: int64 = merc_run_steps(&r, steps);
-  var us: int64 = (time_mono_ns() - t0) / 1000;
-  println("executing {ran} steps took {us / 1000}.{us % 1000 / 100}{us % 100 / 10}{us % 10} ms ({r.matches} matches, {r.unifies} unifications, {r.writes} writes)");
+  var line: MercBuf;
+  merc_buf_text(&line, "executing {ran} steps took ");
+  add_time(&line, time_mono_ns() - t0);
+  merc_buf_text(&line, " ({r.matches} matches, {r.unifies} unifications, {r.writes} writes)");
+  println(merc_buf_view(&line));
+  merc_buf_free(&line);
   if (r.skipped > 0) { println("{r.skipped} rules use a source or sink merc does not have yet and were dropped"); }
   println("dumping {merc_count(t)} expressions");
   var fd: int64 = -1;
@@ -185,7 +211,10 @@ fn main(argc_in: int32, argv_in: cstring*) -> int32 {
   if (argc > 1 && is_word(arg(argv, 1), "run")) { return run_program(argc, argv); }
   if (gpu) { merc_scan_start(); }
   if (argc < 2 || !is_word(arg(argv, 1), "shell")) {
+    var spare: MercRun;
+    merc_wide_start(&spare, 8);
     var shown: int32 = merc_view(argc, argv);
+    merc_wide_stop();
     merc_scan_stop();
     return shown;
   }

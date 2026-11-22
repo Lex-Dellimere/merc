@@ -11,13 +11,12 @@ fn project() {
   mb_bin("merc", "src/main.mettle");
   mb_link_libs("c");
 
-  // alph needs the port for this machine.
+  // alph needs its port for this machine, which comes inside the package.
   mb_for_bin("merc");
-  mb_set_list("flags", "-I, ../mettle/alph/ports/host");
+  mb_set_list("flags", "-I, .mbuild/deps/alph/ports/host");
 }
 
-// alph, mythic_ui and glint sit in a folder named mettle beside merc, see the readme.
 fn deps() {
-  mb_dep_path("mythic", "../mettle/mythic_ui");
-  mb_dep_path("alph", "../mettle/alph");
+  mb_dep("alph", "0.2.0");
+  mb_dep("mythic", "0.1.0");
 }

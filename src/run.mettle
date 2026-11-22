@@ -57,6 +57,10 @@ struct Seek {
   pfloor: int64;
   matches: int64;
   unifies: int64;
+  inc_done: int64;
+  dlen: int64[17];
+  dvars: int32[17];
+  tmark: int32[17];
 }
 
 fn seek_new(t: MercTrie*) -> Seek* {
@@ -64,7 +68,7 @@ fn seek_new(t: MercTrie*) -> Seek* {
   if (s == 0) { return s; }
   s->trie = t;
   s->q = (MercQuery*)calloc(RUN_MAX, sizeof(MercQuery));
-  s->u = (MercUnify*)calloc(RUN_MAX + 1, sizeof(MercUnify));
+  s->u = (MercUnify*)calloc(1, sizeof(MercUnify));
   s->zips = (MercZip*)calloc(RUN_MAX, sizeof(MercZip));
   return s;
 }
@@ -110,7 +114,7 @@ export struct MercRun {
   spread: fn(MercRun*, int64) -> bool;
   wide_min: int64;
   used: int64;
-  phase: int32;         // what merc_run_part does: 0 search, 1 sort into ranges, 2 build a range
+  phase: int32;         // what merc_run_part does: 0 search, 1 sort into ranges, 2 build a range, 3 count below prefixes
   by_prefix: bool;
   tail_walk: bool;
   floor0: int64;
@@ -119,6 +123,8 @@ export struct MercRun {
   range_trie: MercTrie*;
   cut_bytes: MercBuf;
   cut_at: MercBuf;
+  weights: MercBuf;
+  wspare: MercBuf;
   steps: int64;
   matches: int64;
   unifies: int64;
@@ -146,6 +152,8 @@ export fn merc_run_free(r: MercRun*) {
   }
   merc_buf_free(&r->cut_bytes);
   merc_buf_free(&r->cut_at);
+  merc_buf_free(&r->weights);
+  merc_buf_free(&r->wspare);
   merc_buf_free(&r->first);
   merc_buf_free(&r->first_at);
   merc_buf_free(&r->rule);
@@ -192,7 +200,8 @@ fn run_shift(e: string, first: int32, out: MercBuf*) -> int32 {
   return vars;
 }
 
-fn run_unify(r: Seek*, pats: uint8*, pat_end: int64*, upto: int64) -> bool {
+fn run_unify_all(r: Seek*, pats: uint8*, pat_end: int64*, upto: int64) -> bool {
+  r->inc_done = 0;
   merc_buf_clear(&r->ptup);
   merc_buf_clear(&r->dtup);
   merc_buf_push(&r->ptup, (uint8)(upto + 1));
@@ -208,8 +217,55 @@ fn run_unify(r: Seek*, pats: uint8*, pat_end: int64*, upto: int64) -> bool {
     if (got < 0) { return false; }
     vars = vars + got;
   }
+  return merc_unify(r->u, merc_buf_view(&r->ptup), merc_buf_view(&r->dtup));
+}
+
+// the patterns and what each one found, as two lists unified one item at a
+// time. the items below a level stay while only that level moves on.
+fn run_unify(r: Seek*, pl: Plan*, upto: int64) -> bool {
   r->unifies = r->unifies + 1;
-  return merc_unify(r->u + upto, merc_buf_view(&r->ptup), merc_buf_view(&r->dtup));
+  var u: MercUnify* = r->u;
+  var pats: uint8* = r->pats;
+  if (3 + pl->pat_end[upto - 1] > (int64)MERC_UNIFY_CAP) { return run_unify_all(r, pats, &pl->pat_end[0], upto); }
+  var keep: int64 = r->inc_done;
+  if (keep > upto - 1) { keep = upto - 1; }
+  if (keep == 0) {
+    merc_buf_clear(&r->ptup);
+    merc_buf_push(&r->ptup, (uint8)(pl->k + 1));
+    merc_buf_push(&r->ptup, 0xC1);
+    merc_buf_push(&r->ptup, 44);
+    merc_buf_add(&r->ptup, pats, pl->pat_end[pl->k - 1]);
+    merc_buf_clear(&r->dtup);
+    merc_buf_push(&r->dtup, (uint8)(pl->k + 1));
+    merc_buf_push(&r->dtup, 0xC1);
+    merc_buf_push(&r->dtup, 44);
+    merc_unify_reset(u, 3, 3);
+    r->dlen[0] = 3;
+    r->dvars[0] = 0;
+    r->tmark[0] = 0;
+  } else {
+    merc_unify_undo(u, r->tmark[keep], pl->before[keep], r->dvars[keep]);
+    r->dtup.len = r->dlen[keep];
+  }
+  for i: int64 in keep..upto {
+    var got: int32 = run_shift(merc_buf_view(&r->found[i]), r->dvars[i], &r->dtup);
+    if (got < 0 || r->dtup.len > (int64)MERC_UNIFY_CAP) { return run_unify_all(r, pats, &pl->pat_end[0], upto); }
+    var pv: string = run_view(r->ptup.data, 3 + pl->pat_end[i]);
+    var ok: bool = merc_unify_item(u, pv, 3 + pl->pat_at[i], merc_buf_view(&r->dtup), r->dlen[i]);
+    r->dlen[i + 1] = r->dtup.len;
+    r->dvars[i + 1] = r->dvars[i] + got;
+    r->tmark[i + 1] = merc_unify_mark(u);
+    if (!ok) {
+      r->inc_done = i;
+      return false;
+    }
+  }
+  r->inc_done = upto;
+  return true;
+}
+
+fn run_moved(r: Seek*, level: int64) {
+  if (r->inc_done > level) { r->inc_done = level; }
 }
 
 fn run_newvars(p: uint8*, n: int64) -> int32 {
@@ -593,6 +649,7 @@ fn fast_ask(b: Binds*, shape: uint8*, n: int64, first: int32, out: MercBuf*) {
 fn run_ask(r: Seek*, level: int64, ask: string) {
   if (r->live[level] == 0) {
     r->q[level] = merc_query(r->trie, ask);
+    merc_query_lazy(r->q + level, true);
     r->live[level] = 1;
   } else {
     merc_query_again(r->q + level, ask);
@@ -601,7 +658,8 @@ fn run_ask(r: Seek*, level: int64, ask: string) {
 
 // a pattern that is plain keys, maybe ending in new variables, is
 // walked straight down the trie. gives false when a stored variable sits
-// where the walk would pass, and then the search has to do it.
+// where the walk would pass, and then the search has to do it. stored
+// variables below the new ones are fine, such a match is not exact.
 fn probe_start(r: Seek*, level: int64, ask: string) -> bool {
   if (r->zlive[level] == 0) {
     r->zips[level] = merc_zip(r->trie);
@@ -631,10 +689,6 @@ fn probe_start(r: Seek*, level: int64, ask: string) -> bool {
       if (!gone && !merc_zip_descend(z, run_view(p + i, len))) { gone = true; }
       i = i + len;
     }
-  }
-  if (tail && !gone) {
-    var v2: int32 = merc_zip_next(z, 0x80);
-    if (v2 >= 0x80 && v2 <= 0xC0) { return false; }
   }
   r->zfloor[level] = merc_zip_depth(z);
   r->zstate[level] = 0;
@@ -815,6 +869,160 @@ fn cut_prefixes(r: MercRun*, s: Seek*) -> int64 {
   return n;
 }
 
+// true when every key below the fixed start of p is a match to try, so
+// counting keys says how much work a prefix holds.
+fn all_new(p: uint8*, n: int64) -> bool {
+  for i: int64 in run_prefix(p, n, 0)..n {
+    if (p[i] != 0xC0) { return false; }
+  }
+  return true;
+}
+
+fn more_parts(r: MercRun*, parts: int64) -> bool {
+  if (parts <= r->part_cap) { return true; }
+  var p: rawptr* = (rawptr*)realloc(r->parts, parts * 8);
+  if (p == 0) { return false; }
+  r->parts = p;
+  while (r->part_cap < parts) {
+    r->parts[r->part_cap] = (rawptr)seek_new(r->trie);
+    r->part_cap = r->part_cap + 1;
+  }
+  return true;
+}
+
+fn count_below(z: MercZip*) -> int64 {
+  var floor: int64 = merc_zip_depth(z);
+  var c: int64 = 0;
+  if (merc_zip_get(z, (uint64*)0)) { c = 1; }
+  while (merc_zip_next_value(z, floor)) { c = c + 1; }
+  return c;
+}
+
+fn count_prefixes(r: MercRun*, s: Seek*, lo: int64, hi: int64) {
+  if (s->zlive[0] == 0) {
+    s->zips[0] = merc_zip(s->trie);
+    s->zlive[0] = 1;
+  }
+  var z: MercZip* = s->zips;
+  var rec: int64* = (int64*)r->first_at.data;
+  var w: int64* = (int64*)r->weights.data;
+  for i: int64 in lo..hi {
+    if (w[i] >= 0) { continue; }
+    merc_zip_reset(z);
+    w[i] = 0;
+    if (merc_zip_descend(z, run_view(r->first.data + rec[2 * i], rec[2 * i + 1]))) { w[i] = count_below(z); }
+  }
+}
+
+fn count_all(r: MercRun*, n: int64) {
+  var chunks: int64 = n;
+  if (chunks > 64) { chunks = 64; }
+  merc_buf_clear(&r->part_lo);
+  for i: int64 in 0..(chunks + 1) {
+    var lo: int64 = n * i / chunks;
+    merc_buf_add(&r->part_lo, (uint8*)&lo, 8);
+  }
+  r->phase = 3;
+  if (!r->spread(r, chunks)) {
+    for c: int64 in 0..chunks { merc_run_part(r, c); }
+  }
+  r->phase = 0;
+}
+
+// how many keys sit below each prefix, counted on the cores. a prefix with
+// too many is cut at the next place its keys part ways, so the parts come
+// out about the same size however the keys bunch up.
+fn balance_prefixes(r: MercRun*, s: Seek*, n0: int64) -> int64 {
+  var n: int64 = n0;
+  merc_buf_clear(&r->weights);
+  merc_buf_room(&r->weights, n * 8);
+  r->weights.len = n * 8;
+  for i0: int64 in 0..n { ((int64*)r->weights.data)[i0] = -1; }
+  count_all(r, n);
+  var total: int64 = 0;
+  for i2: int64 in 0..n { total = total + ((int64*)r->weights.data)[i2]; }
+  var limit: int64 = total / 256 + 1;
+  var z: MercZip* = s->zips;
+  for round in 0..6 {
+    var heavy: bool = false;
+    for i3: int64 in 0..n {
+      if (((int64*)r->weights.data)[i3] > limit) { heavy = true; break; }
+    }
+    if (!heavy) { break; }
+    merc_buf_clear(&r->extra);
+    merc_buf_clear(&r->spare);
+    merc_buf_clear(&r->wspare);
+    var grew: bool = false;
+    for i4: int64 in 0..n {
+      var rec: int64* = (int64*)r->first_at.data;
+      var pb: uint8* = r->first.data + rec[2 * i4];
+      var pn: int64 = rec[2 * i4 + 1];
+      var w: int64 = ((int64*)r->weights.data)[i4];
+      var split: bool = false;
+      if (w > limit) {
+        merc_zip_reset(z);
+        split = merc_zip_descend(z, run_view(pb, pn)) && !merc_zip_get(z, (uint64*)0) && merc_zip_children(z) > 1;
+      }
+      if (!split) {
+        var ne: int64[2];
+        ne[0] = r->extra.len;
+        ne[1] = pn;
+        merc_buf_add(&r->extra, pb, pn);
+        merc_buf_add(&r->spare, (uint8*)&ne[0], 16);
+        merc_buf_add(&r->wspare, (uint8*)&w, 8);
+        continue;
+      }
+      grew = true;
+      var c: int32 = merc_zip_next(z, 0);
+      while (c >= 0) {
+        merc_zip_reset(z);
+        merc_zip_descend(z, run_view(pb, pn));
+        merc_zip_step(z, (uint8)c);
+        while (!merc_zip_get(z, (uint64*)0) && merc_zip_children(z) == 1) {
+          merc_zip_step(z, (uint8)merc_zip_next(z, 0));
+        }
+        var path: string = merc_zip_path(z);
+        var ce: int64[2];
+        ce[0] = r->extra.len;
+        ce[1] = (int64)path.length;
+        merc_buf_text(&r->extra, path);
+        merc_buf_add(&r->spare, (uint8*)&ce[0], 16);
+        var cw: int64 = -1;
+        merc_buf_add(&r->wspare, (uint8*)&cw, 8);
+        merc_zip_reset(z);
+        merc_zip_descend(z, run_view(pb, pn));
+        c = merc_zip_next(z, c + 1);
+      }
+    }
+    n = r->spare.len / 16;
+    merc_buf_clear(&r->first);
+    merc_buf_add(&r->first, r->extra.data, r->extra.len);
+    merc_buf_clear(&r->first_at);
+    merc_buf_add(&r->first_at, r->spare.data, r->spare.len);
+    merc_buf_clear(&r->weights);
+    merc_buf_add(&r->weights, r->wspare.data, r->wspare.len);
+    if (!grew) { break; }
+    count_all(r, n);
+  }
+  merc_zip_reset(z);
+  var want: int64 = 64;
+  merc_buf_clear(&r->part_lo);
+  var zero: int64 = 0;
+  merc_buf_add(&r->part_lo, (uint8*)&zero, 8);
+  var parts: int64 = 1;
+  var acc: int64 = 0;
+  for i5: int64 in 0..n {
+    acc = acc + ((int64*)r->weights.data)[i5];
+    if (i5 + 1 < n && parts < want && acc * want >= total * parts) {
+      var cut: int64 = i5 + 1;
+      merc_buf_add(&r->part_lo, (uint8*)&cut, 8);
+      parts = parts + 1;
+    }
+  }
+  merc_buf_add(&r->part_lo, (uint8*)&n, 8);
+  return parts;
+}
+
 fn run_match(r: Seek*, pl: Plan*, list: MercRun*, lo: int64, hi: int64) {
   var e: uint8* = r->rule;
   var k: int64 = pl->k;
@@ -827,6 +1035,7 @@ fn run_match(r: Seek*, pl: Plan*, list: MercRun*, lo: int64, hi: int64) {
   probe[0] = false;
   var level: int64 = 0;
   var at0: int64 = lo;
+  r->inc_done = 0;
   if (k == 0) {
     merc_buf_clear(&r->ptup);
     merc_buf_push(&r->ptup, 1);
@@ -849,11 +1058,12 @@ fn run_match(r: Seek*, pl: Plan*, list: MercRun*, lo: int64, hi: int64) {
       if (level == 0 && list != 0 && list->by_prefix) {
         if (!prefix_next(r, list, run_view(pats, pl->pat_end[0]), &at0, hi)) { break; }
         merc_buf_clear(f);
+        run_moved(r, level);
         if (list->tail_walk) {
           merc_buf_text(f, merc_zip_path(r->zips));
           quick = !has_var(f->data + list->floor0, f->len - list->floor0);
           if (quick) { tail_bind(&b, 0, list->tail0, f->data, list->floor0, f->len); }
-          else if (!run_unify(r, pats, &pl->pat_end[0], 1)) { continue; }
+          else if (!run_unify(r, pl, 1)) { continue; }
         } else {
         merc_buf_text(f, merc_query_match(q));
         quick = q->exact;
@@ -862,7 +1072,7 @@ fn run_match(r: Seek*, pl: Plan*, list: MercRun*, lo: int64, hi: int64) {
             b.at[v1] = f->data + q->from[v1];
             b.len[v1] = (int64)(q->to[v1] - q->from[v1]);
           }
-        } else if (!run_unify(r, pats, &pl->pat_end[0], 1)) {
+        } else if (!run_unify(r, pl, 1)) {
           continue;
         }
         }
@@ -872,6 +1082,7 @@ fn run_match(r: Seek*, pl: Plan*, list: MercRun*, lo: int64, hi: int64) {
         at0 = at0 + 1;
         var head: int64* = (int64*)rec;
         merc_buf_clear(f);
+        run_moved(r, level);
         merc_buf_add(f, rec + 32, head[0]);
         exact = head[1] != 0;
         quick = exact;
@@ -881,7 +1092,7 @@ fn run_match(r: Seek*, pl: Plan*, list: MercRun*, lo: int64, hi: int64) {
             b.at[v0] = f->data + ft[2 * v0];
             b.len[v0] = ft[2 * v0 + 1] - ft[2 * v0];
           }
-        } else if (!run_unify(r, pats, &pl->pat_end[0], 1)) {
+        } else if (!run_unify(r, pl, 1)) {
           continue;
         }
       } else {
@@ -896,6 +1107,7 @@ fn run_match(r: Seek*, pl: Plan*, list: MercRun*, lo: int64, hi: int64) {
           continue;
         }
         merc_buf_clear(f);
+        run_moved(r, level);
         if (probe[level]) { merc_buf_text(f, merc_zip_path(r->zips + level)); }
         else { merc_buf_text(f, merc_query_match(q)); }
         if (pl->rel[level] == 1 && !same_bytes(f, &r->found[pl->relto[level]])) { continue; }
@@ -909,7 +1121,7 @@ fn run_match(r: Seek*, pl: Plan*, list: MercRun*, lo: int64, hi: int64) {
             b.at[first + v] = f->data + q->from[v];
             b.len[first + v] = (int64)(q->to[v] - q->from[v]);
           }
-        } else if (!run_unify(r, pats, &pl->pat_end[0], level + 1)) {
+        } else if (!run_unify(r, pl, level + 1)) {
           continue;
         }
       }
@@ -921,8 +1133,8 @@ fn run_match(r: Seek*, pl: Plan*, list: MercRun*, lo: int64, hi: int64) {
         if (quick) {
           fast_ask(&b, pats + p_at, p_n, pl->before[next], &r->ask);
         } else {
-          merc_unify_fresh(r->u + next);
-          merc_unify_fill_from(r->u + next, run_view(pats + p_at, p_n), pl->before[next], &r->ask);
+          merc_unify_fresh(r->u);
+          merc_unify_fill_from(r->u, run_view(pats + p_at, p_n), pl->before[next], &r->ask);
         }
         fast[next] = quick;
         probe[next] = quick && probe_start(r, next, merc_buf_view(&r->ask));
@@ -934,7 +1146,7 @@ fn run_match(r: Seek*, pl: Plan*, list: MercRun*, lo: int64, hi: int64) {
     }
     if (whole) {
       r->matches = r->matches + 1;
-      var u: MercUnify* = r->u + k;
+      var u: MercUnify* = r->u;
       for j: int64 in 0..m {
         if (quick && r->batch && pl->kind[j] == K_ADD) {
           var a0: int64 = r->addb.len;
@@ -1082,6 +1294,10 @@ export fn merc_run_part(r: MercRun*, i: int64) -> bool {
     build_range(r, i);
     return true;
   }
+  if (r->phase == 3) {
+    count_prefixes(r, (Seek*)r->parts[i], ((int64*)r->part_lo.data)[i], ((int64*)r->part_lo.data)[i + 1]);
+    return true;
+  }
   var s: Seek* = (Seek*)r->parts[i];
   var lo: int64 = ((int64*)r->part_lo.data)[i];
   var hi: int64 = ((int64*)r->part_lo.data)[i + 1];
@@ -1104,38 +1320,38 @@ fn run_search(r: MercRun*, s: Seek*, pl: Plan*) {
   r->tail_walk = probe_start(s, 0, run_view(s->pats, pl->pat_end[0])) && s->zstate[0] == 1;
   r->floor0 = s->zfloor[0];
   r->tail0 = s->ztail[0];
+  var parts: int64 = 0;
   if (r->tail_walk || (fixed_walk(s->zips, s->pats, pl->pat_end[0]) && merc_zip_exists(s->zips))) {
     n = cut_prefixes(r, s);
-    if (n < r->wide_min) {
+    if (n < r->wide_min || !more_parts(r, 64)) {
       run_match(s, pl, (MercRun*)0, 0, 0);
       return;
     }
     r->by_prefix = true;
+    if (r->tail_walk || all_new(s->pats, pl->pat_end[0])) {
+      parts = balance_prefixes(r, s, n);
+    } else {
+      parts = n;
+      if (parts > 64) { parts = 64; }
+      merc_buf_clear(&r->part_lo);
+      for i: int64 in 0..(parts + 1) {
+        var lo: int64 = n * i / parts;
+        merc_buf_add(&r->part_lo, (uint8*)&lo, 8);
+      }
+    }
   } else {
     n = gather_first(r, s, pl);
-    if (n < r->wide_min) {
+    if (n < r->wide_min || !more_parts(r, 64)) {
       run_match(s, pl, r, 0, n);
       return;
     }
-  }
-  var parts: int64 = n;
-  if (parts > 64) { parts = 64; }
-  if (parts > r->part_cap) {
-    var p: rawptr* = (rawptr*)realloc(r->parts, parts * 8);
-    if (p == 0) {
-      run_match(s, pl, r, 0, n);
-      return;
+    parts = n;
+    if (parts > 64) { parts = 64; }
+    merc_buf_clear(&r->part_lo);
+    for i: int64 in 0..(parts + 1) {
+      var lo: int64 = n * i / parts;
+      merc_buf_add(&r->part_lo, (uint8*)&lo, 8);
     }
-    r->parts = p;
-    while (r->part_cap < parts) {
-      r->parts[r->part_cap] = (rawptr)seek_new(r->trie);
-      r->part_cap = r->part_cap + 1;
-    }
-  }
-  merc_buf_clear(&r->part_lo);
-  for i: int64 in 0..(parts + 1) {
-    var lo: int64 = n * i / parts;
-    merc_buf_add(&r->part_lo, (uint8*)&lo, 8);
   }
   for i2: int64 in 0..parts {
     var ps: Seek* = (Seek*)r->parts[i2];

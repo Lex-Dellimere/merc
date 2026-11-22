@@ -4,15 +4,10 @@ merc is a store for symbolic expressions, written in mettle. you load expression
 
 ## build
 
-you need the mettle compiler built from [its source](https://github.com/The-Mettle-Project/Mettle) and [mbuild](https://github.com/Lex-Dellimere/mbuild). merc also needs alph, MythicUI, Glint and Cryptex in a folder named `mettle` next to it:
+you need the mettle compiler built from [its source](https://github.com/The-Mettle-Project/Mettle) and [mbuild](https://github.com/Lex-Dellimere/mbuild). mbuild downloads alph, MythicUI, Glint and Cryptex for you.
 
 ```
 git clone https://github.com/Lex-Dellimere/merc
-mkdir mettle
-git clone https://github.com/Lex-Dellimere/Alph mettle/alph
-git clone https://github.com/Lex-Dellimere/MythicUI mettle/mythic_ui
-git clone https://github.com/Lex-Dellimere/Glint mettle/glint
-git clone https://github.com/Lex-Dellimere/Cryptex mettle/cryptex
 cd merc
 mbuild build -r
 ```

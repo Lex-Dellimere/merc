@@ -36,6 +36,7 @@ export struct MercQuery {
   ended: bool;
   exact: bool;
   unified: bool;
+  lazy: bool;
   uni: MercUnify;
   pin: uint8*;
   pin_len: int64;
@@ -210,6 +211,7 @@ export fn merc_query_next(q: MercQuery*) -> bool {
             return true;
           }
           q->exact = false;
+          if (q->lazy) { return true; }
           q->checks = q->checks + 1;
           var pv: string;
           pv.chars = q->pat;
@@ -295,6 +297,10 @@ export fn merc_query_pin(q: MercQuery*, path: string) -> bool {
   q->pin_len = n;
   return true;
 }
+
+// lazy leaves the last word to the caller. a match that needs the unifier
+// comes back with exact false and is not checked.
+export fn merc_query_lazy(q: MercQuery*, on: bool) { q->lazy = on; }
 
 export fn merc_query_match(q: MercQuery*) -> string {
   return merc_zip_path(&q->zip);

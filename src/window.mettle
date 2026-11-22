@@ -768,8 +768,41 @@ fn build_hits() {
   mark_vars();
 }
 
+fn mark_inside() {
+  g_hit_fixed = 0;
+  var p: uint8* = g_sh.hits.data;
+  var n: int64 = g_sh.hits.len;
+  var sp: uint32* = (uint32*)g_sh.spans.data;
+  var at: int64 = 0;
+  var s: int64 = 0;
+  var keys: int64 = 0;
+  while (at + 4 <= n && keys < 4000) {
+    var len32: uint32 = 0;
+    memcpy((rawptr)&len32, (rawptr)(p + at), 4);
+    var kn: int64 = (int64)len32;
+    var key: uint8* = p + at + 4;
+    var many: int64 = (int64)sp[s + 1];
+    for k: int64 in 0..many {
+      var off: int64 = (int64)sp[s + 2 + k];
+      var end: int64 = off + merc_span(key + off, kn - off);
+      var h: uint64 = FNV0;
+      for j: int64 in 0..end {
+        h = hstep(h, key[j]);
+        if (j >= off) { hm_put(&g_hitvar_set, h, 1); }
+      }
+    }
+    s = s + 2 + many;
+    at = at + 4 + kn;
+    keys = keys + 1;
+  }
+}
+
 fn mark_vars() {
   hm_clear(&g_hitvar_set);
+  if (g_sh.inside) {
+    mark_inside();
+    return;
+  }
   var pat: uint8* = g_sh.touched.data;
   var pn: int64 = g_sh.touched.len;
   g_hit_fixed = 0;
@@ -836,6 +869,9 @@ var g_list: int64*;
 var g_list_n: int64 = 0;
 var g_list_cap: int64 = 0;
 
+var g_span_at: int64*;
+var g_row_id: int64*;
+
 fn rows_index() {
   g_rows_n = 0;
   var p: uint8* = g_sh.hits.data;
@@ -856,6 +892,27 @@ fn rows_index() {
     g_rows_n = g_rows_n + 1;
     i = i + 4 + (int64)len32;
   }
+  if (!g_sh.inside) { return; }
+  g_span_at = (int64*)realloc((rawptr)g_span_at, g_rows_cap * 8);
+  g_row_id = (int64*)realloc((rawptr)g_row_id, g_rows_cap * 8);
+  var sp: uint32* = (uint32*)g_sh.spans.data;
+  var at: int64 = 0;
+  for r: int64 in 0..g_rows_n {
+    g_span_at[r] = at;
+    g_row_id[r] = (int64)sp[at];
+    at = at + 2 + (int64)sp[at + 1];
+  }
+}
+
+fn row_of_id(id: int64) -> int64 {
+  var lo: int64 = 0;
+  var hi: int64 = g_rows_n - 1;
+  while (lo <= hi) {
+    var mid: int64 = (lo + hi) / 2;
+    if (g_row_id[mid] == id) { return mid; }
+    if (g_row_id[mid] < id) { lo = mid + 1; } else { hi = mid - 1; }
+  }
+  return -1;
 }
 
 fn list_push(v: int64) {
@@ -910,9 +967,14 @@ fn lv_set(mode: int32, v: int32, entry: int64) {
     }
     if (g_list_n > 1) { sort_by_count(g_list, 0, g_list_n - 1); }
   } else if (mode == 2) {
+    var mark: uint8* = (uint8*)calloc(g_rows_n + 1, 1);
     for r: int64 in 0..g_vt_rows {
-      if (g_row_entry[r * (int64)VT_MAX + (int64)v] == entry) { list_push(r); }
+      if (g_row_entry[r * (int64)VT_MAX + (int64)v] == entry && g_occ_row[r] < g_rows_n) { mark[g_occ_row[r]] = 1; }
     }
+    for r2: int64 in 0..g_rows_n {
+      if (mark[r2] != 0) { list_push(r2); }
+    }
+    free((rawptr)mark);
   }
 }
 
@@ -975,9 +1037,64 @@ var g_vt_rows: int64 = 0;
 var g_vt_capped: bool = false;
 
 var g_row_entry: int64*;
+var g_occ_row: int64*;
+
+fn vt_note(v3: int32, bind: MercBuf*) {
+  var h: uint64 = FNV0;
+  for b: int64 in 0..bind->len { h = hstep(h, bind->data[b]); }
+  var idx: int64 = 0;
+  if (hm_get(&g_vmap[v3], h, &idx)) {
+    g_ve[idx].count = g_ve[idx].count + 1;
+    g_row_entry[(g_vt_rows - 1) * (int64)VT_MAX + (int64)v3] = idx;
+    return;
+  }
+  if (g_ve_n == g_ve_cap) {
+    var cap: int64 = g_ve_cap * 2;
+    if (cap < 1024) { cap = 1024; }
+    g_ve = (VEntry*)realloc((rawptr)g_ve, cap * (int64)sizeof(VEntry));
+    g_ve_cap = cap;
+  }
+  var e: VEntry* = &g_ve[g_ve_n];
+  e->v = v3;
+  e->count = 1;
+  e->off = g_vtext.len;
+  if (!merc_format(merc_buf_view(bind), &g_vtext, (MercNames*)0)) { fmt_partial(merc_buf_view(bind), &g_vtext); }
+  if (g_vtext.len - e->off > 160) { g_vtext.len = e->off + 160; }
+  e->len = g_vtext.len - e->off;
+  hm_put(&g_vmap[v3], h, g_ve_n);
+  g_row_entry[(g_vt_rows - 1) * (int64)VT_MAX + (int64)v3] = g_ve_n;
+  g_ve_n = g_ve_n + 1;
+  g_vdistinct[v3] = g_vdistinct[v3] + 1;
+}
+
+fn vt_inside(pat: string) {
+  var f: MercFind* = &g_sh.find;
+  if (f->serial != g_sh.serial || !merc_find_start(f, pat)) { return; }
+  g_vars = merc_find_vars(f);
+  if (g_vars > VT_MAX) { g_vars = VT_MAX; }
+  var bind: MercBuf;
+  while (merc_find_next(f)) {
+    var row: int64 = row_of_id(merc_find_id(f));
+    if (row < 0) { continue; }
+    if (g_vt_rows >= VT_CAP) {
+      g_vt_capped = true;
+      break;
+    }
+    g_occ_row[g_vt_rows] = row;
+    g_vt_rows = g_vt_rows + 1;
+    for v3: int32 in 0..g_vars {
+      merc_buf_clear(&bind);
+      if (merc_find_bind(f, v3, &bind)) { vt_note(v3, &bind); }
+    }
+  }
+  merc_buf_free(&bind);
+}
 
 fn var_table() {
-  if (g_row_entry == 0) { g_row_entry = (int64*)malloc(VT_CAP * (int64)VT_MAX * 8); }
+  if (g_row_entry == 0) {
+    g_row_entry = (int64*)malloc(VT_CAP * (int64)VT_MAX * 8);
+    g_occ_row = (int64*)malloc(VT_CAP * 8);
+  }
   for v: int32 in 0..VT_MAX {
     hm_clear(&g_vmap[v]);
     g_vdistinct[v] = 0;
@@ -1005,39 +1122,20 @@ fn var_table() {
     g_vname_len[v2] = g_vname.len - g_vname_off[v2];
   }
   var bind: MercBuf;
-  while (merc_query_next(&q)) {
-    if (g_vt_rows >= VT_CAP) {
-      g_vt_capped = true;
-      break;
-    }
-    g_vt_rows = g_vt_rows + 1;
-    for v3: int32 in 0..g_vars {
-      merc_buf_clear(&bind);
-      if (!merc_query_bind(&q, v3, &bind)) { continue; }
-      var h: uint64 = FNV0;
-      for b: int64 in 0..bind.len { h = hstep(h, bind.data[b]); }
-      var idx: int64 = 0;
-      if (hm_get(&g_vmap[v3], h, &idx)) {
-        g_ve[idx].count = g_ve[idx].count + 1;
-        g_row_entry[(g_vt_rows - 1) * (int64)VT_MAX + (int64)v3] = idx;
-      } else {
-        if (g_ve_n == g_ve_cap) {
-          var cap: int64 = g_ve_cap * 2;
-          if (cap < 1024) { cap = 1024; }
-          g_ve = (VEntry*)realloc((rawptr)g_ve, cap * (int64)sizeof(VEntry));
-          g_ve_cap = cap;
-        }
-        var e: VEntry* = &g_ve[g_ve_n];
-        e->v = v3;
-        e->count = 1;
-        e->off = g_vtext.len;
-        if (!merc_format(merc_buf_view(&bind), &g_vtext, (MercNames*)0)) { fmt_partial(merc_buf_view(&bind), &g_vtext); }
-        if (g_vtext.len - e->off > 160) { g_vtext.len = e->off + 160; }
-        e->len = g_vtext.len - e->off;
-        hm_put(&g_vmap[v3], h, g_ve_n);
-        g_row_entry[(g_vt_rows - 1) * (int64)VT_MAX + (int64)v3] = g_ve_n;
-        g_ve_n = g_ve_n + 1;
-        g_vdistinct[v3] = g_vdistinct[v3] + 1;
+  if (g_sh.inside) {
+    vt_inside(merc_buf_view(&pb));
+  } else {
+    while (merc_query_next(&q)) {
+      if (g_vt_rows >= VT_CAP) {
+        g_vt_capped = true;
+        break;
+      }
+      g_occ_row[g_vt_rows] = g_vt_rows;
+      g_vt_rows = g_vt_rows + 1;
+      for v3: int32 in 0..g_vars {
+        merc_buf_clear(&bind);
+        if (!merc_query_bind(&q, v3, &bind)) { continue; }
+        vt_note(v3, &bind);
       }
     }
   }
@@ -1089,6 +1187,7 @@ var g_step_took: MercBuf;
 var g_find_took: MercBuf;
 var g_find_found: int64 = 0;
 var g_find_walked: int64 = 0;
+var g_find_rows: int64 = 0;
 var g_save_line: MercBuf;
 
 fn out_line_with(word: string, out: MercBuf*) -> bool {
@@ -1139,6 +1238,14 @@ fn note_result(tl: string) {
     merc_buf_text(&g_step_line, merc_buf_view(&tmp));
     merc_buf_clear(&g_step_took);
     merc_buf_text(&g_step_took, merc_buf_view(&g_took));
+  } else if (kind == MERC_DID_SEARCH && g_sh.inside && (out_line_with(" places in ", &tmp) || out_line_with(" place in ", &tmp))) {
+    var at2: int64 = 0;
+    var v2: string = merc_buf_view(&tmp);
+    g_find_found = first_num(v2, &at2);
+    g_find_rows = first_num(v2, &at2);
+    g_find_walked = 0;
+    merc_buf_clear(&g_find_took);
+    merc_buf_text(&g_find_took, merc_buf_view(&g_took));
   } else if (kind == MERC_DID_SEARCH && out_line_with(" bytes walked", &tmp)) {
     var at: int64 = 0;
     var v: string = merc_buf_view(&tmp);
@@ -1369,7 +1476,7 @@ fn go_done() {
 }
 
 fn go_pump() {
-  if (!g_go || g_engine_busy || g_q_len > 0 || g_del_t0 >= 0.0) { return; }
+  if (!g_go || g_engine_busy || g_del_t0 >= 0.0) { return; }
   rules_scan();
   if (g_rules_n == 0) {
     go_done();
@@ -1380,8 +1487,17 @@ fn go_pump() {
   g_quiet = false;
 }
 
+var g_wait_said: bool = false;
+
 fn pump_queue() {
-  if (g_engine_busy) { return; }
+  if (g_engine_busy || g_go) {
+    if (g_q_len > 0 && !g_wait_said) {
+      g_wait_said = true;
+      log_s("waiting for the rules to finish", LL_NOTE);
+    }
+    return;
+  }
+  g_wait_said = false;
   if (g_del_t0 >= 0.0) {
     if (g_now - g_del_t0 < DEL_FLASH_S) { return; }
     g_del_t0 = -1.0;
@@ -1409,8 +1525,7 @@ fn pump_queue() {
       g_go = true;
       g_go_ran = 0;
       free((rawptr)one);
-      done = done + 1;
-      continue;
+      return;
     }
     if (last && !g_go && trim(line) == "step") {
       rules_scan();
@@ -2863,14 +2978,34 @@ const LV_TOP: float32 = 46.0;
 const LV_ROW: float32 = 28.0;
 const LV_GUT: float32 = 88.0;
 
+var g_flag_row: int64 = 0;
+
 fn row_flags(key: uint8*, kn: int64) {
+  var n: int64 = kn;
+  if (n > 8192) { n = 8192; }
+  memset((rawptr)&g_rb[0], 0, n);
+  if (!g_sh.inside) {
+    flags_at(key, kn, 0, 0);
+    return;
+  }
+  var sp: uint32* = (uint32*)g_sh.spans.data;
+  var at: int64 = g_span_at[g_flag_row];
+  var many: int64 = (int64)sp[at + 1];
+  for k: int64 in 0..many {
+    var off: int64 = (int64)sp[at + 2 + k];
+    var span: int64 = merc_span(key + off, kn - off);
+    for q: int64 in off..off + span { if (q < n) { g_rb[q] = 0x20; } }
+    flags_at(key, kn, off, 0x20);
+  }
+}
+
+fn flags_at(key: uint8*, kn: int64, from: int64, base: uint8) {
   var pat: uint8* = g_sh.touched.data;
   var pn: int64 = g_sh.touched.len;
   var n: int64 = kn;
   if (n > 8192) { n = 8192; }
-  memset((rawptr)&g_rb[0], 0, n);
   var i: int64 = 0;
-  var j: int64 = 0;
+  var j: int64 = from;
   var vno: int32 = 0;
   while (i < pn && j < kn) {
     var t: uint8 = pat[i];
@@ -2880,7 +3015,9 @@ fn row_flags(key: uint8*, kn: int64) {
       if (span <= 0) { return; }
       var vid: int32 = vno;
       if (t < 0xC0) { vid = (int32)(t & 63); } else { vno = vno + 1; }
-      for q: int64 in 0..span { if (j + q < n) { g_rb[j + q] = (uint8)(1 + vid % 8); } }
+      var mark: uint8 = (uint8)(1 + vid % 8);
+      if (base != 0) { mark = base | 0x10 | (uint8)(vid % 2); }
+      for q: int64 in 0..span { if (j + q < n) { g_rb[j + q] = mark; } }
       j = j + span;
       i = i + 1;
     } else if (kt >= 0x80 && kt <= 0xC0) {
@@ -2999,7 +3136,15 @@ fn lv_clamp() {
 fn run_color(f: uint8) -> uint32 {
   var v: int32 = (int32)(f & 0x0F);
   var col: uint32 = C_TEXT2;
-  if (v > 0) {
+  if ((f & 0x20) != 0) {
+    col = C_AMBER;
+    if ((f & 0x10) != 0) {
+      col = C_TEXT;
+      if (v == 1) { col = C_TEXT2; }
+    }
+  } else if (v == 0 && g_sh.inside && g_lv_mode != 1) {
+    col = C_MUTED;
+  } else if (v > 0) {
     col = C_TEXT;
     if (v % 2 == 1) { col = C_AMBER; }
   }
@@ -3049,6 +3194,7 @@ fn draw_list(p: MythicPainter*, box: MythicRect) {
       var row: int64 = r;
       if (g_lv_mode == 2) { row = g_list[r]; }
       fmt_group(row + 1);
+      g_flag_row = row;
       flat_row(g_sh.hits.data + g_rows_off[row], g_rows_len[row], g_hit_fixed);
     }
     var gw: float32 = mythic_text_width(p->fonts, mythic_paint_text_spec(p->scale, gst), fmt_view()) / p->scale;
@@ -3530,17 +3676,23 @@ fn side_find(ui: MythicUi*) {
   fmt_group(g_find_found);
   txt(ui, fmt_view(), serif(34.0), C_TEXT);
   fmt_reset();
-  if (g_find_found == 1) { fmt_s("match"); } else { fmt_s("matches"); }
+  if (g_sh.inside) {
+    if (g_find_found == 1) { fmt_s("place in "); } else { fmt_s("places in "); }
+    fmt_group(g_find_rows);
+    if (g_find_rows == 1) { fmt_s(" sentence"); } else { fmt_s(" sentences"); }
+  } else if (g_find_found == 1) { fmt_s("match"); } else { fmt_s("matches"); }
   if (!hits_live() && g_hit_n > 0) { fmt_s(" before the trie changed"); }
   txt(ui, fmt_view(), sans(14.0), C_TEXT2);
   gap(ui, 4.0);
   fmt_reset();
   fmt_s(merc_buf_view(&g_find_took));
-  fmt_s(" · ");
-  fmt_group(g_find_walked);
-  fmt_s(" bytes walked");
+  if (!g_sh.inside) {
+    fmt_s(" · ");
+    fmt_group(g_find_walked);
+    fmt_s(" bytes walked");
+  }
   wrap(ui, fmt_view(), mono(12.0), C_MUTED);
-  if (g_vars > 0) {
+  if (g_vars > 0 && g_find_found > 0) {
     gap(ui, 16.0);
     for v: int32 in 0..g_vars {
       rule_h(ui);
@@ -3575,7 +3727,7 @@ fn side_find(ui: MythicUi*) {
       fmt_reset();
       fmt_s("Counted over the first ");
       fmt_group(VT_CAP);
-      fmt_s(" matches.");
+      if (g_sh.inside) { fmt_s(" places."); } else { fmt_s(" matches."); }
       txt(ui, fmt_view(), sans(12.0), C_MUTED);
     }
   }
@@ -4222,13 +4374,24 @@ fn divider(ui: MythicUi*, which: int32) {
 fn results_bar(ui: MythicUi*) {
   mythic_row_begin(ui, { width: mythic_grow(), height: mythic_fixed(52.0), pad: mythic_pad_xy(48.0, 0.0), gap: 18, align_y: MYTHIC_ALIGN_CENTER });
     var pst: MythicTextStyle = mono(15.0);
-    txt(ui, merc_buf_view(&g_hit_pattern), pst, C_TEXT);
+    var shown: int64 = g_find_found;
+    fmt_reset();
+    if (g_sh.inside) {
+      fmt_s("find ");
+      shown = g_find_rows;
+    }
+    fmt_s(merc_buf_view(&g_hit_pattern));
+    txt(ui, fmt_view(), pst, C_TEXT);
     fmt_reset();
     fmt_group(g_find_found);
-    if (g_find_found == 1) { fmt_s(" match"); } else { fmt_s(" matches"); }
+    if (g_sh.inside) {
+      if (g_find_found == 1) { fmt_s(" place in "); } else { fmt_s(" places in "); }
+      fmt_group(g_find_rows);
+      if (g_find_rows == 1) { fmt_s(" sentence"); } else { fmt_s(" sentences"); }
+    } else if (g_find_found == 1) { fmt_s(" match"); } else { fmt_s(" matches"); }
     txt(ui, fmt_view(), sans(14.0), C_TEXT2);
     txt(ui, merc_buf_view(&g_find_took), mono(13.0), C_MUTED);
-    if (g_find_found > merc_count(&g_res)) {
+    if (shown > merc_count(&g_res)) {
       fmt_reset();
       fmt_s("first ");
       fmt_group(merc_count(&g_res));

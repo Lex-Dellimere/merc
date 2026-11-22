@@ -1,0 +1,444 @@
+// subtree search. a second trie holds every subexpression below the top of
+// every stored expression, cut off at a few levels, and each of its keys
+// lists where it came from as (expression, byte offset) pairs.
+// a pattern is searched in that trie, then each place is checked against
+// the whole subexpression when the cut or a stored variable left it loose.
+
+import "std/mem";
+import "trie";
+import "expr";
+import "query";
+
+export const MERC_FIND_DEPTH: int32 = 2;
+
+export struct MercFind {
+  index: MercTrie;
+  serial: int64;
+  built: bool;
+  depth: int32;
+  exprs: MercBuf;
+  expr_at: MercBuf;
+  with_vars: MercBuf;
+  post_at: MercBuf;
+  posts: MercBuf;
+  places: int64;
+  build_ns: int64;
+  q: MercQuery;
+  pat: MercBuf;
+  sub: MercBuf;
+  uni: MercUnify;
+  loose: bool;
+  safe: bool;
+  linear: bool;
+  checked: bool;
+  pos: int64;
+  end: int64;
+  id: int64;
+  off: int64;
+  steps: int64;
+}
+
+struct MercFdPart {
+  trie: MercTrie;
+  occ: MercBuf;
+  map: MercBuf;
+  key: MercBuf;
+  lo: int64;
+  hi: int64;
+}
+
+var g_fd_each: fn(int64, fn(int64) -> void) -> void;
+var g_fd_cores: bool = false;
+var g_fd: MercFind*;
+var g_fd_parts: MercFdPart*;
+
+// wide.mettle hands over its way of running parts on the cores.
+export fn merc_find_spread(each_cb: fn(int64, fn(int64) -> void) -> void) {
+  g_fd_each = each_cb;
+  g_fd_cores = true;
+}
+
+export fn merc_find_init(f: MercFind*) {
+  var blank: MercFind;
+  *f = blank;
+  f->serial = -1;
+  f->depth = MERC_FIND_DEPTH;
+}
+
+fn merc_fd_drop(f: MercFind*) {
+  merc_free(&f->index);
+  merc_buf_free(&f->exprs);
+  merc_buf_free(&f->expr_at);
+  merc_buf_free(&f->with_vars);
+  merc_buf_free(&f->post_at);
+  merc_buf_free(&f->posts);
+  f->built = false;
+  f->places = 0;
+}
+
+export fn merc_find_free(f: MercFind*) {
+  merc_fd_drop(f);
+  merc_query_free(&f->q);
+  merc_buf_free(&f->pat);
+  merc_buf_free(&f->sub);
+  f->serial = -1;
+}
+
+// the subexpression at off as an expression of its own, variables numbered
+// from zero again. below depth cut every parent turns into a fresh variable,
+// a cut below zero copies all of it. before is how many variables came first.
+fn merc_fd_cut(e: uint8*, n: int64, off: int64, before: int32, cut: int32, out: MercBuf*) -> bool {
+  var span: int64 = merc_span(e + off, n - off);
+  if (span <= 0) { return false; }
+  var end: int64 = off + span;
+  var map: int32[64];
+  for k in 0..64 { map[k] = -1; }
+  var local: int32 = 0;
+  var seen: int32 = before;
+  var left: int32[256];
+  var depth: int32 = 0;
+  var i: int64 = off;
+  while (i < end) {
+    if (depth > 0) { left[depth - 1] = left[depth - 1] - 1; }
+    var tag: uint8 = e[i];
+    if (tag < 64) {
+      if (tag > 0 && ((cut >= 0 && depth >= cut) || depth >= 256)) {
+        var whole: int64 = merc_span(e + i, end - i);
+        var inner: string;
+        inner.chars = e + i;
+        inner.length = (uint64)whole;
+        seen = seen + merc_var_count(inner);
+        merc_buf_push(out, 0xC0);
+        local = local + 1;
+        i = i + whole;
+      } else {
+        merc_buf_push(out, tag);
+        i = i + 1;
+        if (tag > 0) {
+          left[depth] = (int32)tag;
+          depth = depth + 1;
+          continue;
+        }
+      }
+    } else if (tag > 0xC0) {
+      merc_buf_add(out, e + i, 1 + (int64)(tag & 63));
+      i = i + 1 + (int64)(tag & 63);
+    } else {
+      var o: int32 = seen;
+      if (tag == 0xC0) { seen = seen + 1; } else { o = (int32)(tag & 63); }
+      if (o < 64 && map[o] >= 0) {
+        merc_buf_push(out, (uint8)(0x80 + map[o]));
+      } else {
+        if (o < 64) { map[o] = local; }
+        merc_buf_push(out, 0xC0);
+        local = local + 1;
+      }
+      i = i + 1;
+    }
+    while (depth > 0 && left[depth - 1] == 0) { depth = depth - 1; }
+  }
+  return true;
+}
+
+export fn merc_find_count(f: MercFind*) -> int64 { return f->expr_at.len / 8 - 1; }
+
+export fn merc_find_places(f: MercFind*) -> int64 { return f->places; }
+
+export fn merc_find_keys(f: MercFind*) -> int64 { return merc_count(&f->index); }
+
+export fn merc_find_memory(f: MercFind*) -> int64 {
+  return merc_memory(&f->index) + f->exprs.cap + f->expr_at.cap + f->with_vars.cap + f->post_at.cap + f->posts.cap;
+}
+
+export fn merc_find_expr(f: MercFind*, id: int64) -> string {
+  var at: int64* = (int64*)f->expr_at.data;
+  var s: string;
+  s.chars = f->exprs.data + at[id];
+  s.length = (uint64)(at[id + 1] - at[id]);
+  return s;
+}
+
+fn merc_fd_index(p: MercFdPart*) {
+  var f: MercFind* = g_fd;
+  var at: int64* = (int64*)f->expr_at.data;
+  var rec: uint32[3];
+  for id: int64 in p->lo..p->hi {
+    var e: uint8* = f->exprs.data + at[id];
+    var n: int64 = at[id + 1] - at[id];
+    var vars: int32 = 0;
+    var i: int64 = 0;
+    while (i < n) {
+      var tag: uint8 = e[i];
+      if (i > 0 && (tag < 64 || (tag >= 0x80 && tag <= 0xC0))) {
+        merc_buf_clear(&p->key);
+        merc_fd_cut(e, n, i, vars, f->depth, &p->key);
+        var num: uint64 = 0;
+        if (!merc_get(&p->trie, merc_buf_view(&p->key), &num)) {
+          num = (uint64)merc_count(&p->trie);
+          merc_put(&p->trie, merc_buf_view(&p->key), num);
+        }
+        rec[0] = (uint32)num;
+        rec[1] = (uint32)id;
+        rec[2] = (uint32)i;
+        merc_buf_add(&p->occ, (uint8*)&rec[0], 12);
+      }
+      i = i + 1;
+      if (tag == 0xC0) { vars = vars + 1; }
+      else if (tag > 0xC0) { i = i + (int64)(tag & 63); }
+    }
+  }
+}
+
+fn merc_fd_index_part(i: int64) { merc_fd_index(g_fd_parts + i); }
+
+fn merc_fd_number(i: int64) {
+  var p: MercFdPart* = g_fd_parts + i;
+  var keys: int64 = merc_count(&p->trie);
+  merc_buf_room(&p->map, keys * 4);
+  p->map.len = keys * 4;
+  var map: uint32* = (uint32*)p->map.data;
+  var z: MercZip = merc_zip(&p->trie);
+  var more: bool = merc_zip_get(&z, (uint64*)0);
+  if (!more) { more = merc_zip_next_value(&z, 0); }
+  while (more) {
+    var mine: uint64 = 0;
+    var all: uint64 = 0;
+    merc_zip_get(&z, &mine);
+    merc_get(&g_fd->index, merc_zip_path(&z), &all);
+    map[mine] = (uint32)all;
+    more = merc_zip_next_value(&z, 0);
+  }
+  merc_zip_free(&z);
+  var occ: uint32* = (uint32*)p->occ.data;
+  var n: int64 = p->occ.len / 12;
+  for k: int64 in 0..n { occ[3 * k] = map[occ[3 * k]]; }
+}
+
+fn merc_fd_build(f: MercFind*, t: MercTrie*) -> bool {
+  merc_fd_drop(f);
+  var z: MercZip = merc_zip(t);
+  var zero: int64 = 0;
+  merc_buf_add(&f->expr_at, (uint8*)&zero, 8);
+  var more: bool = merc_zip_get(&z, (uint64*)0);
+  if (!more) { more = merc_zip_next_value(&z, 0); }
+  while (more) {
+    var k: string = merc_zip_path(&z);
+    merc_buf_add(&f->exprs, k.chars, (int64)k.length);
+    var mark: uint8 = 0;
+    if (merc_var_count(k) > 0) { mark = 1; }
+    merc_buf_push(&f->with_vars, mark);
+    var end: int64 = f->exprs.len;
+    merc_buf_add(&f->expr_at, (uint8*)&end, 8);
+    more = merc_zip_next_value(&z, 0);
+  }
+  merc_zip_free(&z);
+  var count: int64 = merc_find_count(f);
+  var parts: int64 = 1;
+  if (g_fd_cores && count >= 4096) { parts = 8; }
+  g_fd = f;
+  g_fd_parts = (MercFdPart*)calloc(parts, sizeof(MercFdPart));
+  for i: int64 in 0..parts {
+    g_fd_parts[i].lo = count * i / parts;
+    g_fd_parts[i].hi = count * (i + 1) / parts;
+  }
+  if (parts > 1) {
+    g_fd_each(parts, &merc_fd_index_part);
+    for i2: int64 in 0..parts { merc_merge_in(&f->index, &g_fd_parts[i2].trie); }
+    var zi: MercZip = merc_zip(&f->index);
+    var num: uint64 = 0;
+    var more2: bool = merc_zip_next_value(&zi, 0);
+    while (more2) {
+      merc_zip_set(&zi, num);
+      num = num + (uint64)1;
+      more2 = merc_zip_next_value(&zi, 0);
+    }
+    merc_zip_free(&zi);
+    g_fd_each(parts, &merc_fd_number);
+  } else {
+    merc_fd_index(g_fd_parts);
+    f->index = g_fd_parts[0].trie;
+    var blank: MercTrie;
+    g_fd_parts[0].trie = blank;
+  }
+  var keys: int64 = merc_count(&f->index);
+  merc_buf_room(&f->post_at, (keys + 1) * 4);
+  f->post_at.len = (keys + 1) * 4;
+  var start: uint32* = (uint32*)f->post_at.data;
+  memset((rawptr)start, 0, (keys + 1) * 4);
+  var total: int64 = 0;
+  for i3: int64 in 0..parts {
+    var occ: uint32* = (uint32*)g_fd_parts[i3].occ.data;
+    var n: int64 = g_fd_parts[i3].occ.len / 12;
+    total = total + n;
+    for k2: int64 in 0..n { start[occ[3 * k2] + (uint32)1] = start[occ[3 * k2] + (uint32)1] + (uint32)1; }
+  }
+  for k3: int64 in 0..keys { start[k3 + 1] = start[k3 + 1] + start[k3]; }
+  merc_buf_room(&f->posts, total * 8);
+  f->posts.len = total * 8;
+  var posts: uint32* = (uint32*)f->posts.data;
+  var fill: uint32* = (uint32*)calloc(keys + 1, 4);
+  for i4: int64 in 0..parts {
+    var occ2: uint32* = (uint32*)g_fd_parts[i4].occ.data;
+    var n2: int64 = g_fd_parts[i4].occ.len / 12;
+    for k4: int64 in 0..n2 {
+      var key: uint32 = occ2[3 * k4];
+      var at: int64 = (int64)(start[key] + fill[key]);
+      fill[key] = fill[key] + (uint32)1;
+      posts[2 * at] = occ2[3 * k4 + 1];
+      posts[2 * at + 1] = occ2[3 * k4 + 2];
+    }
+  }
+  free((rawptr)fill);
+  for i5: int64 in 0..parts {
+    merc_free(&g_fd_parts[i5].trie);
+    merc_buf_free(&g_fd_parts[i5].occ);
+    merc_buf_free(&g_fd_parts[i5].map);
+    merc_buf_free(&g_fd_parts[i5].key);
+  }
+  free((rawptr)g_fd_parts);
+  f->places = total;
+  f->built = true;
+  return true;
+}
+
+// builds the index again when serial moved since the last build.
+// gives true when it had to build.
+export fn merc_find_ready(f: MercFind*, t: MercTrie*, serial: int64) -> bool {
+  if (f->built && f->serial == serial) { return false; }
+  merc_fd_build(f, t);
+  f->serial = serial;
+  return true;
+}
+
+// true when no symbol or parent of the pattern met a variable of the key.
+// then a pattern without repeated variables needs no check against the
+// whole place, unless that place came with stored variables.
+fn merc_fd_covers(p: uint8*, pn: int64, k: string) -> bool {
+  var kp: uint8* = k.chars;
+  var kn: int64 = (int64)k.length;
+  var i: int64 = 0;
+  var j: int64 = 0;
+  while (i < pn && j < kn) {
+    var pt: uint8 = p[i];
+    if (pt >= 0x80 && pt <= 0xC0) {
+      i = i + 1;
+      j = j + merc_span(kp + j, kn - j);
+      continue;
+    }
+    var kt: uint8 = kp[j];
+    if (kt >= 0x80 && kt <= 0xC0) { return false; }
+    var step: int64 = 1;
+    if (pt > 0xC0) { step = 1 + (int64)(pt & 63); }
+    i = i + step;
+    j = j + step;
+  }
+  return true;
+}
+
+fn merc_fd_linear(p: string) -> bool {
+  var i: int64 = 0;
+  var n: int64 = (int64)p.length;
+  while (i < n) {
+    var tag: uint8 = p.chars[i];
+    if (tag >= 0x80 && tag < 0xC0) { return false; }
+    i = i + 1;
+    if (tag > 0xC0) { i = i + (int64)(tag & 63); }
+  }
+  return true;
+}
+
+export fn merc_find_start(f: MercFind*, pattern: string) -> bool {
+  f->linear = merc_fd_linear(pattern);
+  f->pos = 0;
+  f->end = 0;
+  f->steps = 0;
+  merc_buf_clear(&f->pat);
+  merc_buf_text(&f->pat, pattern);
+  merc_query_free(&f->q);
+  f->q = merc_query(&f->index, pattern);
+  return merc_valid(pattern) && f->built;
+}
+
+fn merc_fd_has_var(k: string) -> bool {
+  var p: uint8* = k.chars;
+  var n: int64 = (int64)k.length;
+  var i: int64 = 0;
+  while (i < n) {
+    var tag: uint8 = p[i];
+    if (tag >= 0x80 && tag <= 0xC0) { return true; }
+    i = i + 1;
+    if (tag > 0xC0) { i = i + (int64)(tag & 63); }
+  }
+  return false;
+}
+
+fn merc_fd_load(f: MercFind*) {
+  var e: string = merc_find_expr(f, f->id);
+  var before: int32 = 0;
+  var i: int64 = 0;
+  while (i < f->off) {
+    var tag: uint8 = e.chars[i];
+    i = i + 1;
+    if (tag == 0xC0) { before = before + 1; }
+    else if (tag > 0xC0) { i = i + (int64)(tag & 63); }
+  }
+  merc_buf_clear(&f->sub);
+  merc_fd_cut(e.chars, (int64)e.length, f->off, before, -1, &f->sub);
+}
+
+fn merc_fd_check(f: MercFind*) -> bool {
+  merc_fd_load(f);
+  f->checked = true;
+  return merc_unify(&f->uni, merc_buf_view(&f->pat), merc_buf_view(&f->sub));
+}
+
+// the next place the pattern unifies with. false when there are no more.
+export fn merc_find_next(f: MercFind*) -> bool {
+  if (!f->built) { return false; }
+  var posts: uint32* = (uint32*)f->posts.data;
+  var start: uint32* = (uint32*)f->post_at.data;
+  while (true) {
+    while (f->pos < f->end) {
+      var at: int64 = f->pos;
+      f->pos = f->pos + 1;
+      f->id = (int64)posts[2 * at];
+      f->off = (int64)posts[2 * at + 1];
+      if (!f->loose) { return true; }
+      if (f->safe && f->with_vars.data[f->id] == 0) {
+        f->checked = false;
+        return true;
+      }
+      if (merc_fd_check(f)) { return true; }
+    }
+    if (!merc_query_next(&f->q)) { return false; }
+    var k: uint64 = merc_query_value(&f->q);
+    f->pos = (int64)start[k];
+    f->end = (int64)start[k + (uint64)1];
+    var key: string = merc_query_match(&f->q);
+    f->loose = merc_fd_has_var(key);
+    f->safe = f->loose && f->linear && merc_fd_covers(f->pat.data, f->pat.len, key);
+    f->steps = f->q.steps;
+  }
+  return false;
+}
+
+export fn merc_find_id(f: MercFind*) -> int64 { return f->id; }
+
+export fn merc_find_offset(f: MercFind*) -> int64 { return f->off; }
+
+// the place found, as an expression of its own.
+export fn merc_find_place(f: MercFind*) -> string {
+  if (!f->loose) { return merc_query_match(&f->q); }
+  if (!f->checked) { merc_fd_check(f); }
+  return merc_buf_view(&f->sub);
+}
+
+export fn merc_find_vars(f: MercFind*) -> int32 { return merc_query_vars(&f->q); }
+
+export fn merc_find_bind(f: MercFind*, number: int32, out: MercBuf*) -> bool {
+  if (!f->loose) { return merc_query_bind(&f->q, number, out); }
+  if (number < 0 || number >= merc_query_vars(&f->q)) { return false; }
+  if (!f->checked) { merc_fd_check(f); }
+  merc_unify_fresh(&f->uni);
+  return merc_unify_out(&f->uni, 0, number, out);
+}

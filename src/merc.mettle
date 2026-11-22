@@ -4,6 +4,7 @@
 import "merc/trie";
 import "merc/expr";
 import "merc/query";
+import "merc/find";
 import "merc/pure";
 import "merc/run";
 import "merc/shell";
