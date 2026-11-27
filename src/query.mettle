@@ -1,9 +1,5 @@
-// pattern search. walks the pattern and the trie together with a zipper.
-// a pattern symbol takes that one byte. a pattern variable takes every
-// stored expression at that place. a stored variable can stand for a whole
-// pattern subexpression. the unifier has the last word when either side had
-// a variable the walk could not settle.
-// one frame per byte of depth, so it stops on a match and carries on later.
+// pattern search, walking the pattern and the trie together. the unifier
+// settles any variable the walk could not
 
 import "std/mem";
 import "trie";
@@ -100,12 +96,14 @@ export fn merc_query_again(q: MercQuery*, pattern: string) -> bool {
   q->plen = n;
   q->nvars = merc_var_count(pattern);
   var i: int64 = 0;
+
   while (i < n) {
     var tag: uint8 = q->pat[i];
     i = i + 1;
     if (tag > 0xC0) { i = i + (int64)(tag & 63); }
     else if (tag >= 0x80 && tag < 0xC0) { q->has_ref = true; }
   }
+
   q->ended = false;
   return true;
 }
@@ -131,7 +129,8 @@ export fn merc_query_free(q: MercQuery*) {
   q->ended = true;
 }
 
-fn merc_q_enter(q: MercQuery*, depth: int64, pi: int32, praw: int32, need: int32, raw: int32, nv: int32, cur: int32, loose: int32) -> bool {
+fn merc_q_enter(q: MercQuery*, depth: int64, pi: int32, praw: int32,
+  need: int32, raw: int32, nv: int32, cur: int32, loose: int32) -> bool {
   var f: MercQFrame* = merc_q_frame(q, depth);
   if (f == 0) { return false; }
   f->pi = pi;
@@ -156,10 +155,14 @@ export fn merc_query_next(q: MercQuery*) -> bool {
   var z: MercZip* = &q->zip;
   if (!q->started) {
     q->started = true;
-    if (!merc_q_enter(q, 0, 0, 0, 0, 0, 0, -1, 0)) { q->ended = true; return false; }
+    if (!merc_q_enter(q, 0, 0, 0, 0, 0, 0, -1, 0)) {
+      q->ended = true;
+      return false;
+    }
   }
   q->unified = false;
   q->at_limit = false;
+
   while (true) {
     var depth: int64 = merc_zip_depth(z);
     var f: MercQFrame* = q->frames + depth;
@@ -199,7 +202,10 @@ export fn merc_query_next(q: MercQuery*) -> bool {
         }
         merc_zip_step(z, (uint8)b);
         q->steps = q->steps + 1;
-        if (!merc_q_enter(q, depth + 1, f->pi, 0, need, raw, f->nv, f->cur, loose)) { q->ended = true; return false; }
+        if (!merc_q_enter(q, depth + 1, f->pi, 0, need, raw, f->nv, f->cur, loose)) {
+          q->ended = true;
+          return false;
+        }
         down = true;
       }
     } else if ((int64)f->pi >= q->plen) {
@@ -232,7 +238,10 @@ export fn merc_query_next(q: MercQuery*) -> bool {
           var praw: int32 = 0;
           if (f->praw > 0) { praw = f->praw - 1; }
           else if (p > 0xC0) { praw = (int32)(p & 63); }
-          if (!merc_q_enter(q, depth + 1, f->pi + 1, praw, 0, 0, f->nv, -1, f->loose)) { q->ended = true; return false; }
+          if (!merc_q_enter(q, depth + 1, f->pi + 1, praw, 0, 0, f->nv, -1, f->loose)) {
+            q->ended = true;
+            return false;
+          }
           down = true;
         }
       } else if (f->stage == 1) {
@@ -248,7 +257,11 @@ export fn merc_query_next(q: MercQuery*) -> bool {
           var skip: int64 = merc_span(q->pat + f->pi, q->plen - (int64)f->pi);
           merc_zip_step(z, (uint8)v);
           q->steps = q->steps + 1;
-          if (!merc_q_enter(q, depth + 1, f->pi + (int32)skip, 0, 0, 0, f->nv + merc_q_vars_in(q, f->pi, skip), -1, 1)) { q->ended = true; return false; }
+          if (!merc_q_enter(q, depth + 1, f->pi + (int32)skip, 0, 0, 0,
+            f->nv + merc_q_vars_in(q, f->pi, skip), -1, 1)) {
+            q->ended = true;
+            return false;
+          }
           down = true;
         } else {
           f->stage = 2;
@@ -264,6 +277,7 @@ export fn merc_query_next(q: MercQuery*) -> bool {
       merc_zip_back(z);
     }
   }
+
   return false;
 }
 
@@ -280,10 +294,8 @@ fn merc_q_vars_in(q: MercQuery*, at: int32, n: int64) -> int32 {
   return vars;
 }
 
-// splitting a search so its parts can run on other cores.
-// limit makes the walk stop at a depth and report each place it reached.
-// pin makes a walk take given bytes from the root.
-// run once with a limit and keep the paths, then run once per path pinned to it.
+// to split a search over cores, run it once with a limit to get the paths,
+// then once per path pinned to it
 export fn merc_query_limit(q: MercQuery*, depth: int64) { q->limit = depth; }
 
 export fn merc_query_edge(q: MercQuery*) -> bool { return q->at_limit; }
@@ -298,8 +310,7 @@ export fn merc_query_pin(q: MercQuery*, path: string) -> bool {
   return true;
 }
 
-// lazy leaves the last word to the caller. a match that needs the unifier
-// comes back with exact false and is not checked.
+// lazy skips the unifier and returns such matches with exact false
 export fn merc_query_lazy(q: MercQuery*, on: bool) { q->lazy = on; }
 
 export fn merc_query_match(q: MercQuery*) -> string {
@@ -326,7 +337,8 @@ fn merc_q_unify(q: MercQuery*) -> bool {
 export fn merc_query_bind(q: MercQuery*, number: int32, out: MercBuf*) -> bool {
   if (q->ended || number < 0 || number >= q->nvars) { return false; }
   if (q->exact) {
-    return merc_buf_add(out, q->zip.path + q->from[number], (int64)(q->to[number] - q->from[number]));
+    return merc_buf_add(out, q->zip.path + q->from[number],
+      (int64)(q->to[number] - q->from[number]));
   }
   if (!merc_q_unify(q)) { return false; }
   merc_unify_fresh(&q->uni);
@@ -352,18 +364,26 @@ export fn merc_match_count(t: MercTrie*, pattern: string) -> int64 {
   return n;
 }
 
-// returns how many were new, or -1.
+// gives how many were new, or -1
 export fn merc_transform(t: MercTrie*, pattern: string, shape: string, value: uint64) -> int64 {
   var made: MercBuf;
   var cuts: MercBuf;
   var q: MercQuery = merc_query(t, pattern);
   var bad: bool = false;
+
   while (merc_query_next(&q)) {
     var at: int64 = made.len;
-    if (!merc_query_fill(&q, shape, &made)) { bad = true; break; }
+    if (!merc_query_fill(&q, shape, &made)) {
+      bad = true;
+      break;
+    }
     var size: int64 = made.len - at;
-    if (!merc_buf_add(&cuts, (uint8*)&size, 8)) { bad = true; break; }
+    if (!merc_buf_add(&cuts, (uint8*)&size, 8)) {
+      bad = true;
+      break;
+    }
   }
+
   merc_query_free(&q);
   var added: int64 = 0;
   if (!bad) {
@@ -375,7 +395,10 @@ export fn merc_transform(t: MercTrie*, pattern: string, shape: string, value: ui
       e.chars = made.data + at2;
       e.length = (uint64)sizes[k];
       var r: int32 = merc_put(t, e, value);
-      if (r == MERC_FAILED) { bad = true; break; }
+      if (r == MERC_FAILED) {
+        bad = true;
+        break;
+      }
       if (r == MERC_ADDED) { added = added + 1; }
       at2 = at2 + sizes[k];
     }

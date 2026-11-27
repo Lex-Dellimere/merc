@@ -1,9 +1,7 @@
-// the trie. keys are bytes, values are uint64.
-// one block of memory holds every node. a node is a run of 8 byte words:
-// header, value, label bytes, then the child table (4, 16, 48 or 256 wide).
-// nodes point at each other by word number. when a node outgrows its run
-// it moves and its parent is told.
-// every node but the root has a value or at least two children.
+// the trie. one block holds every node as a run of 8 byte words:
+//   header, value, label bytes, child table 4, 16, 48 or 256 wide
+// nodes point at each other by word number. every node but the root has a
+// value or at least two children
 
 import "std/mem";
 
@@ -188,7 +186,7 @@ fn merc_slot(h: MercHead*, b: uint8) -> uint32* {
   return ids + (uint32)b;
 }
 
-// tell the parent its child moved. parent 0 means the root.
+// parent 0 means the root
 fn merc_relink(t: MercTrie*, parent: uint32, via: uint8, at: uint32) {
   if (parent == 0) {
     t->root = at;
@@ -219,10 +217,12 @@ fn merc_next_child(h: MercHead*, from: int32) -> int32 {
     return -1;
   }
   var ids: uint32* = (uint32*)tab;
+
   while (b < 256) {
     if (ids[b] != 0) { return b; }
     b = b + 1;
   }
+
   return -1;
 }
 
@@ -264,7 +264,8 @@ fn merc_rekind(t: MercTrie*, at: uint32, kind: uint8) -> uint32 {
   return fresh;
 }
 
-fn merc_add_child(t: MercTrie*, at: uint32, b: uint8, child: uint32, parent: uint32, via: uint8) -> uint32 {
+fn merc_add_child(t: MercTrie*, at: uint32, b: uint8, child: uint32,
+  parent: uint32, via: uint8) -> uint32 {
   var node: uint32 = at;
   var h: MercHead* = merc_head(t, node);
   if ((uint32)h->count == merc_tab_room(h->kind)) {
@@ -349,7 +350,6 @@ fn merc_del_child(t: MercTrie*, at: uint32, b: uint8, parent: uint32, via: uint8
   return i;
 }
 
-// cut a node at pos. the head keeps the first part, the tail gets the rest.
 fn merc_split(t: MercTrie*, at: uint32, pos: uint32, parent: uint32, via: uint8) -> uint32 {
   var len: uint32 = merc_head(t, at)->len;
   var kind: uint8 = merc_head(t, at)->kind;
@@ -397,15 +397,19 @@ fn merc_merge(t: MercTrie*, at: uint32, parent: uint32, via: uint8) -> uint32 {
   hn->value = hc->value;
   hn->has = hc->has;
   hn->count = hc->count;
-  if (hc->kind != MERC_KIND_NONE) { memcpy(merc_tab(hn), merc_tab(hc), (int64)merc_tab_bytes(hc->kind)); }
+  if (hc->kind != MERC_KIND_NONE) {
+    memcpy(merc_tab(hn), merc_tab(hc), (int64)merc_tab_bytes(hc->kind));
+  }
   merc_drop(t, at);
   merc_drop(t, c);
   merc_relink(t, parent, via, fresh);
   return fresh;
 }
 
-// store a value pos bytes into a node, then rest. self gets where the node ended up.
-fn merc_attach(t: MercTrie*, at: uint32, pos: uint32, rest: uint8*, rlen: uint64, v: uint64, added: int32*, parent: uint32, via: uint8, self: uint32*) -> uint32 {
+// self gets where the node ended up
+fn merc_attach(t: MercTrie*, at: uint32, pos: uint32, rest: uint8*,
+  rlen: uint64, v: uint64, added: int32*, parent: uint32, via: uint8,
+  self: uint32*) -> uint32 {
   var node: uint32 = at;
   *self = at;
   if (pos < merc_head(t, node)->len) {
@@ -442,8 +446,9 @@ fn merc_attach(t: MercTrie*, at: uint32, pos: uint32, rest: uint8*, rlen: uint64
   return leaf;
 }
 
-// drop a value and tidy up. returns 0 stays, 1 took in its child, 2 gone.
-fn merc_detach(t: MercTrie*, at: uint32, parent: uint32, via: uint8, grand: uint32, gvia: uint8, self: uint32*, up: uint32*) -> int32 {
+// 0 stays, 1 took in its child, 2 gone
+fn merc_detach(t: MercTrie*, at: uint32, parent: uint32, via: uint8,
+  grand: uint32, gvia: uint8, self: uint32*, up: uint32*) -> int32 {
   var h: MercHead* = merc_head(t, at);
   h->has = 0;
   h->value = 0;
@@ -520,8 +525,7 @@ export fn merc_has(t: MercTrie*, key: string) -> bool {
   }
 }
 
-// look up n keys together, 16 in flight at a time.
-// faster once the trie is bigger than the cache.
+// 16 lookups in flight at once, faster once the trie outgrows the cache
 export fn merc_get_many(t: MercTrie*, keys: string*, n: int64, values: uint64*, found: uint8*) {
   if (t->root == 0) {
     for z: int64 in 0..n { found[z] = 0; }
@@ -532,6 +536,7 @@ export fn merc_get_many(t: MercTrie*, keys: string*, n: int64, values: uint64*, 
   var lane_i: uint64[16];
   var next: int64 = 0;
   var active: int32 = 0;
+
   for l in 0..16 {
     lane_key[l] = -1;
     if (next < n) {
@@ -542,6 +547,7 @@ export fn merc_get_many(t: MercTrie*, keys: string*, n: int64, values: uint64*, 
       active = active + 1;
     }
   }
+
   while (active > 0) {
     for l2 in 0..16 {
       var k: int64 = lane_key[l2];
@@ -554,7 +560,11 @@ export fn merc_get_many(t: MercTrie*, keys: string*, n: int64, values: uint64*, 
       var done: bool = false;
       var hit: uint8 = 0;
       if (len != 0) {
-        if (klen - i < len || merc_common(merc_lab(h), kp + i, len) != len) { done = true; } else { i = i + len; }
+        if (klen - i < len || merc_common(merc_lab(h), kp + i, len) != len) {
+          done = true;
+        } else {
+          i = i + len;
+        }
       }
       if (!done) {
         if (i == klen) {
@@ -591,6 +601,7 @@ export fn merc_get_many(t: MercTrie*, keys: string*, n: int64, values: uint64*, 
 }
 
 fn merc_put_raw(t: MercTrie*, kp: uint8*, klen: uint64, value: uint64) -> int32 {
+
   if (!merc_root(t)) { return MERC_FAILED; }
   var at: uint32 = t->root;
   var parent: uint32 = 0;
@@ -599,6 +610,7 @@ fn merc_put_raw(t: MercTrie*, kp: uint8*, klen: uint64, value: uint64) -> int32 
   var added: int32 = 0;
   var self: uint32 = 0;
   var holder: uint32 = 0;
+
   while (true) {
     var h: MercHead* = merc_head(t, at);
     var len: uint64 = (uint64)h->len;
@@ -607,7 +619,8 @@ fn merc_put_raw(t: MercTrie*, kp: uint8*, klen: uint64, value: uint64) -> int32 
     var same: uint64 = merc_common(merc_lab(h), kp + i, room);
     i = i + same;
     if (same < len || i == klen) {
-      holder = merc_attach(t, at, (uint32)same, kp + i, klen - i, value, &added, parent, via, &self);
+      holder = merc_attach(t, at, (uint32)same, kp + i, klen - i, value, &added,
+        parent, via, &self);
       break;
     }
     var c: uint32 = merc_child(h, kp[i]);
@@ -620,6 +633,7 @@ fn merc_put_raw(t: MercTrie*, kp: uint8*, klen: uint64, value: uint64) -> int32 
     i = i + 1;
     at = c;
   }
+
   if (holder == 0) { return MERC_FAILED; }
   return added;
 }
@@ -628,7 +642,8 @@ export fn merc_put(t: MercTrie*, key: string, value: uint64) -> int32 {
   var kp: uint8* = key.chars;
   var klen: uint64 = key.length;
   if (klen > 0x7fffffff) { return MERC_FAILED; }
-  var inside: bool = t->mem != 0 && (uint64)kp >= (uint64)t->mem && (uint64)kp < (uint64)t->mem + t->cap * (uint64)8;
+  var inside: bool = t->mem != 0 && (uint64)kp >= (uint64)t->mem &&
+    (uint64)kp < (uint64)t->mem + t->cap * (uint64)8;
   if (!inside) { return merc_put_raw(t, kp, klen, value); }
   var copy: uint8* = malloc((int64)klen + 1);
   if (copy == 0) { return MERC_FAILED; }
@@ -650,6 +665,7 @@ export fn merc_remove(t: MercTrie*, key: string) -> bool {
   var gvia: uint8 = 0;
   var self: uint32 = 0;
   var up: uint32 = 0;
+
   while (true) {
     var h: MercHead* = merc_head(t, at);
     var len: uint64 = (uint64)h->len;
@@ -672,6 +688,7 @@ export fn merc_remove(t: MercTrie*, key: string) -> bool {
     i = i + 1;
     at = c;
   }
+
   return false;
 }
 
@@ -684,8 +701,7 @@ export fn merc_clear(t: MercTrie*) {
   for i in 0..304 { t->free[i] = 0; }
 }
 
-// read only access for tools that draw the trie.
-// node numbers die on the next change, keep paths.
+// node numbers die on the next change, keep paths
 fn merc_node_ok(t: MercTrie*, ni: uint32) -> bool {
   return ni != 0 && (uint64)ni < t->top;
 }
@@ -732,11 +748,8 @@ export fn merc_node_fanout(t: MercTrie*, ni: uint32) -> int32 {
   return (int32)merc_tab_room(merc_head(t, ni)->kind);
 }
 
-// a zipper is a place in the trie that moves a byte at a time.
-// it keeps the bytes it took and the nodes it passed, so it can step back
-// and change the trie from where it stands.
-// push always moves, step only moves where something is stored.
-// while a zipper is in use change the trie only through it.
+// push always moves, step only where something is stored. while a zipper is
+// in use change the trie only through it
 struct MercZFrame {
   start: int64;
   node: uint32;
@@ -895,7 +908,7 @@ export fn merc_zip_children(z: MercZip*) -> int32 {
   return (int32)h->count;
 }
 
-// 256 bit mask of the bytes that can follow, low byte values first.
+// low byte values first
 export fn merc_zip_mask(z: MercZip*, mask: uint64*) {
   mask[0] = 0;
   mask[1] = 0;
@@ -917,7 +930,6 @@ export fn merc_zip_get(z: MercZip*, value: uint64*) -> bool {
   return true;
 }
 
-// store a value here. builds the path if the trie did not reach this place.
 export fn merc_zip_set(z: MercZip*, value: uint64) -> int32 {
   if (z->top == 0) { return MERC_FAILED; }
   var t: MercTrie* = z->trie;
@@ -931,7 +943,8 @@ export fn merc_zip_set(z: MercZip*, value: uint64) -> int32 {
   var pos: int64 = z->live - f->start;
   var added: int32 = 0;
   var self: uint32 = 0;
-  var holder: uint32 = merc_attach(t, f->node, (uint32)pos, z->path + z->live, (uint64)(z->depth - z->live), value, &added, parent, via, &self);
+  var holder: uint32 = merc_attach(t, f->node, (uint32)pos, z->path + z->live,
+    (uint64)(z->depth - z->live), value, &added, parent, via, &self);
   f->node = self;
   if (holder == 0) { return MERC_FAILED; }
   if (z->live < z->depth) {
@@ -944,7 +957,7 @@ export fn merc_zip_set(z: MercZip*, value: uint64) -> int32 {
   return added;
 }
 
-// remove the value here. the place may be gone after, ask merc_zip_exists.
+// the place may be gone after, ask merc_zip_exists
 export fn merc_zip_unset(z: MercZip*) -> bool {
   if (!merc_zip_get(z, (uint64*)0)) { return false; }
   var f: MercZFrame* = z->frames + (z->top - 1);
@@ -973,10 +986,11 @@ export fn merc_zip_unset(z: MercZip*) -> bool {
   return true;
 }
 
-// move to the next value in key order below the first floor bytes. false when done.
+// stays below the first floor bytes
 export fn merc_zip_next_value(z: MercZip*, floor: int64) -> bool {
   if (z->top == 0 || z->live != z->depth) { return false; }
   var t: MercTrie* = z->trie;
+
   while (true) {
     var f: MercZFrame* = z->frames + (z->top - 1);
     var h: MercHead* = merc_head(t, f->node);
@@ -1015,6 +1029,7 @@ export fn merc_zip_next_value(z: MercZip*, floor: int64) -> bool {
     var hc: MercHead* = merc_head(t, c);
     if (hc->len == 0 && hc->has != 0) { return true; }
   }
+
   return false;
 }
 
@@ -1035,7 +1050,9 @@ fn merc_copy_from(t: MercTrie*, s: MercTrie*, sn: uint32, skip: uint32) -> uint3
     h->has = hs->has;
     h->value = hs->value;
     h->count = hs->count;
-    if (hs->kind != MERC_KIND_NONE) { memcpy(merc_tab(h), merc_tab(hs), (int64)merc_tab_bytes(hs->kind)); }
+    if (hs->kind != MERC_KIND_NONE) {
+      memcpy(merc_tab(h), merc_tab(hs), (int64)merc_tab_bytes(hs->kind));
+    }
   }
   if (hs->has != 0) { t->count = t->count + 1; }
   var kind: uint8 = hs->kind;
@@ -1043,6 +1060,7 @@ fn merc_copy_from(t: MercTrie*, s: MercTrie*, sn: uint32, skip: uint32) -> uint3
   var slots: uint32 = (uint32)hs->count;
   if (kind == MERC_KIND_256) { slots = 256; }
   var src: uint32* = merc_ids(merc_tab(hs), kind);
+
   for k: uint32 in 0..slots {
     var c: uint32 = src[k];
     if (c == 0) { continue; }
@@ -1051,15 +1069,18 @@ fn merc_copy_from(t: MercTrie*, s: MercTrie*, sn: uint32, skip: uint32) -> uint3
     var dst: uint32* = merc_ids(merc_tab(merc_head(t, node)), kind);
     dst[k] = cc;
   }
+
   return node;
 }
 
-fn merc_merge_at(t: MercTrie*, at0: uint32, pos0: uint32, parent: uint32, via: uint8, s: MercTrie*, sn: uint32, skip: uint32) -> uint32 {
+fn merc_merge_at(t: MercTrie*, at0: uint32, pos0: uint32, parent: uint32,
+  via: uint8, s: MercTrie*, sn: uint32, skip: uint32) -> uint32 {
   var at: uint32 = at0;
   var pos: uint32 = pos0;
   var hs: MercHead* = merc_head(s, sn);
   var slab: uint8* = merc_lab(hs);
   var i: uint32 = skip;
+
   while (i < hs->len) {
     var h: MercHead* = merc_head(t, at);
     if (pos < h->len) {
@@ -1083,6 +1104,7 @@ fn merc_merge_at(t: MercTrie*, at0: uint32, pos0: uint32, parent: uint32, via: u
     if (merc_merge_at(t, c, 0, at, slab[i], s, sn, i + 1) == 0) { return 0; }
     return at;
   }
+
   if (hs->has != 0) {
     if (pos < merc_head(t, at)->len) {
       at = merc_split(t, at, pos, parent, via);
@@ -1094,6 +1116,7 @@ fn merc_merge_at(t: MercTrie*, at0: uint32, pos0: uint32, parent: uint32, via: u
     hv->value = hs->value;
   }
   var b: int32 = merc_next_child(hs, 0);
+
   while (b >= 0) {
     var cs: uint32 = merc_child(hs, (uint8)b);
     var h2: MercHead* = merc_head(t, at);
@@ -1122,19 +1145,18 @@ fn merc_merge_at(t: MercTrie*, at0: uint32, pos0: uint32, parent: uint32, via: u
     }
     b = merc_next_child(hs, b + 1);
   }
+
   return at;
 }
 
-// puts every key of s into t, the value from s winning where both have one.
-// the same as a put of each key of s, in far fewer steps: what t lacks is
-// copied a whole branch at a time. false when memory ran out.
+// s wins where both have a value. what t lacks is copied a branch at a time
 export fn merc_merge_in(t: MercTrie*, s: MercTrie*) -> bool {
   if (s->root == 0) { return true; }
   if (!merc_root(t)) { return false; }
   return merc_merge_at(t, t->root, 0, 0, 0, s, s->root, 0) != 0;
 }
 
-// walk everything and check the rules. 0 is good, any other number names the broken rule.
+// 0 is good, any other number names the broken rule
 export fn merc_check(t: MercTrie*) -> int32 {
   if (t->root == 0) {
     if (t->count != 0 || t->live_nodes != 0) { return 1; }
@@ -1149,28 +1171,59 @@ export fn merc_check(t: MercTrie*) -> int32 {
   var values: int64 = 0;
   var words: uint64 = 0;
   var bad: int32 = 0;
+
   while (top > 0 && bad == 0) {
     top = top - 1;
     var at: uint32 = stack[top];
-    if (at == 0 || (uint64)at >= t->top) { bad = 3; break; }
+    if (at == 0 || (uint64)at >= t->top) {
+      bad = 3;
+      break;
+    }
     var h: MercHead* = merc_head(t, at);
     seen = seen + 1;
-    if (seen > t->live_nodes) { bad = 4; break; }
-    if (h->kind > MERC_KIND_256) { bad = 5; break; }
-    if ((uint64)at + merc_words(h->len, h->kind) > t->top) { bad = 5; break; }
+    if (seen > t->live_nodes) {
+      bad = 4;
+      break;
+    }
+    if (h->kind > MERC_KIND_256) {
+      bad = 5;
+      break;
+    }
+    if ((uint64)at + merc_words(h->len, h->kind) > t->top) {
+      bad = 5;
+      break;
+    }
     words = words + merc_words(h->len, h->kind);
     if (h->has != 0) { values = values + 1; }
-    if (at != t->root && h->has == 0 && h->count < 2) { bad = 6; break; }
-    if ((h->kind == MERC_KIND_NONE) != (h->count == 0)) { bad = 7; break; }
-    if ((uint32)h->count > merc_tab_room(h->kind)) { bad = 7; break; }
+    if (at != t->root && h->has == 0 && h->count < 2) {
+      bad = 6;
+      break;
+    }
+    if ((h->kind == MERC_KIND_NONE) != (h->count == 0)) {
+      bad = 7;
+      break;
+    }
+    if ((uint32)h->count > merc_tab_room(h->kind)) {
+      bad = 7;
+      break;
+    }
     var kids: int32 = 0;
     var prev: int32 = -1;
     var b: int32 = merc_next_child(h, 0);
     while (b >= 0) {
-      if (b <= prev) { bad = 8; break; }
+      if (b <= prev) {
+        bad = 8;
+        break;
+      }
       var c: uint32 = merc_child(h, (uint8)b);
-      if (c == 0 || c == t->root) { bad = 9; break; }
-      if (top >= cap) { bad = 10; break; }
+      if (c == 0 || c == t->root) {
+        bad = 9;
+        break;
+      }
+      if (top >= cap) {
+        bad = 10;
+        break;
+      }
       stack[top] = c;
       top = top + 1;
       kids = kids + 1;
@@ -1179,6 +1232,7 @@ export fn merc_check(t: MercTrie*) -> int32 {
     }
     if (bad == 0 && kids != (int32)h->count) { bad = 11; }
   }
+
   free(stack);
   if (bad != 0) { return bad; }
   if (seen != t->live_nodes) { return 12; }

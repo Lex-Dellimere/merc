@@ -1,11 +1,9 @@
-// expressions as bytes in prefix order. a parent says how many children
-// follow, then the children come. nothing closes it.
+// expressions as bytes in prefix order, same as MORK
 //   00 + n   parent with n children, up to 63
 //   c0 + n   symbol of n bytes, 1 to 63, then the bytes
 //   c0       a variable the first time it shows up
 //   80 + i   variable i again
 // (edge a (to b)) is 03 c4 edge c1 a 02 c2 to c1 b
-// same bytes as MORK.
 
 import "std/mem";
 
@@ -72,7 +70,7 @@ export fn merc_buf_view(b: MercBuf*) -> string {
 @inline fn merc_is_newvar(tag: uint8) -> bool { return tag == 0xC0; }
 @inline fn merc_is_ref(tag: uint8) -> bool { return tag >= 0x80 && tag < 0xC0; }
 
-// length of the expression at p, or -1 if it is cut short.
+// gives -1 when the expression is cut short
 export fn merc_span(p: uint8*, n: int64) -> int64 {
   var i: int64 = 0;
   var need: int64 = 1;
@@ -111,8 +109,7 @@ export fn merc_var_count(e: string) -> int32 {
   return vars;
 }
 
-// variable names in the order they were first seen. parse a second text
-// with the same names and the same name gets the same number.
+// names in first seen order, so a second parse with them keeps the numbers
 export struct MercNames {
   text: uint8[1024];
   at: int32[64];
@@ -140,7 +137,10 @@ fn merc_name_find(names: MercNames*, p: uint8*, n: int64) -> int32 {
     var q: uint8* = &names->text[names->at[i]];
     var same: bool = true;
     for j: int64 in 0..n {
-      if (q[j] != p[j]) { same = false; break; }
+      if (q[j] != p[j]) {
+        same = false;
+        break;
+      }
     }
     if (same) { return i; }
   }
@@ -183,8 +183,7 @@ export fn merc_parse_error(code: int64) -> string {
   return "not an expression";
 }
 
-// read one expression from text into out.
-// returns the text bytes used or a MERC_ERR number.
+// gives the text bytes used or a MERC_ERR number
 export fn merc_parse(text: string, out: MercBuf*, names: MercNames*) -> int64 {
   var p: uint8* = text.chars;
   var n: int64 = (int64)text.length;
@@ -196,6 +195,7 @@ export fn merc_parse(text: string, out: MercBuf*, names: MercNames*) -> int64 {
   var done: bool = false;
   var err: int64 = 0;
   var known: int32 = names->count;
+
   while (!done && err == 0) {
     while (i < n && (merc_is_space(p[i]) || p[i] == 59)) {
       if (p[i] == 59) {
@@ -205,26 +205,42 @@ export fn merc_parse(text: string, out: MercBuf*, names: MercNames*) -> int64 {
       }
     }
     if (i >= n) {
-      if (depth > 0) { err = MERC_ERR_UNCLOSED; } else { err = MERC_ERR_EMPTY; }
+      if (depth > 0) {
+        err = MERC_ERR_UNCLOSED;
+      } else {
+        err = MERC_ERR_EMPTY;
+      }
       break;
     }
     var c: uint8 = p[i];
     var item: bool = false;
     if (c == 40) {
-      if (depth >= 256) { err = MERC_ERR_DEPTH; break; }
+      if (depth >= 256) {
+        err = MERC_ERR_DEPTH;
+        break;
+      }
       if (depth > 0) {
         open_n[depth - 1] = open_n[depth - 1] + 1;
-        if (open_n[depth - 1] > 63) { err = MERC_ERR_ARITY; break; }
+        if (open_n[depth - 1] > 63) {
+          err = MERC_ERR_ARITY;
+          break;
+        }
       }
       open_at[depth] = out->len;
       open_n[depth] = 0;
       depth = depth + 1;
-      if (!merc_buf_push(out, 0)) { err = MERC_ERR_MEMORY; break; }
+      if (!merc_buf_push(out, 0)) {
+        err = MERC_ERR_MEMORY;
+        break;
+      }
       i = i + 1;
       continue;
     }
     if (c == 41) {
-      if (depth == 0) { err = MERC_ERR_STRAY_CLOSE; break; }
+      if (depth == 0) {
+        err = MERC_ERR_STRAY_CLOSE;
+        break;
+      }
       depth = depth - 1;
       out->data[open_at[depth]] = (uint8)open_n[depth];
       i = i + 1;
@@ -233,7 +249,10 @@ export fn merc_parse(text: string, out: MercBuf*, names: MercNames*) -> int64 {
     }
     if (depth > 0) {
       open_n[depth - 1] = open_n[depth - 1] + 1;
-      if (open_n[depth - 1] > 63) { err = MERC_ERR_ARITY; break; }
+      if (open_n[depth - 1] > 63) {
+        err = MERC_ERR_ARITY;
+        break;
+      }
     }
     if (c == 36) {
       var from: int64 = i + 1;
@@ -242,10 +261,19 @@ export fn merc_parse(text: string, out: MercBuf*, names: MercNames*) -> int64 {
       var id: int32 = merc_name_find(names, p + from, i - from);
       if (id < 0) {
         id = merc_name_add(names, p + from, i - from);
-        if (id < 0) { err = MERC_ERR_VARS; break; }
-        if (!merc_buf_push(out, 0xC0)) { err = MERC_ERR_MEMORY; break; }
+        if (id < 0) {
+          err = MERC_ERR_VARS;
+          break;
+        }
+        if (!merc_buf_push(out, 0xC0)) {
+          err = MERC_ERR_MEMORY;
+          break;
+        }
       } else {
-        if (!merc_buf_push(out, (uint8)(0x80 + id))) { err = MERC_ERR_MEMORY; break; }
+        if (!merc_buf_push(out, (uint8)(0x80 + id))) {
+          err = MERC_ERR_MEMORY;
+          break;
+        }
       }
       item = true;
     } else if (c == 34) {
@@ -255,22 +283,41 @@ export fn merc_parse(text: string, out: MercBuf*, names: MercNames*) -> int64 {
       while (i < n) {
         var q: uint8 = p[i];
         i = i + 1;
-        if (q == 34) { closed = true; break; }
+        if (q == 34) {
+          closed = true;
+          break;
+        }
         if (q == 92 && i < n) { i = i + 1; }
       }
-      if (!closed) { err = MERC_ERR_UNCLOSED; break; }
-      if (i - q0 > 63) { err = MERC_ERR_SYMBOL; break; }
-      if (!merc_buf_push(out, (uint8)(0xC0 + (i - q0))) || !merc_buf_add(out, p + q0, i - q0)) { err = MERC_ERR_MEMORY; break; }
+      if (!closed) {
+        err = MERC_ERR_UNCLOSED;
+        break;
+      }
+      if (i - q0 > 63) {
+        err = MERC_ERR_SYMBOL;
+        break;
+      }
+      if (!merc_buf_push(out, (uint8)(0xC0 + (i - q0))) || !merc_buf_add(out, p + q0, i - q0)) {
+        err = MERC_ERR_MEMORY;
+        break;
+      }
       item = true;
     } else {
       var s0: int64 = i;
       while (i < n && !merc_is_space(p[i]) && p[i] != 40 && p[i] != 41) { i = i + 1; }
-      if (i - s0 > 63) { err = MERC_ERR_SYMBOL; break; }
-      if (!merc_buf_push(out, (uint8)(0xC0 + (i - s0))) || !merc_buf_add(out, p + s0, i - s0)) { err = MERC_ERR_MEMORY; break; }
+      if (i - s0 > 63) {
+        err = MERC_ERR_SYMBOL;
+        break;
+      }
+      if (!merc_buf_push(out, (uint8)(0xC0 + (i - s0))) || !merc_buf_add(out, p + s0, i - s0)) {
+        err = MERC_ERR_MEMORY;
+        break;
+      }
       item = true;
     }
     if (item && depth == 0) { done = true; }
   }
+
   if (err != 0) {
     out->len = start;
     names->count = known;
@@ -302,6 +349,7 @@ export fn merc_format(e: string, out: MercBuf*, names: MercNames*) -> bool {
   var depth: int32 = 0;
   var i: int64 = 0;
   var vars: int32 = 0;
+
   while (i < n) {
     var tag: uint8 = p[i];
     i = i + 1;
@@ -334,15 +382,14 @@ export fn merc_format(e: string, out: MercBuf*, names: MercNames*) -> bool {
       depth = depth - 1;
     }
   }
+
   return true;
 }
 
 export const MERC_UNIFY_CAP: int32 = 2048;
 const MERC_UCAP: int32 = 2048;
 
-// up to MERC_UCAP bytes a side the unifier keeps, for every place, where its
-// subexpression ends, which variable sits there and how many variables come
-// before it. a longer term goes the slow way.
+// a table per place for terms up to MERC_UCAP bytes, longer ones go the slow way
 export struct MercUnify {
   term: uint8*[2];
   size: int64[2];
@@ -373,6 +420,7 @@ fn merc_unify_table(u: MercUnify*, side: int32) -> bool {
   var sp: int32 = 0;
   var vars: int32 = 0;
   var cnt: int32 = 0;
+
   while (true) {
     if (i >= n) { return false; }
     var tag: uint8 = p[i];
@@ -411,6 +459,7 @@ fn merc_unify_table(u: MercUnify*, side: int32) -> bool {
     }
     if (sp == 0) { break; }
   }
+
   if (i != n) { return false; }
   u->vpre[vb + n] = (int16)cnt;
   if (vars > 64) { vars = 64; }
@@ -440,7 +489,6 @@ fn merc_unify_scan(u: MercUnify*, side: int32) {
   return (int32)merc_span(u->term[side] + at, u->size[side] - (int64)at);
 }
 
-// true when the subexpression at has no variable in it.
 @inline fn merc_unify_ground(u: MercUnify*, side: int32, at: int32) -> bool {
   if (!u->fast[side]) { return false; }
   var vb: int32 = side * (MERC_UCAP + 1);
@@ -481,7 +529,7 @@ fn merc_unify_occurs(u: MercUnify*, v: int32, side: int32, at: int32) -> bool {
   var w: int32 = merc_unify_var(u, s, a);
   if (w >= 0) { return w == v; }
   if (merc_unify_ground(u, s, a)) { return false; }
-  // nothing on this side is bound, so nothing below leads back to v.
+  // nothing on this side is bound, so nothing below leads back to v
   if (s != (v >> 6) && u->bound_n[s] == 0) { return false; }
   var p: uint8* = u->term[s];
   var tag: uint8 = p[a];
@@ -542,11 +590,13 @@ fn merc_unify_at(u: MercUnify*, side1: int32, at1: int32, side2: int32, at2: int
   }
   var c1: int32 = a1 + 1;
   var c2: int32 = a2 + 1;
+
   for k2 in 0..(int32)tag {
     if (!merc_unify_at(u, s1, c1, s2, c2)) { return false; }
     c1 = c1 + merc_unify_span(u, s1, c1);
     c2 = c2 + merc_unify_span(u, s2, c2);
   }
+
   return true;
 }
 
@@ -580,10 +630,8 @@ export fn merc_unify(u: MercUnify*, a: string, b: string) -> bool {
   return merc_unify_at(u, 0, 0, 1, 0);
 }
 
-// unifying a list one item at a time. both terms are lists of whole items
-// that only ever grow at the end, the tables and bindings of the items
-// before stay, and undo takes them back to a mark. each side has to fit in
-// MERC_UNIFY_CAP bytes.
+// unifies lists that grow one item at a time at the end, undo goes back to a
+// mark. each side must fit in MERC_UNIFY_CAP bytes
 export fn merc_unify_reset(u: MercUnify*, a_from: int64, b_from: int64) {
   for i in 0..128 {
     u->bound[i] = 0;
@@ -623,6 +671,7 @@ fn merc_unify_table_from(u: MercUnify*, side: int32, from: int32) -> bool {
   var sp: int32 = 0;
   var vars: int32 = u->var_count[side];
   var cnt: int32 = (int32)u->vpre[vb + from];
+
   while (i < n) {
     var tag: uint8 = p[i];
     var at: int32 = i;
@@ -658,21 +707,23 @@ fn merc_unify_table_from(u: MercUnify*, side: int32, from: int32) -> bool {
       sp = sp - 1;
     }
   }
+
   if (sp != 0 || i != n) { return false; }
   u->vpre[vb + n] = (int16)cnt;
   u->var_count[side] = vars;
   return true;
 }
 
-// adds the item at a_from in a and the one at b_from in b, which run to the
-// ends of a and b, and unifies them with what is there.
-export fn merc_unify_item(u: MercUnify*, a: string, a_from: int64, b: string, b_from: int64) -> bool {
+export fn merc_unify_item(u: MercUnify*, a: string, a_from: int64, b: string,
+  b_from: int64) -> bool {
   if ((int64)a.length > (int64)MERC_UCAP || (int64)b.length > (int64)MERC_UCAP) { return false; }
   u->term[0] = a.chars;
   u->size[0] = (int64)a.length;
   u->term[1] = b.chars;
   u->size[1] = (int64)b.length;
-  if (!merc_unify_table_from(u, 0, (int32)a_from) || !merc_unify_table_from(u, 1, (int32)b_from)) { return false; }
+  if (!merc_unify_table_from(u, 0, (int32)a_from) || !merc_unify_table_from(u, 1, (int32)b_from)) {
+    return false;
+  }
   return merc_unify_at(u, 0, (int32)a_from, 1, (int32)b_from);
 }
 
@@ -704,13 +755,14 @@ fn merc_unify_emit(u: MercUnify*, side: int32, at: int32, out: MercBuf*) {
   }
   if (tag >= 64) { return; }
   var child: int32 = a + 1;
+
   for k in 0..(int32)tag {
     merc_unify_emit(u, s, child, out);
     child = child + merc_unify_span(u, s, child);
   }
 }
 
-// call before writing a new expression out. free variables number from zero again.
+// free variables number from zero again after this
 export fn merc_unify_fresh(u: MercUnify*) {
   for i in 0..128 { u->out_id[i] = -1; }
   u->out_count = 0;
@@ -722,13 +774,13 @@ export fn merc_unify_out(u: MercUnify*, side: int32, number: int32, out: MercBuf
   return true;
 }
 
-// write shape with the variables of a filled in.
-// parse shape with the names a was parsed with.
+// parse shape with the names a was parsed with
 export fn merc_unify_fill(u: MercUnify*, shape: string, out: MercBuf*) -> bool {
   return merc_unify_fill_from(u, shape, u->var_count[0], out);
 }
 
 export fn merc_unify_fill_from(u: MercUnify*, shape: string, base: int32, out: MercBuf*) -> bool {
+
   var p: uint8* = shape.chars;
   var n: int64 = (int64)shape.length;
   if (n == 0 || merc_span(p, n) != n) { return false; }
@@ -736,6 +788,7 @@ export fn merc_unify_fill_from(u: MercUnify*, shape: string, base: int32, out: M
   for k in 0..64 { extra[k] = -1; }
   var next: int32 = base;
   var i: int64 = 0;
+
   while (i < n) {
     var tag: uint8 = p[i];
     i = i + 1;
@@ -747,7 +800,11 @@ export fn merc_unify_fill_from(u: MercUnify*, shape: string, base: int32, out: M
       merc_buf_push(out, tag);
     } else {
       var id: int32 = next;
-      if (tag == 0xC0) { next = next + 1; } else { id = (int32)(tag & 63); }
+      if (tag == 0xC0) {
+        next = next + 1;
+      } else {
+        id = (int32)(tag & 63);
+      }
       if (id < u->var_count[0]) {
         merc_unify_emit(u, 0, u->var_at[id], out);
       } else if (id < 64) {
@@ -761,5 +818,6 @@ export fn merc_unify_fill_from(u: MercUnify*, shape: string, base: int32, out: M
       }
     }
   }
+
   return true;
 }

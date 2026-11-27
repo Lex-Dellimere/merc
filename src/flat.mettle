@@ -1,6 +1,5 @@
 // a flat copy of the trie, one row of 32 bit tokens per expression, for
-// searches with a variable before the fixed parts. a scan says which rows can
-// match and they are checked here, so the answer is the trie's own.
+// searches with a variable before the fixed parts
 
 import "std/mem";
 import "std/time";
@@ -50,10 +49,12 @@ export struct MercFlat {
   has_q: bool;
 }
 
-// true when the row can match. a row cut short at k tokens passes.
-export fn merc_flat_row_ok(rows: int32*, r: int32, stride: int32, k: int32, pat: int32*, plen: int32) -> bool {
+// a row cut short at k tokens passes
+export fn merc_flat_row_ok(rows: int32*, r: int32, stride: int32, k: int32,
+  pat: int32*, plen: int32) -> bool {
   var ri: int32 = 0;
   var pi: int32 = 0;
+
   while (pi < plen) {
     if (ri >= k) { return true; }
     var p: int32 = pat[pi];
@@ -85,6 +86,7 @@ export fn merc_flat_row_ok(rows: int32*, r: int32, stride: int32, k: int32, pat:
       ri = ri + 1;
     }
   }
+
   return true;
 }
 
@@ -135,13 +137,13 @@ fn flat_intern(f: MercFlat*, p: uint8*, len: int64) -> int32 {
   return f->syms + 127;
 }
 
-// up to k tokens of e into out, the rest padded. f->sure says the tokens are
-// all of e with no variable that needs the unifier.
+// f->sure says the tokens hold all of e and nothing needs the unifier
 fn flat_tokens(f: MercFlat*, e: uint8*, n: int64, out: int32*, k: int32) -> int32 {
   var i: int64 = 0;
   var j: int32 = 0;
   f->sure = true;
   f->has_var = false;
+
   while (i < n && j < k) {
     var tag: uint8 = e[i];
     if (tag < 64) {
@@ -161,12 +163,15 @@ fn flat_tokens(f: MercFlat*, e: uint8*, n: int64, out: int32*, k: int32) -> int3
     }
     j = j + 1;
   }
+
   if (i < n) { f->sure = false; }
   var used: int32 = j;
+
   while (j < k) {
     out[j] = MERC_FLAT_PAD;
     j = j + 1;
   }
+
   return used;
 }
 
@@ -175,7 +180,11 @@ fn flat_count_tokens(e: uint8*, n: int64) -> int64 {
   var c: int64 = 0;
   while (i < n) {
     var tag: uint8 = e[i];
-    if (tag > 0xC0) { i = i + 1 + (int64)(tag - 0xC0); } else { i = i + 1; }
+    if (tag > 0xC0) {
+      i = i + 1 + (int64)(tag - 0xC0);
+    } else {
+      i = i + 1;
+    }
     c = c + 1;
   }
   return c;
@@ -212,7 +221,7 @@ export fn merc_flat_row(f: MercFlat*, i: int64) -> string {
   return s;
 }
 
-// copies t into f. k is the tokens a row holds, 0 to pick it from the data.
+// k is the tokens a row holds, 0 to pick it from the data
 export fn merc_flat_build(f: MercFlat*, t: MercTrie*, serial: int64, k: int32) -> bool {
   var gen: int64 = f->gen;
   merc_flat_free(f);
@@ -226,6 +235,7 @@ export fn merc_flat_build(f: MercFlat*, t: MercTrie*, serial: int64, k: int32) -
   var at: int64 = 0;
   var spread: int64[66];
   for c in 0..66 { spread[c] = 0; }
+
   while (more) {
     var p: string = merc_zip_path(&z);
     merc_buf_add(&f->off, (uint8*)&at, 8);
@@ -236,6 +246,7 @@ export fn merc_flat_build(f: MercFlat*, t: MercTrie*, serial: int64, k: int32) -
     spread[c2] = spread[c2] + 1;
     more = merc_zip_next_value(&z, 0);
   }
+
   merc_zip_free(&z);
   merc_buf_add(&f->off, (uint8*)&at, 8);
   f->n = f->off.len / 8 - 1;
@@ -246,7 +257,11 @@ export fn merc_flat_build(f: MercFlat*, t: MercTrie*, serial: int64, k: int32) -
     for c3: int64 in 0..65 {
       seen = seen + spread[c3];
       if (seen * 20 >= f->n * 19) {
-        if (c3 <= 16) { kk = 16; } else if (c3 <= 32) { kk = 32; }
+        if (c3 <= 16) {
+          kk = 16;
+        } else if (c3 <= 32) {
+          kk = 32;
+        }
         break;
       }
     }
@@ -265,6 +280,7 @@ export fn merc_flat_build(f: MercFlat*, t: MercTrie*, serial: int64, k: int32) -
   var one: int32* = (int32*)malloc(kl * 4);
   var whole: MercBuf;
   var off: int64* = (int64*)f->off.data;
+
   for r: int64 in 0..(f->blocks * 64) {
     var have: int64 = f->full.len / 4;
     merc_buf_add(&f->full_off, (uint8*)&have, 8);
@@ -291,6 +307,7 @@ export fn merc_flat_build(f: MercFlat*, t: MercTrie*, serial: int64, k: int32) -
     var base: int32* = f->rows + (r >> 6) * kl * 64;
     for j2: int64 in 0..kl { base[j2 * 64 + (r & 63)] = one[j2]; }
   }
+
   var end: int64 = f->full.len / 4;
   merc_buf_add(&f->full_off, (uint8*)&end, 8);
   merc_buf_free(&whole);
@@ -333,9 +350,8 @@ fn flat_cmp(f: MercFlat*, i: int64, p: uint8*, n: int64) -> int32 {
   return 0;
 }
 
-// sets the pattern the next scan looks for, and the rows it can be in:
-// rows in key order that start with its fixed bytes, all of them when a
-// stored variable could stand in for those bytes.
+// the rows are those starting with its fixed bytes, or all of them when a
+// stored variable could stand in for those bytes
 export fn merc_flat_pattern(f: MercFlat*, pattern: string) {
   f->plen = flat_tokens(f, pattern.chars, (int64)pattern.length, &f->pat[0], 64);
   f->pat_sure = f->sure;
@@ -345,16 +361,28 @@ export fn merc_flat_pattern(f: MercFlat*, pattern: string) {
   if (f->any_var || fixed == 0) { return; }
   var a: int64 = 0;
   var b: int64 = f->n;
+
   while (a < b) {
     var mid: int64 = (a + b) / 2;
-    if (flat_cmp(f, mid, pattern.chars, fixed) < 0) { a = mid + 1; } else { b = mid; }
+    if (flat_cmp(f, mid, pattern.chars, fixed) < 0) {
+      a = mid + 1;
+    } else {
+      b = mid;
+    }
   }
+
   f->lo = a;
   b = f->n;
+
   while (a < b) {
     var mid2: int64 = (a + b) / 2;
-    if (flat_cmp(f, mid2, pattern.chars, fixed) <= 0) { a = mid2 + 1; } else { b = mid2; }
+    if (flat_cmp(f, mid2, pattern.chars, fixed) <= 0) {
+      a = mid2 + 1;
+    } else {
+      b = mid2;
+    }
   }
+
   f->hi = a;
 }
 
@@ -364,14 +392,15 @@ export fn merc_flat_scan_cpu(f: MercFlat*, first: int64, count: int64, masks: ui
     var rows: int32* = f->rows + (first + b) * kl * 64;
     var m: uint64 = 0;
     for r: int32 in 0..64 {
-      if (merc_flat_row_ok(rows, r, 64, f->k, &f->pat[0], f->plen)) { m = m | ((uint64)1 << (uint64)r); }
+      if (merc_flat_row_ok(rows, r, 64, f->k, &f->pat[0], f->plen)) {
+        m = m | ((uint64)1 << (uint64)r);
+      }
     }
     masks[b] = m;
   }
 }
 
-// does row i really match. the tokens settle most rows, the rest are asked
-// of the trie pinned to that one expression.
+// rows the tokens cannot settle are asked of the trie pinned to that row
 export fn merc_flat_confirm(f: MercFlat*, i: int64, pattern: string) -> bool {
   if (i < f->lo || i >= f->hi) { return false; }
   if (f->pat_sure) {
@@ -387,7 +416,8 @@ export fn merc_flat_confirm(f: MercFlat*, i: int64, pattern: string) -> bool {
   return merc_query_next(&f->q);
 }
 
-export fn merc_flat_collect(f: MercFlat*, pattern: string, first: int64, count: int64, masks: uint64*, out: MercBuf*, keep: int64) -> int64 {
+export fn merc_flat_collect(f: MercFlat*, pattern: string, first: int64,
+  count: int64, masks: uint64*, out: MercBuf*, keep: int64) -> int64 {
   var found: int64 = 0;
   for b: int64 in 0..count {
     var m: uint64 = masks[b];
@@ -406,9 +436,8 @@ export fn merc_flat_collect(f: MercFlat*, pattern: string, first: int64, count: 
   return found;
 }
 
-// with stored variables the walk is not in key order: where the pattern has
-// a symbol, the walk takes that symbol before a stored variable. this says
-// which of two matching rows the walk gives first.
+// the walk takes a pattern symbol before a stored variable, so it is not in
+// key order. this gives which of two rows the walk reaches first
 fn flat_rank(x: uint8, want: uint8) -> int32 {
   if (x == want) { return 0; }
   return 1;
@@ -424,6 +453,7 @@ fn flat_walk_cmp(p: string, a: string, b: string) -> int32 {
   var ki: int64 = 0;
   var pi: int64 = 0;
   var pn: int64 = (int64)p.length;
+
   while (ki <= d && pi < pn) {
     var pt: uint8 = p.chars[pi];
     var kt: uint8 = a.chars[ki];
@@ -451,6 +481,7 @@ fn flat_walk_cmp(p: string, a: string, b: string) -> int32 {
     ki = ki + klen;
     pi = pi + klen;
   }
+
   return by_byte;
 }
 
@@ -462,6 +493,7 @@ fn flat_sort(f: MercFlat*, p: string, v: int64*, tmp: int64*, n: int64) {
   var i: int64 = 0;
   var j: int64 = h;
   var o: int64 = 0;
+
   while (i < h && j < n) {
     if (flat_walk_cmp(p, merc_flat_row(f, v[j]), merc_flat_row(f, v[i])) < 0) {
       tmp[o] = v[j];
@@ -472,14 +504,23 @@ fn flat_sort(f: MercFlat*, p: string, v: int64*, tmp: int64*, n: int64) {
     }
     o = o + 1;
   }
-  while (i < h) { tmp[o] = v[i]; i = i + 1; o = o + 1; }
-  while (j < n) { tmp[o] = v[j]; j = j + 1; o = o + 1; }
+
+  while (i < h) {
+    tmp[o] = v[i];
+    i = i + 1;
+    o = o + 1;
+  }
+
+  while (j < n) {
+    tmp[o] = v[j];
+    j = j + 1;
+    o = o + 1;
+  }
+
   memcpy((uint8*)v, (uint8*)tmp, n * 8);
 }
 
-// puts rows found by collect into the order the walk gives them. rows
-// without a variable keep their key order, so only the few with one are
-// sorted and then merged in.
+// puts rows into walk order. only rows with a variable need sorting
 export fn merc_flat_order(f: MercFlat*, pattern: string, rows: MercBuf*) {
   if (!f->any_var) { return; }
   var n: int64 = rows->len / 8;
@@ -488,6 +529,7 @@ export fn merc_flat_order(f: MercFlat*, pattern: string, rows: MercBuf*) {
   var odd: int64* = (int64*)malloc(n * 8 + 8);
   var np: int64 = 0;
   var no: int64 = 0;
+
   for i: int64 in 0..n {
     var r: int64 = v[i];
     if (((f->varrow[r >> 6] >> (uint64)(r & 63)) & (uint64)1) != (uint64)0) {
@@ -498,6 +540,7 @@ export fn merc_flat_order(f: MercFlat*, pattern: string, rows: MercBuf*) {
       np = np + 1;
     }
   }
+
   if (no > 0) {
     flat_sort(f, pattern, odd, v, no);
     var a: int64 = 0;
@@ -513,15 +556,22 @@ export fn merc_flat_order(f: MercFlat*, pattern: string, rows: MercBuf*) {
       }
       o = o + 1;
     }
-    while (a < np) { v[o] = plain[a]; a = a + 1; o = o + 1; }
-    while (b < no) { v[o] = odd[b]; b = b + 1; o = o + 1; }
+    while (a < np) {
+      v[o] = plain[a];
+      a = a + 1;
+      o = o + 1;
+    }
+    while (b < no) {
+      v[o] = odd[b];
+      b = b + 1;
+      o = o + 1;
+    }
   }
   free((uint8*)plain);
   free((uint8*)odd);
 }
 
-// the search the shell asks for. the scanner fills masks for blocks first
-// on and says how it ran: 0 it could not, 1 on cores, 2 on the gpu.
+// the scanner reports how it ran: 0 it could not, 1 on cores, 2 on the gpu
 var g_flat: MercFlat;
 var g_flat_scanner: fn(MercFlat*, int64, int64, uint64*) -> int32;
 var g_flat_has_scanner: bool = false;
@@ -554,7 +604,10 @@ fn flat_num(out: MercBuf*, v: int64) {
   var digits: uint8[24];
   var n: int32 = 0;
   var u: int64 = v;
-  if (u <= 0) { digits[0] = 48; n = 1; }
+  if (u <= 0) {
+    digits[0] = 48;
+    n = 1;
+  }
   while (u > 0) {
     digits[n] = (uint8)(48 + u % 10);
     n = n + 1;
@@ -594,9 +647,8 @@ export fn merc_flat_stats(out: MercBuf*) {
   merc_buf_text(out, "\n");
 }
 
-// is the trie walk for this pattern wide: does it branch into many paths
-// soon after its fixed start. it looks deeper each time, and each look
-// stops at MERC_FLAT_WIDE paths, so it costs little either way.
+// true when the walk branches into many paths soon after the fixed start.
+// each look stops at MERC_FLAT_WIDE paths, so it stays cheap
 fn flat_wide(t: MercTrie*, pattern: string) -> bool {
   var fixed: int64 = flat_fixed(pattern);
   var deeper: int64 = 8;
@@ -624,21 +676,32 @@ fn flat_span_of(f: MercFlat*, pattern: string) -> int64 {
   var b: int64 = f->n;
   while (a < b) {
     var mid: int64 = (a + b) / 2;
-    if (flat_cmp(f, mid, pattern.chars, fixed) < 0) { a = mid + 1; } else { b = mid; }
+    if (flat_cmp(f, mid, pattern.chars, fixed) < 0) {
+      a = mid + 1;
+    } else {
+      b = mid;
+    }
   }
   var lo: int64 = a;
   b = f->n;
   while (a < b) {
     var mid2: int64 = (a + b) / 2;
-    if (flat_cmp(f, mid2, pattern.chars, fixed) <= 0) { a = mid2 + 1; } else { b = mid2; }
+    if (flat_cmp(f, mid2, pattern.chars, fixed) <= 0) {
+      a = mid2 + 1;
+    } else {
+      b = mid2;
+    }
   }
   return a - lo;
 }
 
-// answers a search from the flat copy, or false to leave it to the trie.
-export fn merc_flat_search(t: MercTrie*, serial: int64, pattern: string, out: MercBuf*, keep: int64, found: int64*) -> bool {
+// false leaves the search to the trie
+export fn merc_flat_search(t: MercTrie*, serial: int64, pattern: string,
+  out: MercBuf*, keep: int64, found: int64*) -> bool {
   g_flat_way = 0;
-  if (!g_flat_has_scanner || g_flat_mode == MERC_FLAT_OFF || !merc_flat_has_var(pattern)) { return false; }
+  if (!g_flat_has_scanner || g_flat_mode == MERC_FLAT_OFF || !merc_flat_has_var(pattern)) {
+    return false;
+  }
   var f: MercFlat* = &g_flat;
   if (g_flat_mode == MERC_FLAT_AUTO) {
     if (merc_count(t) < MERC_FLAT_LEAST) { return false; }

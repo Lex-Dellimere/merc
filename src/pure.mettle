@@ -1,8 +1,5 @@
-// pure functions for the (pure ...) sink, with MORK's meanings.
-// a call is worked out from the inside out. a symbol stands for itself and
-// every expression must start with the name of a function. numbers are
-// symbols of their own size in big endian, i8 is one byte and f64 is eight.
-// anything wrong, a variable, a bad size or an unknown name, fails the call.
+// pure functions for the (pure ...) sink, with MORK's meanings. numbers are
+// big endian symbols of their own size, i8 is one byte and f64 is eight
 
 import "std/mem";
 import "expr";
@@ -12,7 +9,7 @@ extern fn strtof(s: cstring, end: rawptr) -> float32;
 extern fn pure_dlopen(path: cstring, flags: int32) -> rawptr = "dlopen";
 extern fn pure_dlsym(h: rawptr, name: cstring) -> rawptr = "dlsym";
 
-// ln, sin and the rest come from the C maths library in MORK, so merc asks the same one.
+// ln, sin and the rest come from the C maths library, as in MORK
 var g_libm: rawptr = 0;
 
 fn libm(name: cstring) -> rawptr {
@@ -178,7 +175,10 @@ struct Args {
 fn arg_next(a: Args*) -> int64 {
   var start: int64 = a->at;
   var k: int64 = merc_span(a->p + start, a->n - start);
-  if (k < 0) { a->bad = true; return start; }
+  if (k < 0) {
+    a->bad = true;
+    return start;
+  }
   a->at = start + k;
   return start;
 }
@@ -186,7 +186,10 @@ fn arg_next(a: Args*) -> int64 {
 fn arg_int(a: Args*, t: int32) -> int64 {
   var at: int64 = arg_next(a);
   var n: int64 = ty_size(t);
-  if (a->bad || a->p[at] != (uint8)(0xC0 + n)) { a->bad = true; return 0; }
+  if (a->bad || a->p[at] != (uint8)(0xC0 + n)) {
+    a->bad = true;
+    return 0;
+  }
   var v: uint64 = 0;
   for k: int64 in 0..n { v = (v << (uint64)8) | (uint64)a->p[at + 1 + k]; }
   return wrap(t, (int64)v);
@@ -202,12 +205,16 @@ fn arg_f(a: Args*, t: int32) -> float64 {
 
 fn arg_sym(a: Args*, len: int64*) -> uint8* {
   var at: int64 = arg_next(a);
-  if (a->bad || a->p[at] <= 0xC0) { a->bad = true; *len = 0; return a->p; }
+  if (a->bad || a->p[at] <= 0xC0) {
+    a->bad = true;
+    *len = 0;
+    return a->p;
+  }
   *len = (int64)(a->p[at] & 63);
   return a->p + at + 1;
 }
 
-// whole numbers as Rust parses them: a sign, then digits, and no overflow.
+// whole numbers as Rust parses them
 fn parse_int(t: int32, p: uint8*, n: int64, out: int64*) -> bool {
   var i: int64 = 0;
   var neg: bool = false;
@@ -220,6 +227,7 @@ fn parse_int(t: int32, p: uint8*, n: int64, out: int64*) -> bool {
   var lim: uint64 = (uint64)1 << (uint64)(bits - 1);
   if (bits == 64) { lim = (uint64)0x8000000000000000; }
   var v: uint64 = 0;
+
   while (i < n) {
     var c: uint8 = p[i];
     if (c < 48 || c > 57) { return false; }
@@ -229,8 +237,13 @@ fn parse_int(t: int32, p: uint8*, n: int64, out: int64*) -> bool {
     if (v > lim) { return false; }
     i = i + 1;
   }
+
   if (!neg && v == lim) { return false; }
-  if (neg) { *out = (int64)((uint64)0 - v); } else { *out = (int64)v; }
+  if (neg) {
+    *out = (int64)((uint64)0 - v);
+  } else {
+    *out = (int64)v;
+  }
   return true;
 }
 
@@ -247,25 +260,38 @@ fn word_is(p: uint8*, n: int64, w: string) -> bool {
   return true;
 }
 
-// what Rust accepts as a float: inf, infinity, nan, or digits with an
-// optional point and exponent, all after an optional sign.
+// what Rust accepts as a float
 fn float_text_ok(p: uint8*, n: int64) -> bool {
   var i: int64 = 0;
   if (n > 0 && (p[0] == 43 || p[0] == 45)) { i = 1; }
   var rest: int64 = n - i;
-  if (word_is(p + i, rest, "inf") || word_is(p + i, rest, "infinity") || word_is(p + i, rest, "nan")) { return true; }
+  if (word_is(p + i, rest, "inf") || word_is(p + i, rest, "infinity") ||
+    word_is(p + i, rest, "nan")) {
+    return true;
+  }
   var digits: int64 = 0;
-  while (i < n && p[i] >= 48 && p[i] <= 57) { i = i + 1; digits = digits + 1; }
+
+  while (i < n && p[i] >= 48 && p[i] <= 57) {
+    i = i + 1;
+    digits = digits + 1;
+  }
+
   if (i < n && p[i] == 46) {
     i = i + 1;
-    while (i < n && p[i] >= 48 && p[i] <= 57) { i = i + 1; digits = digits + 1; }
+    while (i < n && p[i] >= 48 && p[i] <= 57) {
+      i = i + 1;
+      digits = digits + 1;
+    }
   }
   if (digits == 0) { return false; }
   if (i < n && (p[i] == 101 || p[i] == 69)) {
     i = i + 1;
     if (i < n && (p[i] == 43 || p[i] == 45)) { i = i + 1; }
     var ed: int64 = 0;
-    while (i < n && p[i] >= 48 && p[i] <= 57) { i = i + 1; ed = ed + 1; }
+    while (i < n && p[i] >= 48 && p[i] <= 57) {
+      i = i + 1;
+      ed = ed + 1;
+    }
     if (ed == 0) { return false; }
   }
   return i == n;
@@ -279,8 +305,14 @@ fn parse_float(t: int32, p: uint8*, n: int64, out: float64*) -> bool {
     i = 1;
     if (p[0] == 45) { sign = (int64)0x8000000000000000; }
   }
-  if (word_is(p + i, n - i, "nan")) { *out = f64_from_bits(0x7FF8000000000000 | sign); return true; }
-  if (p[i] == 105 || p[i] == 73) { *out = f64_from_bits(0x7FF0000000000000 | sign); return true; }
+  if (word_is(p + i, n - i, "nan")) {
+    *out = f64_from_bits(0x7FF8000000000000 | sign);
+    return true;
+  }
+  if (p[i] == 105 || p[i] == 73) {
+    *out = f64_from_bits(0x7FF0000000000000 | sign);
+    return true;
+  }
   var z: uint8[80];
   for k: int64 in 0..n { z[k] = p[k]; }
   z[n] = 0;
@@ -297,7 +329,10 @@ fn put_dec(out: MercBuf*, v: int64) {
   var k: int32 = 0;
   var u: uint64 = (uint64)v;
   if (v < 0) { u = (uint64)0 - (uint64)v; }
-  if (u == (uint64)0) { d[0] = 48; k = 1; }
+  if (u == (uint64)0) {
+    d[0] = 48;
+    k = 1;
+  }
   while (u > (uint64)0) {
     d[k] = (uint8)(48 + (int32)(u % (uint64)10));
     u = u / (uint64)10;
@@ -310,7 +345,7 @@ fn put_dec(out: MercBuf*, v: int64) {
   }
 }
 
-// a big whole number in base 1e9, lowest part first.
+// base 1e9, lowest part first
 struct Big {
   w: uint32[120];
   n: int32;
@@ -334,28 +369,42 @@ fn exact_digits(x: float64, d: uint8*, nd: int32*, e10: int32*) {
   var bits: uint64 = (uint64)f64_bits(x);
   var be: int32 = (int32)((bits >> (uint64)52) & (uint64)0x7FF);
   var m: uint64 = bits & (uint64)0x000FFFFFFFFFFFFF;
-  if (be == 0) { be = 1; } else { m = m | ((uint64)1 << (uint64)52); }
+  if (be == 0) {
+    be = 1;
+  } else {
+    m = m | ((uint64)1 << (uint64)52);
+  }
   var e2: int32 = be - 1075;
+
   while (m != (uint64)0 && (m & (uint64)1) == (uint64)0) {
     m = m >> (uint64)1;
     e2 = e2 + 1;
   }
+
   var b: Big;
   b.n = 0;
   var mm: uint64 = m;
+
   while (mm > (uint64)0) {
     b.w[b.n] = (uint32)(mm % (uint64)1000000000);
     mm = mm / (uint64)1000000000;
     b.n = b.n + 1;
   }
+
   var shift: int32 = 0;
   if (e2 > 0) {
     var left: int32 = e2;
-    while (left >= 30) { big_mul(&b, (uint64)1 << (uint64)30); left = left - 30; }
+    while (left >= 30) {
+      big_mul(&b, (uint64)1 << (uint64)30);
+      left = left - 30;
+    }
     if (left > 0) { big_mul(&b, (uint64)1 << (uint64)left); }
   } else if (e2 < 0) {
     var left2: int32 = -e2;
-    while (left2 >= 13) { big_mul(&b, (uint64)1220703125); left2 = left2 - 13; }
+    while (left2 >= 13) {
+      big_mul(&b, (uint64)1220703125);
+      left2 = left2 - 13;
+    }
     var f: uint64 = 1;
     for k in 0..left2 { f = f * (uint64)5; }
     if (left2 > 0) { big_mul(&b, f); }
@@ -365,17 +414,21 @@ fn exact_digits(x: float64, d: uint8*, nd: int32*, e10: int32*) {
   var top: uint32 = b.w[b.n - 1];
   var tmp: uint8[12];
   var tn: int32 = 0;
+
   while (top > (uint32)0) {
     tmp[tn] = (uint8)(48 + (int32)(top % (uint32)10));
     top = top / (uint32)10;
     tn = tn + 1;
   }
+
   while (tn > 0) {
     tn = tn - 1;
     d[k2] = tmp[tn];
     k2 = k2 + 1;
   }
+
   var i: int32 = b.n - 2;
+
   while (i >= 0) {
     var w: uint32 = b.w[i];
     var j: int32 = 8;
@@ -387,6 +440,7 @@ fn exact_digits(x: float64, d: uint8*, nd: int32*, e10: int32*) {
     k2 = k2 + 9;
     i = i - 1;
   }
+
   *nd = k2;
   *e10 = k2 - 1 + shift;
 }
@@ -399,17 +453,38 @@ fn back_same(t: int32, x: float64, d: uint8*, n: int32, e10: int32) -> bool {
   if (n > 1) {
     s[k] = 46;
     k = k + 1;
-    for i in 1..n { s[k] = d[i]; k = k + 1; }
+    for i in 1..n {
+      s[k] = d[i];
+      k = k + 1;
+    }
   }
   s[k] = 101;
   k = k + 1;
   var e: int32 = e10;
-  if (e < 0) { s[k] = 45; k = k + 1; e = -e; }
+  if (e < 0) {
+    s[k] = 45;
+    k = k + 1;
+    e = -e;
+  }
   var ed: uint8[8];
   var en: int32 = 0;
-  if (e == 0) { ed[0] = 48; en = 1; }
-  while (e > 0) { ed[en] = (uint8)(48 + e % 10); e = e / 10; en = en + 1; }
-  while (en > 0) { en = en - 1; s[k] = ed[en]; k = k + 1; }
+  if (e == 0) {
+    ed[0] = 48;
+    en = 1;
+  }
+
+  while (e > 0) {
+    ed[en] = (uint8)(48 + e % 10);
+    e = e / 10;
+    en = en + 1;
+  }
+
+  while (en > 0) {
+    en = en - 1;
+    s[k] = ed[en];
+    k = k + 1;
+  }
+
   s[k] = 0;
   if (t == T_F32) {
     var f: float32 = strtof((cstring)&s[0], (rawptr)0);
@@ -418,12 +493,13 @@ fn back_same(t: int32, x: float64, d: uint8*, n: int32, e10: int32) -> bool {
   return f64_bits(strtod((cstring)&s[0], (rawptr)0)) == f64_bits(x);
 }
 
-// the shortest digits that read back as x, the closest of them when two fit.
+// the shortest digits that read back as x, the closest when two fit
 fn shortest(t: int32, x: float64, d: uint8*, nd: int32*, e10: int32*) {
   var all: uint8[800];
   var an: int32 = 0;
   var ae: int32 = 0;
   exact_digits(x, &all[0], &an, &ae);
+
   for p in 1..18 {
     if (p >= an) {
       for k in 0..an { d[k] = all[k]; }
@@ -435,12 +511,21 @@ fn shortest(t: int32, x: float64, d: uint8*, nd: int32*, e10: int32*) {
     }
     var down: uint8[20];
     var up: uint8[20];
-    for k2 in 0..p { down[k2] = all[k2]; up[k2] = all[k2]; }
+    for k2 in 0..p {
+      down[k2] = all[k2];
+      up[k2] = all[k2];
+    }
     var ue: int32 = ae;
     var i: int32 = p - 1;
     var carry: bool = true;
     while (carry && i >= 0) {
-      if (up[i] == 57) { up[i] = 48; i = i - 1; } else { up[i] = up[i] + 1; carry = false; }
+      if (up[i] == 57) {
+        up[i] = 48;
+        i = i - 1;
+      } else {
+        up[i] = up[i] + 1;
+        carry = false;
+      }
     }
     if (carry) {
       up[0] = 49;
@@ -451,7 +536,9 @@ fn shortest(t: int32, x: float64, d: uint8*, nd: int32*, e10: int32*) {
     if (all[p] > 53) { cmp = 1; }
     else if (all[p] < 53) { cmp = -1; }
     else {
-      for k4 in (p + 1)..an { if (all[k4] != 48) { cmp = 1; } }
+      for k4 in (p + 1)..an {
+        if (all[k4] != 48) { cmp = 1; }
+      }
       if (cmp == 0 && ((int32)(all[p - 1] - 48) % 2) == 0) { cmp = -1; }
       if (cmp == 0) { cmp = 1; }
     }
@@ -474,18 +561,29 @@ fn shortest(t: int32, x: float64, d: uint8*, nd: int32*, e10: int32*) {
   }
 }
 
-// a float the way Rust writes it. {:?} gives 128.7723 or 1e16 or 1.5e-5,
-// plain {} gives 10000000000000000 and 0.000015 and no .0 on whole numbers.
+// as Rust writes it. {:?} gives 1e16 or 1.5e-5, plain {} gives
+// 10000000000000000 and 0.000015 with no .0 on whole numbers
 fn float_text(x: float64, single: bool, plain: bool, out: MercBuf*) {
+
   var t: int32 = T_F64;
   if (single) { t = T_F32; }
-  if (isnan(x)) { merc_buf_text(out, "NaN"); return; }
+  if (isnan(x)) {
+    merc_buf_text(out, "NaN");
+    return;
+  }
   if (f64_bits(x) < 0) { merc_buf_push(out, 45); }
   var a: float64 = x;
   if (a < 0.0) { a = -a; }
-  if (a == INF()) { merc_buf_text(out, "inf"); return; }
+  if (a == INF()) {
+    merc_buf_text(out, "inf");
+    return;
+  }
   if (a == 0.0) {
-    if (plain) { merc_buf_text(out, "0"); } else { merc_buf_text(out, "0.0"); }
+    if (plain) {
+      merc_buf_text(out, "0");
+    } else {
+      merc_buf_text(out, "0.0");
+    }
     return;
   }
   var d: uint8[24];
@@ -508,9 +606,15 @@ fn float_text(x: float64, single: bool, plain: bool, out: MercBuf*) {
     merc_buf_add(out, &d[0], (int64)nd);
     return;
   }
+
   for k2 in 0..(e10 + 1) {
-    if (k2 < nd) { merc_buf_push(out, d[k2]); } else { merc_buf_push(out, 48); }
+    if (k2 < nd) {
+      merc_buf_push(out, d[k2]);
+    } else {
+      merc_buf_push(out, 48);
+    }
   }
+
   if (nd > e10 + 1) {
     merc_buf_push(out, 46);
     merc_buf_add(out, &d[e10 + 1], (int64)(nd - e10 - 1));
@@ -616,7 +720,7 @@ fn powi(t: int32, a0: float64, b0: int32) -> float64 {
   return r;
 }
 
-// float to whole number the way Rust's as does it: saturate, NaN is zero.
+// like Rust's as: saturate, NaN is zero
 fn f_to_int(t: int32, x: float64) -> int64 {
   if (isnan(x)) { return 0; }
   var bits: int64 = ty_size(t) * 8;
@@ -640,7 +744,9 @@ fn f_to_int(t: int32, x: float64) -> int64 {
   if (x <= 0.0) { return 0; }
   if (bits == 64) {
     if (x >= 18446744073709551615.0) { return -1; }
-    if (x >= 9223372036854775808.0) { return (int64)((uint64)(x - 9223372036854775808.0) + (uint64)0x8000000000000000); }
+    if (x >= 9223372036854775808.0) {
+      return (int64)((uint64)(x - 9223372036854775808.0) + (uint64)0x8000000000000000);
+    }
     return (int64)x;
   }
   var top: float64 = (float64)(((int64)1 << (int64)bits) - (int64)1);
@@ -668,7 +774,9 @@ fn bit_count(t: int32, v: int64) -> int64 {
   var u: uint64 = (uint64)wrap(T_U64, v);
   var n: int64 = 0;
   var bits: int64 = ty_size(t) * 8;
-  for k: int64 in 0..bits { if (((u >> (uint64)k) & (uint64)1) != (uint64)0) { n = n + 1; } }
+  for k: int64 in 0..bits {
+    if (((u >> (uint64)k) & (uint64)1) != (uint64)0) { n = n + 1; }
+  }
   return n;
 }
 
@@ -695,7 +803,13 @@ fn unsigned_op(t: int32, op: string, a: Args*, out: MercBuf*) -> bool {
     if (op == "and") { acc = -1; }
     for i in 0..c {
       var x: int64 = arg_int(a, t);
-      if (op == "and") { acc = acc & x; } else if (op == "or") { acc = acc | x; } else { acc = acc ^ x; }
+      if (op == "and") {
+        acc = acc & x;
+      } else if (op == "or") {
+        acc = acc | x;
+      } else {
+        acc = acc ^ x;
+      }
     }
     if (a->bad) { return false; }
     return put_int(out, t, acc);
@@ -720,7 +834,9 @@ fn unsigned_op(t: int32, op: string, a: Args*, out: MercBuf*) -> bool {
     if (op == "reverse_bits") {
       var r2: uint64 = 0;
       for k2: int64 in 0..bits {
-        if ((((uint64)x1 >> (uint64)k2) & (uint64)1) != (uint64)0) { r2 = r2 | ((uint64)1 << (uint64)(bits - 1 - k2)); }
+        if ((((uint64)x1 >> (uint64)k2) & (uint64)1) != (uint64)0) {
+          r2 = r2 | ((uint64)1 << (uint64)(bits - 1 - k2));
+        }
       }
       return put_int(out, t, (int64)r2);
     }
@@ -749,12 +865,30 @@ fn unsigned_op(t: int32, op: string, a: Args*, out: MercBuf*) -> bool {
 }
 
 fn int_cmp(op: string, x: int64, y: int64, out: MercBuf*) -> int32 {
-  if (op == "lt") { put_i8(out, x < y); return 1; }
-  if (op == "gt") { put_i8(out, x > y); return 1; }
-  if (op == "lte") { put_i8(out, x <= y); return 1; }
-  if (op == "gte") { put_i8(out, x >= y); return 1; }
-  if (op == "eq") { put_i8(out, x == y); return 1; }
-  if (op == "ne") { put_i8(out, x != y); return 1; }
+  if (op == "lt") {
+    put_i8(out, x < y);
+    return 1;
+  }
+  if (op == "gt") {
+    put_i8(out, x > y);
+    return 1;
+  }
+  if (op == "lte") {
+    put_i8(out, x <= y);
+    return 1;
+  }
+  if (op == "gte") {
+    put_i8(out, x >= y);
+    return 1;
+  }
+  if (op == "eq") {
+    put_i8(out, x == y);
+    return 1;
+  }
+  if (op == "ne") {
+    put_i8(out, x != y);
+    return 1;
+  }
   return 0;
 }
 
@@ -783,10 +917,15 @@ fn signed_op(t: int32, op: string, a: Args*, out: MercBuf*) -> bool {
     if (op == "min") { acc = hi; }
     for i in 0..c {
       var x: int64 = arg_int(a, t);
-      if (op == "sum") { acc = wrap(t, acc + x); }
-      else if (op == "product") { acc = wrap(t, acc * x); }
-      else if (op == "max") { if (x > acc) { acc = x; } }
-      else { if (x < acc) { acc = x; } }
+      if (op == "sum") {
+        acc = wrap(t, acc + x);
+      } else if (op == "product") {
+        acc = wrap(t, acc * x);
+      } else if (op == "max") {
+        if (x > acc) { acc = x; }
+      } else {
+        if (x < acc) { acc = x; }
+      }
     }
     if (a->bad) { return false; }
     return put_int(out, t, acc);
@@ -877,8 +1016,12 @@ fn float_op(t: int32, op: string, a: Args*, out: MercBuf*) -> bool {
     }
     var lr: float64 = 0.0;
     if (libm_call(op, t, x1, 0.0, false, &lr)) { return put_f(out, t, lr); }
-    if (t == T_F64 && op == "to_degrees") { return put_f(out, t, x1 * (180.0 / 3.141592653589793)); }
-    if (t == T_F64 && op == "to_radians") { return put_f(out, t, x1 * (3.141592653589793 / 180.0)); }
+    if (t == T_F64 && op == "to_degrees") {
+      return put_f(out, t, x1 * (180.0 / 3.141592653589793));
+    }
+    if (t == T_F64 && op == "to_radians") {
+      return put_f(out, t, x1 * (3.141592653589793 / 180.0));
+    }
     return false;
   }
   if (c == 2) {
@@ -900,7 +1043,9 @@ fn float_op(t: int32, op: string, a: Args*, out: MercBuf*) -> bool {
     }
     if (isnan(x2) || isnan(y2)) {
       if (op == "ne") { return put_i8(out, true); }
-      if (op == "lt" || op == "gt" || op == "lte" || op == "gte" || op == "eq") { return put_i8(out, false); }
+      if (op == "lt" || op == "gt" || op == "lte" || op == "gte" || op == "eq") {
+        return put_i8(out, false);
+      }
     }
     if (op == "lt") { return put_i8(out, x2 < y2); }
     if (op == "gt") { return put_i8(out, x2 > y2); }
@@ -988,7 +1133,9 @@ fn plain_op(name: string, a: Args*, out: MercBuf*) -> bool {
     var p: uint8* = arg_sym(a, &n);
     if (a->bad) { return false; }
     var nz: bool = false;
-    for k: int64 in 0..n { if (p[k] != 0) { nz = true; } }
+    for k: int64 in 0..n {
+      if (p[k] != 0) { nz = true; }
+    }
     var wn: int64 = 0;
     var w: uint8* = arg_sym(a, &wn);
     if (a->bad || pv(w, wn) != "then") { return false; }
@@ -1014,7 +1161,10 @@ fn plain_op(name: string, a: Args*, out: MercBuf*) -> bool {
     var p2: uint8* = arg_sym(a, &n2);
     if (a->bad) { return false; }
     merc_buf_push(out, (uint8)n2);
-    for k2: int64 in 0..n2 { merc_buf_push(out, 0xC1); merc_buf_push(out, p2[k2]); }
+    for k2: int64 in 0..n2 {
+      merc_buf_push(out, 0xC1);
+      merc_buf_push(out, p2[k2]);
+    }
     return true;
   }
   if (name == "collapse_symbol") {
@@ -1042,7 +1192,10 @@ fn plain_op(name: string, a: Args*, out: MercBuf*) -> bool {
   if (name == "reverse_symbol") {
     merc_buf_push(out, (uint8)(0xC0 + n3));
     var k5: int64 = n3 - 1;
-    while (k5 >= 0) { merc_buf_push(out, p3[k5]); k5 = k5 - 1; }
+    while (k5 >= 0) {
+      merc_buf_push(out, p3[k5]);
+      k5 = k5 - 1;
+    }
     return true;
   }
   if (name == "encode_hex") {
@@ -1063,7 +1216,10 @@ fn plain_op(name: string, a: Args*, out: MercBuf*) -> bool {
     while (k7 < n3) {
       var h: int32 = hexval(p3[k7]);
       var l: int32 = hexval(p3[k7 + 1]);
-      if (h < 0 || l < 0) { out->len = start; return false; }
+      if (h < 0 || l < 0) {
+        out->len = start;
+        return false;
+      }
       merc_buf_push(out, (uint8)(h * 16 + l));
       k7 = k7 + 2;
     }
@@ -1076,13 +1232,17 @@ fn apply(name: string, a: Args*, out: MercBuf*) -> bool {
   var n: int64 = (int64)name.length;
   var p: uint8* = name.chars;
   var cut: int64 = -1;
-  for k: int64 in 0..n { if (cut < 0 && p[k] == 95) { cut = k; } }
+  for k: int64 in 0..n {
+    if (cut < 0 && p[k] == 95) { cut = k; }
+  }
   if (cut > 0) {
     var t: int32 = ty_of(pv(p, cut));
     if (t != 0) { return typed_first(t, pv(p + cut + 1, n - cut - 1), a, out); }
   }
   var last: int64 = -1;
-  for k2: int64 in 0..n { if (p[k2] == 95) { last = k2; } }
+  for k2: int64 in 0..n {
+    if (p[k2] == 95) { last = k2; }
+  }
   if (last > 0) {
     var t2: int32 = ty_of(pv(p + last + 1, n - last - 1));
     if (t2 != 0) {
@@ -1117,11 +1277,16 @@ fn eval_at(p: uint8*, n: int64, out: MercBuf*, depth: int32) -> int64 {
   }
   var args: MercBuf;
   var ok: bool = true;
+
   for i in 1..(int32)tag {
     var k: int64 = eval_at(p + at, n - at, &args, depth + 1);
-    if (k < 0) { ok = false; break; }
+    if (k < 0) {
+      ok = false;
+      break;
+    }
     at = at + k;
   }
+
   if (ok) {
     var a: Args;
     a.p = args.data;

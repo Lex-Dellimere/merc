@@ -1,6 +1,5 @@
-// the command language. the terminal tool and the viewer both run it.
-// a shell points at its own trie, so set it up in place with
-// merc_shell_init and never copy it.
+// the command language used by the terminal tool and the viewer.
+// a shell points at its own trie, so init it in place and never copy it
 
 import "std/mem";
 import "std/file";
@@ -28,7 +27,7 @@ export struct MercShell {
   zip: MercZip;
   out: MercBuf;
   touched: MercBuf;
-  hits: MercBuf;        // keys the last search found, 4 bytes of length then the key
+  hits: MercBuf;        // 4 byte length then key, for each hit
   hit_count: int64;
   kind: int32;
   serial: int64;
@@ -42,7 +41,7 @@ export struct MercShell {
   rules: MercRun;
   find: MercFind;
   inside: bool;
-  spans: MercBuf;       // after find, for each hit: its number, how many places, their offsets
+  spans: MercBuf;       // per find hit its number, place count, then offsets
 }
 
 export fn merc_shell_init(sh: MercShell*) {
@@ -94,7 +93,8 @@ fn sh_cmds() -> ShCmd* {
 var g_cmd_table: ShCmd[22];
 var g_move_table: ShWord[10];
 
-fn sh_cmd(i: int32, name: string, args: string, note: string, basic: string, section: int32, run: fn(MercShell*, string) -> int32) {
+fn sh_cmd(i: int32, name: string, args: string, note: string, basic: string,
+  section: int32, run: fn(MercShell*, string) -> int32) {
   g_cmd_table[i].name = name;
   g_cmd_table[i].args = args;
   g_cmd_table[i].note = note;
@@ -110,28 +110,42 @@ fn sh_move(i: int32, name: string, args: string, note: string) {
 }
 
 fn sh_fill_cmds() {
-  sh_cmd(0, "add", "EXPR [= N]", "store an expression (a bare (expr) line does the same)", "store one expression", 0, &sh_add);
+  sh_cmd(0, "add", "EXPR [= N]",
+    "store an expression (a bare (expr) line does the same)",
+    "store one expression", 0, &sh_add);
   sh_cmd(1, "del", "EXPR", "remove it", "", 0, &sh_del);
   sh_cmd(2, "has", "EXPR", "is it stored", "", 0, &sh_has);
-  sh_cmd(3, "match", "PATTERN", "every stored expression the pattern unifies with, $x is a variable", "find stored expressions, $x matches anything", 0, &sh_c_match);
+  sh_cmd(3, "match", "PATTERN",
+    "every stored expression the pattern unifies with, $x is a variable",
+    "find stored expressions, $x matches anything", 0, &sh_c_match);
   sh_cmd(4, "count", "PATTERN", "how many", "", 0, &sh_c_count);
-  sh_cmd(5, "transform", "PATTERN => SHAPE", "store SHAPE for every match, variables filled in", "", 0, &sh_transform);
+  sh_cmd(5, "transform", "PATTERN => SHAPE",
+    "store SHAPE for every match, variables filled in", "", 0, &sh_transform);
   sh_cmd(6, "list", "[N]", "the first N stored expressions (20)", "", 0, &sh_list);
-  sh_cmd(7, "load", "FILE", "store every expression in FILE, one or more a line", "read a file of expressions and rules", 1, &sh_load);
-  sh_cmd(8, "save", "FILE [PATTERN]", "write every stored expression to FILE, or only the ones PATTERN matches", "write everything stored to a file", 1, &sh_save);
+  sh_cmd(7, "load", "FILE",
+    "store every expression in FILE, one or more a line",
+    "read a file of expressions and rules", 1, &sh_load);
+  sh_cmd(8, "save", "FILE [PATTERN]",
+    "write every stored expression to FILE, or only the ones PATTERN matches",
+    "write everything stored to a file", 1, &sh_save);
   sh_cmd(9, "run", "FILE", "run the commands in FILE", "", 1, &sh_run_file);
   sh_cmd(10, "z", "", "where the zipper is and which bytes can follow", "", 2, &sh_zip);
-  sh_cmd(11, "rules", "[N]", "the rules waiting to run, first to run on top", "show the rules waiting to run", 3, &sh_rules);
+  sh_cmd(11, "rules", "[N]", "the rules waiting to run, first to run on top",
+    "show the rules waiting to run", 3, &sh_rules);
   sh_cmd(12, "step", "", "run the first rule and say what it did", "run one rule", 3, &sh_c_step);
-  sh_cmd(13, "go", "[N]", "run rules until none is left, or N of them", "run every rule until none is left", 3, &sh_go);
+  sh_cmd(13, "go", "[N]", "run rules until none is left, or N of them",
+    "run every rule until none is left", 3, &sh_go);
   sh_cmd(14, "stats", "", "sizes", "", 4, &sh_c_stats);
-  sh_cmd(15, "gpu", "on|off|auto", "when match and count may scan a flat copy on the gpu", "", 4, &sh_gpu);
+  sh_cmd(15, "gpu", "on|off|auto",
+    "when match and count may scan a flat copy on the gpu", "", 4, &sh_gpu);
   sh_cmd(16, "clear", "", "empty the trie", "", 4, &sh_c_clear);
   sh_cmd(17, "help", "", "this list", "", 4, &sh_c_help);
   sh_cmd(18, "quit", "", "", "", 4, &sh_c_quit);
   sh_cmd(19, "exit", "", "", "", 5, &sh_c_quit);
   sh_cmd(20, "help all", "", "", "every command", 5, &sh_c_help);
-  sh_cmd(21, "find", "PATTERN", "every place inside a stored expression the pattern unifies with", "find a pattern anywhere inside", 0, &sh_find);
+  sh_cmd(21, "find", "PATTERN",
+    "every place inside a stored expression the pattern unifies with",
+    "find a pattern anywhere inside", 0, &sh_find);
   sh_move(0, "top", "", "back to the root");
   sh_move(1, "arity", "N", "step onto a parent with N children");
   sh_move(2, "sym", "NAME", "step onto the symbol NAME");
@@ -183,6 +197,7 @@ export fn merc_shell_help_all() -> string {
   var t: ShCmd* = sh_cmds();
   merc_buf_clear(&g_sh_help);
   var heads: string[5] = ["expressions", "files", "zipper", "rules", "trie"];
+
   for sec in 0..5 {
     merc_buf_text(&g_sh_help, heads[sec]);
     merc_buf_text(&g_sh_help, "\n");
@@ -208,6 +223,7 @@ export fn merc_shell_help_all() -> string {
       }
     }
   }
+
   return merc_buf_view(&g_sh_help);
 }
 
@@ -239,8 +255,16 @@ fn sh_num(sh: MercShell*, v: int64) {
 fn sh_hex(sh: MercShell*, b: uint8) {
   var hi: int32 = (int32)(b >> 4);
   var lo: int32 = (int32)(b & 15);
-  if (hi < 10) { merc_buf_push(&sh->out, (uint8)(48 + hi)); } else { merc_buf_push(&sh->out, (uint8)(87 + hi)); }
-  if (lo < 10) { merc_buf_push(&sh->out, (uint8)(48 + lo)); } else { merc_buf_push(&sh->out, (uint8)(87 + lo)); }
+  if (hi < 10) {
+    merc_buf_push(&sh->out, (uint8)(48 + hi));
+  } else {
+    merc_buf_push(&sh->out, (uint8)(87 + hi));
+  }
+  if (lo < 10) {
+    merc_buf_push(&sh->out, (uint8)(48 + lo));
+  } else {
+    merc_buf_push(&sh->out, (uint8)(87 + lo));
+  }
 }
 
 fn sh_fail(sh: MercShell*, why: string) -> int32 {
@@ -262,7 +286,9 @@ fn sh_trim(s: string) -> string {
   var n: int64 = (int64)s.length;
   var i: int64 = 0;
   while (i < n && (p[i] == 32 || p[i] == 9 || p[i] == 13 || p[i] == 10)) { i = i + 1; }
-  while (n > i && (p[n - 1] == 32 || p[n - 1] == 9 || p[n - 1] == 13 || p[n - 1] == 10)) { n = n - 1; }
+  while (n > i && (p[n - 1] == 32 || p[n - 1] == 9 || p[n - 1] == 13 || p[n - 1] == 10)) {
+    n = n - 1;
+  }
   var r: string;
   r.chars = p + i;
   r.length = (uint64)(n - i);
@@ -361,7 +387,7 @@ fn sh_resync(sh: MercShell*) {
   merc_buf_free(&keep);
 }
 
-// raw symbol bytes still due after path. 0 means the next byte is a tag.
+// raw symbol bytes still due after path, 0 when the next byte is a tag
 export fn merc_path_raw(path: string) -> int32 {
   var p: uint8* = path.chars;
   var n: int64 = (int64)path.length;
@@ -413,10 +439,12 @@ fn sh_where(sh: MercShell*) {
   sh_say(sh, "zipper at depth ");
   sh_num(sh, merc_zip_depth(z));
   sh_say(sh, ":");
+
   for i: int64 in 0..(int64)path.length {
     sh_say(sh, " ");
     sh_hex(sh, path.chars[i]);
   }
+
   sh_say(sh, "\n");
   if (!merc_zip_exists(z)) {
     sh_say(sh, "  nothing is stored this way\n");
@@ -437,6 +465,7 @@ fn sh_where(sh: MercShell*) {
   sh_say(sh, " can follow:");
   var b: int32 = merc_zip_next(z, 0);
   var shown: int32 = 0;
+
   while (b >= 0 && shown < 24) {
     sh_say(sh, " [");
     sh_byte_name(sh, b, raw);
@@ -444,6 +473,7 @@ fn sh_where(sh: MercShell*) {
     shown = shown + 1;
     b = merc_zip_next(z, b + 1);
   }
+
   if (b >= 0) { sh_say(sh, " ..."); }
   sh_say(sh, "\n");
 }
@@ -471,13 +501,17 @@ fn sh_zip(sh: MercShell*, rest: string) -> int32 {
     if (!sh_int(args, &k) || k > 63) { return sh_fail(sh, "z arity takes a number from 0 to 63"); }
     merc_zip_push(z, (uint8)k);
   } else if (sh_is(word, "sym")) {
-    if (args.length == 0 || args.length > 63) { return sh_fail(sh, "z sym takes a name of 1 to 63 bytes"); }
+    if (args.length == 0 || args.length > 63) {
+      return sh_fail(sh, "z sym takes a name of 1 to 63 bytes");
+    }
     merc_zip_push(z, (uint8)(0xC0 + (int32)args.length));
     merc_zip_descend(z, args);
   } else if (sh_is(word, "var")) {
     merc_zip_push(z, 0xC0);
   } else if (sh_is(word, "byte")) {
-    if (args.length != 2 || sh_hexval(args.chars[0]) < 0 || sh_hexval(args.chars[1]) < 0) { return sh_fail(sh, "z byte takes two hex digits"); }
+    if (args.length != 2 || sh_hexval(args.chars[0]) < 0 || sh_hexval(args.chars[1]) < 0) {
+      return sh_fail(sh, "z byte takes two hex digits");
+    }
     merc_zip_push(z, (uint8)(sh_hexval(args.chars[0]) * 16 + sh_hexval(args.chars[1])));
   } else if (sh_is(word, "expr")) {
     if (sh_parse(sh, args, &sh->a, false) == 0) { return 1; }
@@ -489,7 +523,11 @@ fn sh_zip(sh: MercShell*, rest: string) -> int32 {
     if (r == MERC_FAILED) { return sh_fail(sh, "out of memory"); }
     sh->serial = sh->serial + 1;
     sh_touch(sh, merc_zip_path(z), MERC_DID_ADD);
-    if (r == MERC_ADDED) { sh_say(sh, "stored\n"); } else { sh_say(sh, "replaced\n"); }
+    if (r == MERC_ADDED) {
+      sh_say(sh, "stored\n");
+    } else {
+      sh_say(sh, "replaced\n");
+    }
     return 0;
   } else if (sh_is(word, "unset")) {
     sh_touch(sh, merc_zip_path(z), MERC_DID_REMOVE);
@@ -528,7 +566,11 @@ fn sh_add(sh: MercShell*, rest: string) -> int32 {
   sh->serial = sh->serial + 1;
   sh_touch(sh, merc_buf_view(&sh->a), MERC_DID_ADD);
   sh_resync(sh);
-  if (r == MERC_ADDED) { sh_say(sh, "stored\n"); } else { sh_say(sh, "already there, value replaced\n"); }
+  if (r == MERC_ADDED) {
+    sh_say(sh, "stored\n");
+  } else {
+    sh_say(sh, "already there, value replaced\n");
+  }
   return 0;
 }
 
@@ -567,6 +609,7 @@ fn sh_match_rows(sh: MercShell*, rows: MercBuf*, found: int64, only_count: bool)
   merc_buf_clear(&sh->hits);
   sh->hit_count = 0;
   var q: MercQuery = merc_query(&sh->trie, pat);
+
   for i: int64 in 0..(rows->len / 8) {
     var m: string = merc_flat_row(f, ((int64*)rows->data)[i]);
     var len: uint32 = (uint32)m.length;
@@ -589,6 +632,7 @@ fn sh_match_rows(sh: MercShell*, rows: MercBuf*, found: int64, only_count: bool)
       sh_say(sh, "\n");
     }
   }
+
   merc_query_free(&q);
   if (!only_count && found > 50) {
     sh_say(sh, "... ");
@@ -596,9 +640,17 @@ fn sh_match_rows(sh: MercShell*, rows: MercBuf*, found: int64, only_count: bool)
     sh_say(sh, " more\n");
   }
   sh_num(sh, found);
-  if (found == 1) { sh_say(sh, " match, "); } else { sh_say(sh, " matches, "); }
+  if (found == 1) {
+    sh_say(sh, " match, ");
+  } else {
+    sh_say(sh, " matches, ");
+  }
   sh_say(sh, "0 bytes walked, ");
-  if (merc_flat_way() == 2) { sh_say(sh, "flat scan on the gpu\n"); } else { sh_say(sh, "flat scan on the cores\n"); }
+  if (merc_flat_way() == 2) {
+    sh_say(sh, "flat scan on the gpu\n");
+  } else {
+    sh_say(sh, "flat scan on the cores\n");
+  }
   sh_touch(sh, pat, MERC_DID_SEARCH);
   return 0;
 }
@@ -619,6 +671,7 @@ fn sh_match(sh: MercShell*, rest: string, only_count: bool) -> int32 {
   var found: int64 = 0;
   merc_buf_clear(&sh->hits);
   sh->hit_count = 0;
+
   while (merc_query_next(&q)) {
     found = found + 1;
     var m: string = merc_query_match(&q);
@@ -641,13 +694,18 @@ fn sh_match(sh: MercShell*, rest: string, only_count: bool) -> int32 {
       sh_say(sh, "\n");
     }
   }
+
   if (!only_count && found > 50) {
     sh_say(sh, "... ");
     sh_num(sh, found - 50);
     sh_say(sh, " more\n");
   }
   sh_num(sh, found);
-  if (found == 1) { sh_say(sh, " match, "); } else { sh_say(sh, " matches, "); }
+  if (found == 1) {
+    sh_say(sh, " match, ");
+  } else {
+    sh_say(sh, " matches, ");
+  }
   sh_num(sh, q.steps);
   sh_say(sh, " bytes walked\n");
   sh_touch(sh, merc_buf_view(&sh->a), MERC_DID_SEARCH);
@@ -658,6 +716,7 @@ fn sh_match(sh: MercShell*, rest: string, only_count: bool) -> int32 {
 fn sh_sort64(a: uint64*, lo: int64, hi: int64) {
   var l: int64 = lo;
   var h: int64 = hi;
+
   while (l < h) {
     var pivot: uint64 = a[(l + h) / 2];
     var i: int64 = l;
@@ -697,6 +756,7 @@ fn sh_show_cut(sh: MercShell*, e: string, most: int64) {
 }
 
 fn sh_find(sh: MercShell*, rest: string) -> int32 {
+
   if (sh_parse(sh, rest, &sh->a, false) == 0) { return 1; }
   var f: MercFind* = &sh->find;
   var t0: int64 = time_mono_ns();
@@ -718,6 +778,7 @@ fn sh_find(sh: MercShell*, rest: string) -> int32 {
   var found: int64 = 0;
   var exprs: int64 = 0;
   var bind: MercBuf;
+
   while (merc_find_next(f)) {
     found = found + 1;
     var id: int64 = merc_find_id(f);
@@ -744,6 +805,7 @@ fn sh_find(sh: MercShell*, rest: string) -> int32 {
       sh_say(sh, "\n");
     }
   }
+
   merc_buf_free(&bind);
   free((rawptr)seen);
   if (found > 50) {
@@ -752,9 +814,17 @@ fn sh_find(sh: MercShell*, rest: string) -> int32 {
     sh_say(sh, " more\n");
   }
   sh_num(sh, found);
-  if (found == 1) { sh_say(sh, " place in "); } else { sh_say(sh, " places in "); }
+  if (found == 1) {
+    sh_say(sh, " place in ");
+  } else {
+    sh_say(sh, " places in ");
+  }
   sh_num(sh, exprs);
-  if (exprs == 1) { sh_say(sh, " expression\n"); } else { sh_say(sh, " expressions\n"); }
+  if (exprs == 1) {
+    sh_say(sh, " expression\n");
+  } else {
+    sh_say(sh, " expressions\n");
+  }
   var pn: int64 = pairs.len / 8;
   var pv: uint64* = (uint64*)pairs.data;
   if (pn > 1) { sh_sort64(pv, 0, pn - 1); }
@@ -762,6 +832,7 @@ fn sh_find(sh: MercShell*, rest: string) -> int32 {
   merc_buf_clear(&sh->spans);
   sh->hit_count = 0;
   var k: int64 = 0;
+
   while (k < pn && sh->hit_count < 20000) {
     var id2: int64 = (int64)(pv[k] >> (uint64)32);
     var e: string = merc_find_expr(f, id2);
@@ -781,6 +852,7 @@ fn sh_find(sh: MercShell*, rest: string) -> int32 {
     sh->hit_count = sh->hit_count + 1;
     k = j;
   }
+
   merc_buf_free(&pairs);
   sh->inside = true;
   sh_touch(sh, merc_buf_view(&sh->a), MERC_DID_SEARCH);
@@ -794,7 +866,9 @@ fn sh_transform(sh: MercShell*, rest: string) -> int32 {
   tail.chars = rest.chars + used;
   tail.length = (uint64)((int64)rest.length - used);
   tail = sh_trim(tail);
-  if (tail.length < 2 || tail.chars[0] != 61 || tail.chars[1] != 62) { return sh_fail(sh, "write: transform PATTERN => SHAPE"); }
+  if (tail.length < 2 || tail.chars[0] != 61 || tail.chars[1] != 62) {
+    return sh_fail(sh, "write: transform PATTERN => SHAPE");
+  }
   tail.chars = tail.chars + 2;
   tail.length = tail.length - (uint64)2;
   if (sh_parse(sh, tail, &sh->b, true) == 0) { return 1; }
@@ -853,9 +927,14 @@ fn sh_gpu(sh: MercShell*, rest: string) -> int32 {
   else if (sh_is(rest, "off")) { merc_flat_set_mode(MERC_FLAT_OFF); }
   else if (sh_is(rest, "auto")) { merc_flat_set_mode(MERC_FLAT_AUTO); }
   else if (rest.length != 0) { return sh_fail(sh, "gpu takes on, off or auto"); }
-  if (!merc_flat_ready()) { sh_say(sh, "no gpu in this program, searches use the trie\n"); return 0; }
+  if (!merc_flat_ready()) {
+    sh_say(sh, "no gpu in this program, searches use the trie\n");
+    return 0;
+  }
   var mode: int32 = merc_flat_mode();
-  if (mode == MERC_FLAT_ON) { sh_say(sh, "gpu on: every search with a variable scans the flat copy\n"); }
+  if (mode == MERC_FLAT_ON) {
+    sh_say(sh, "gpu on: every search with a variable scans the flat copy\n");
+  }
   else if (mode == MERC_FLAT_OFF) { sh_say(sh, "gpu off: every search walks the trie\n"); }
   else { sh_say(sh, "gpu auto: big searches with a variable first scan the flat copy\n"); }
   return 0;
@@ -867,6 +946,7 @@ export fn merc_shell_load_text(sh: MercShell*, text: string) -> int64 {
   var i: int64 = 0;
   var added: int64 = 0;
   var bad: int64 = 0;
+
   while (i < n) {
     while (i < n && (p[i] == 32 || p[i] == 9 || p[i] == 10 || p[i] == 13)) { i = i + 1; }
     if (i >= n) { break; }
@@ -890,6 +970,7 @@ export fn merc_shell_load_text(sh: MercShell*, text: string) -> int64 {
     if (r == MERC_FAILED) { return -1; }
     if (r == MERC_ADDED) { added = added + 1; }
   }
+
   sh->errors = sh->errors + bad;
   if (bad > 0) {
     sh_num(sh, bad);
@@ -931,6 +1012,7 @@ fn sh_run_file(sh: MercShell*, rest: string) -> int32 {
   var n: int64 = text.len;
   var i: int64 = 0;
   var worst: int32 = 0;
+
   while (i < n && !sh->quit) {
     var from: int64 = i;
     while (i < n && p[i] != 10) { i = i + 1; }
@@ -941,6 +1023,7 @@ fn sh_run_file(sh: MercShell*, rest: string) -> int32 {
     var r: int32 = merc_shell_run(sh, line);
     if (r > worst) { worst = r; }
   }
+
   sh->depth = sh->depth - 1;
   merc_buf_free(&text);
   return worst;
@@ -1039,7 +1122,11 @@ fn sh_rules(sh: MercShell*, rest: string) -> int32 {
   }
   merc_zip_free(&z);
   sh_num(sh, total);
-  if (total == 1) { sh_say(sh, " rule waiting\n"); } else { sh_say(sh, " rules waiting\n"); }
+  if (total == 1) {
+    sh_say(sh, " rule waiting\n");
+  } else {
+    sh_say(sh, " rules waiting\n");
+  }
   return 0;
 }
 
@@ -1092,7 +1179,11 @@ fn sh_go(sh: MercShell*, rest: string) -> int32 {
   sh->kind = MERC_DID_BULK;
   sh_resync(sh);
   sh_num(sh, ran);
-  if (ran == 1) { sh_say(sh, " rule ran, "); } else { sh_say(sh, " rules ran, "); }
+  if (ran == 1) {
+    sh_say(sh, " rule ran, ");
+  } else {
+    sh_say(sh, " rules ran, ");
+  }
   sh_num(sh, r->matches - m0);
   sh_say(sh, " matches, ");
   sh_num(sh, r->writes - w0);
@@ -1112,7 +1203,11 @@ fn sh_c_step(sh: MercShell*, rest: string) -> int32 { return sh_step(sh); }
 fn sh_c_stats(sh: MercShell*, rest: string) -> int32 { return sh_stats(sh); }
 
 fn sh_c_help(sh: MercShell*, rest: string) -> int32 {
-  if (sh_is(rest, "all")) { sh_say(sh, merc_shell_help_all()); } else { sh_say(sh, merc_shell_help()); }
+  if (sh_is(rest, "all")) {
+    sh_say(sh, merc_shell_help_all());
+  } else {
+    sh_say(sh, merc_shell_help());
+  }
   return 0;
 }
 
@@ -1145,8 +1240,7 @@ fn sh_run_line(sh: MercShell*, line: string) -> int32 {
   return sh_fail(sh, "unknown command, try help");
 }
 
-// runs one line. what it prints is added to sh->out. gives 0, or 1 when the
-// line was wrong. a blank line or a comment line does nothing.
+// output goes to sh->out. gives 1 when the line was wrong
 export fn merc_shell_run(sh: MercShell*, line: string) -> int32 {
   var t0: int64 = time_mono_ns();
   var r: int32 = sh_run_line(sh, line);
@@ -1174,16 +1268,22 @@ export fn merc_shell_took(sh: MercShell*, out: MercBuf*) {
   }
   var digits: uint8[24];
   var n: int32 = 0;
-  if (whole == 0) { digits[0] = 48; n = 1; }
+  if (whole == 0) {
+    digits[0] = 48;
+    n = 1;
+  }
+
   while (whole > 0) {
     digits[n] = (uint8)(48 + whole % 10);
     n = n + 1;
     whole = whole / 10;
   }
+
   while (n > 0) {
     n = n - 1;
     merc_buf_push(out, digits[n]);
   }
+
   if (ns >= 1000) {
     merc_buf_push(out, 46);
     merc_buf_push(out, (uint8)(48 + frac / 10));
@@ -1192,9 +1292,7 @@ export fn merc_shell_took(sh: MercShell*, out: MercBuf*) {
   merc_buf_text(out, unit);
 }
 
-// completion: what can come next at the cursor, for a command line that
-// offers it while you type. it reads the trie and never changes it or the
-// shell's zipper.
+// completion at the cursor. it only reads the trie and leaves the zipper alone
 
 export const MERC_CK_COMMAND: int32 = 1;
 export const MERC_CK_MOVE: int32 = 2;
@@ -1241,15 +1339,19 @@ export fn merc_complete_note(cm: MercComplete*, i: int32) -> string {
   return s;
 }
 
-fn cp_add(cm: MercComplete*, kind: int32, from: int64, to: int64, text: string, note: string, count: int64, capped: bool) {
+fn cp_add(cm: MercComplete*, kind: int32, from: int64, to: int64, text: string,
+  note: string, count: int64, capped: bool) {
   for i in 0..cm->n {
     var c: MercCand* = &cm->c[i];
-    if (c->kind == kind && c->text_len == (int64)text.length && memcmp((rawptr)(cm->buf.data + c->text_off), (rawptr)text.chars, (int64)text.length) == 0) {
+    if (c->kind == kind && c->text_len == (int64)text.length &&
+      memcmp((rawptr)(cm->buf.data + c->text_off), (rawptr)text.chars,
+        (int64)text.length) == 0) {
       c->count = c->count + count;
       c->capped = c->capped || capped;
       return;
     }
   }
+
   if (cm->n >= MERC_COMPLETE_MAX) {
     cm->more = true;
     return;
@@ -1299,7 +1401,9 @@ var g_cp_b: CpSt*;
 var g_cp_stack: int64*;
 var g_cp_stack_cap: int64 = 0;
 
-fn cp_label_len(t: MercTrie*, ni: int64) -> int64 { return (int64)merc_node_label(t, (uint32)ni).length; }
+fn cp_label_len(t: MercTrie*, ni: int64) -> int64 {
+  return (int64)merc_node_label(t, (uint32)ni).length;
+}
 
 fn cp_step(t: MercTrie*, s: CpSt*, b: uint8) -> bool {
   var lab: string = merc_node_label(t, (uint32)s->ni);
@@ -1335,6 +1439,7 @@ fn cp_count(t: MercTrie*, cm: MercComplete*, ni: int64, capped: bool*) -> int64 
   g_cp_stack[sp] = ni;
   sp = sp + 1;
   *capped = false;
+
   while (sp > 0) {
     sp = sp - 1;
     var x: int64 = g_cp_stack[sp];
@@ -1358,6 +1463,7 @@ fn cp_count(t: MercTrie*, cm: MercComplete*, ni: int64, capped: bool*) -> int64 
       b = merc_node_next(t, (uint32)x, b + 1);
     }
   }
+
   return n;
 }
 
@@ -1371,7 +1477,8 @@ fn cp_push(cm: MercComplete*, out: CpSt*, n: int32*, s: CpSt*) {
 }
 
 // every way to read one whole expression from s, each end kept as a state
-fn cp_any(t: MercTrie*, cm: MercComplete*, s: CpSt*, left: int64, raw: int64, out: CpSt*, n: int32*) {
+fn cp_any(t: MercTrie*, cm: MercComplete*, s: CpSt*, left: int64, raw: int64,
+  out: CpSt*, n: int32*) {
   if (cm->work > CP_WORK * 6 / 10 || *n >= CP_STATES) {
     cm->more = true;
     return;
@@ -1381,6 +1488,7 @@ fn cp_any(t: MercTrie*, cm: MercComplete*, s: CpSt*, left: int64, raw: int64, ou
     return;
   }
   var b: int32 = cp_next(t, s, 0);
+
   while (b >= 0) {
     var s2: CpSt = *s;
     cm->work = cm->work + 1;
@@ -1415,7 +1523,9 @@ fn cp_syms(t: MercTrie*, cm: MercComplete*, s: CpSt*, p: string, from: int64, to
   }
 }
 
-fn cp_sym_bytes(t: MercTrie*, cm: MercComplete*, s: CpSt*, p: string, len: int64, at: int64, word: uint8*, from: int64, to: int64) {
+fn cp_sym_bytes(t: MercTrie*, cm: MercComplete*, s: CpSt*, p: string,
+
+  len: int64, at: int64, word: uint8*, from: int64, to: int64) {
   if (cm->work > CP_WORK) {
     cm->more = true;
     return;
@@ -1435,6 +1545,7 @@ fn cp_sym_bytes(t: MercTrie*, cm: MercComplete*, s: CpSt*, p: string, len: int64
     b = cp_next(t, s, want);
     if (b != want) { return; }
   }
+
   while (b >= 0) {
     var s2: CpSt = *s;
     cm->work = cm->work + 1;
@@ -1447,7 +1558,9 @@ fn cp_sym_bytes(t: MercTrie*, cm: MercComplete*, s: CpSt*, p: string, len: int64
   }
 }
 
-fn cp_expr(sh: MercShell*, cm: MercComplete*, line: string, start: int64, cursor: int64, pattern: bool) {
+fn cp_expr(sh: MercShell*, cm: MercComplete*, line: string, start: int64,
+
+  cursor: int64, pattern: bool) {
   var t: MercTrie* = &sh->trie;
   if (g_cp_a == 0) {
     g_cp_a = (CpSt*)malloc((int64)CP_STATES * (int64)sizeof(CpSt));
@@ -1466,6 +1579,7 @@ fn cp_expr(sh: MercShell*, cm: MercComplete*, line: string, start: int64, cursor
   na = 1;
   var i: int64 = start;
   var wstart: int64 = cursor;
+
   while (i < cursor) {
     var ch: uint8 = line.chars[i];
     if (cp_space(ch)) {
@@ -1503,7 +1617,10 @@ fn cp_expr(sh: MercShell*, cm: MercComplete*, line: string, start: int64, cursor
       i = i + 1;
     } else {
       var e: int64 = i;
-      while (e < (int64)line.length && !cp_space(line.chars[e]) && line.chars[e] != 40 && line.chars[e] != 41) { e = e + 1; }
+      while (e < (int64)line.length && !cp_space(line.chars[e]) &&
+        line.chars[e] != 40 && line.chars[e] != 41) {
+        e = e + 1;
+      }
       if (e >= cursor) {
         wstart = i;
         break;
@@ -1540,13 +1657,19 @@ fn cp_expr(sh: MercShell*, cm: MercComplete*, line: string, start: int64, cursor
     na = nb;
     if (na == 0) { return; }
   }
+
   var p: string = cp_sub(line, wstart, cursor);
   if (p.length > 0 && p.chars[0] == 36) { return; }
   var room: bool = false;
+
   for k5 in 0..na {
     if (g_cp_a[k5].c[g_cp_a[k5].d - 1] < g_cp_a[k5].n[g_cp_a[k5].d - 1]) { room = true; }
   }
-  if (pattern && p.length == 0 && room) { cp_add(cm, MERC_CK_VARIABLE, wstart, cursor, "$", "any expression", 0, false); }
+
+  if (pattern && p.length == 0 && room) {
+    cp_add(cm, MERC_CK_VARIABLE, wstart, cursor, "$", "any expression", 0, false);
+  }
+
   for k4 in 0..na {
     var st4: CpSt* = &g_cp_a[k4];
     if (st4->c[st4->d - 1] >= st4->n[st4->d - 1]) { continue; }
@@ -1555,11 +1678,14 @@ fn cp_expr(sh: MercShell*, cm: MercComplete*, line: string, start: int64, cursor
 }
 
 fn cp_path(cm: MercComplete*, line: string, start: int64, cursor: int64) {
+
   var word: string = cp_sub(line, start, cursor);
   var slash: int64 = -1;
+
   for i in 0..(int64)word.length {
     if (word.chars[i] == 47) { slash = i; }
   }
+
   var dir: MercBuf;
   var base: string = word;
   var base_at: int64 = start;
@@ -1587,9 +1713,12 @@ fn cp_path(cm: MercComplete*, line: string, start: int64, cursor: int64) {
   var rank: int32[256];
   var nn: int32 = 0;
   var e: FsDirEntry;
+
   while (fs_dir_next(&fd, &e) > 0 && nn < 256) {
     if (!cp_starts(e.name, base)) { continue; }
-    if (e.name.length > 0 && e.name.chars[0] == 46 && (base.length == 0 || base.chars[0] != 46)) { continue; }
+    if (e.name.length > 0 && e.name.chars[0] == 46 && (base.length == 0 || base.chars[0] != 46)) {
+      continue;
+    }
     var is_dir: bool = e.kind == FS_DIR;
     if (e.kind == FS_SYMLINK) {
       var full: MercBuf;
@@ -1613,9 +1742,11 @@ fn cp_path(cm: MercComplete*, line: string, start: int64, cursor: int64) {
     rank[nn] = r;
     nn = nn + 1;
   }
+
   fs_dir_close(&fd);
   var order: int32[256];
   for k in 0..nn { order[k] = k; }
+
   for a in 1..nn {
     var cur: int32 = order[a];
     var b: int32 = a - 1;
@@ -1625,17 +1756,22 @@ fn cp_path(cm: MercComplete*, line: string, start: int64, cursor: int64) {
     }
     order[b + 1] = cur;
   }
+
   for k2 in 0..nn {
     var o: int32 = order[k2];
     var note: string = "";
     if (names.data[offs[o] + lens[o] - 1] == 47) { note = "folder"; }
-    cp_add(cm, MERC_CK_PATH, base_at, cursor, cp_sub(merc_buf_view(&names), offs[o], offs[o] + lens[o]), note, 0, false);
+    cp_add(cm, MERC_CK_PATH, base_at, cursor,
+      cp_sub(merc_buf_view(&names), offs[o], offs[o] + lens[o]),
+      note, 0, false);
   }
+
   merc_buf_free(&names);
   merc_buf_free(&dir);
 }
 
-fn cp_before(names: MercBuf*, offs: int64*, lens: int64*, rank: int32*, a: int32, b: int32) -> bool {
+fn cp_before(names: MercBuf*, offs: int64*, lens: int64*, rank: int32*,
+  a: int32, b: int32) -> bool {
   if (rank[a] != rank[b]) { return rank[a] < rank[b]; }
   var la: int64 = lens[a];
   var lb: int64 = lens[b];
@@ -1653,7 +1789,8 @@ fn cp_sort_syms(cm: MercComplete*) {
   for a in 1..cm->n {
     var cur: MercCand = cm->c[a];
     var b: int32 = a - 1;
-    while (b >= 0 && cm->c[b].kind == MERC_CK_SYMBOL && cur.kind == MERC_CK_SYMBOL && cm->c[b].count < cur.count) {
+    while (b >= 0 && cm->c[b].kind == MERC_CK_SYMBOL &&
+      cur.kind == MERC_CK_SYMBOL && cm->c[b].count < cur.count) {
       cm->c[b + 1] = cm->c[b];
       b = b - 1;
     }
@@ -1662,7 +1799,8 @@ fn cp_sort_syms(cm: MercComplete*) {
 }
 
 fn cp_is_pattern(cmd: string) -> bool {
-  return sh_is(cmd, "match") || sh_is(cmd, "find") || sh_is(cmd, "count") || sh_is(cmd, "transform") || sh_is(cmd, "save");
+  return sh_is(cmd, "match") || sh_is(cmd, "find") || sh_is(cmd, "count") ||
+    sh_is(cmd, "transform") || sh_is(cmd, "save");
 }
 
 export fn merc_shell_complete(sh: MercShell*, line: string, cursor: int64, out: MercComplete*) {
@@ -1704,7 +1842,9 @@ export fn merc_shell_complete(sh: MercShell*, line: string, cursor: int64, out: 
     if (cur <= e) {
       var mp: string = cp_sub(line, a0, cur);
       for m in 0..SH_MOVES - 1 {
-        if (cp_starts(g_move_table[m].name, mp)) { cp_add(out, MERC_CK_MOVE, a0, cur, g_move_table[m].name, g_move_table[m].note, 0, false); }
+        if (cp_starts(g_move_table[m].name, mp)) {
+          cp_add(out, MERC_CK_MOVE, a0, cur, g_move_table[m].name, g_move_table[m].note, 0, false);
+        }
       }
       return;
     }
@@ -1718,11 +1858,18 @@ export fn merc_shell_complete(sh: MercShell*, line: string, cursor: int64, out: 
   }
   if (sh_is(cmd, "gpu") || sh_is(cmd, "help")) {
     var gp: string = cp_sub(line, a0, cur);
-    for g in 0..cur - a0 { if (cp_space(gp.chars[g])) { return; } }
+    for g in 0..cur - a0 {
+      if (cp_space(gp.chars[g])) { return; }
+    }
     if (sh_is(cmd, "gpu")) {
       var opts: string[3] = ["on", "off", "auto"];
-      var notes: string[3] = ["always scan the flat copy", "always walk the trie", "scan when it pays"];
-      for o in 0..3 { if (cp_starts(opts[o], gp)) { cp_add(out, MERC_CK_MOVE, a0, cur, opts[o], notes[o], 0, false); } }
+      var notes: string[3] = ["always scan the flat copy", "always walk the trie",
+        "scan when it pays"];
+      for o in 0..3 {
+        if (cp_starts(opts[o], gp)) {
+          cp_add(out, MERC_CK_MOVE, a0, cur, opts[o], notes[o], 0, false);
+        }
+      }
     } else if (cp_starts("all", gp)) {
       cp_add(out, MERC_CK_MOVE, a0, cur, "all", "every command", 0, false);
     }

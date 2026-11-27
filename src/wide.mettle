@@ -1,8 +1,5 @@
-// a big rule step on several cores. the step is cut into parts, each part
-// runs on its own, and the step puts their writes together, so the result
-// is the one a single core gives. the cores are alph threads that stay
-// alive between steps and sleep while there is nothing to do. the engine
-// itself never needs alph, merc run and the shell's go turn this on.
+// a big rule step cut into parts on several cores, with the writes merged so
+// the result is what one core gives. merc run and the shell's go turn it on.
 
 import "alph/sys/atomic";
 import "alph/sys/thread";
@@ -60,9 +57,8 @@ fn wide_worker(id: int64) -> int64 {
   return 0;
 }
 
-// a thread late from the last batch must not take a part of this one by an
-// old number, so nothing is handed out until every thread is out and the
-// counter is past any total.
+// a thread late from the last batch must not take a part by an old number,
+// so nothing goes out until all threads leave and the counter passes any total.
 fn wide_each(parts: int64, job: fn(int64) -> void) {
   alph_atomic_store_sc(&g_wide_next, 0x4000000000000000);
   while (alph_atomic_load(&g_wide_busy) != 0) { alph_cpu_relax(); }
@@ -84,9 +80,8 @@ fn wide_spread(r: MercRun*, parts: int64) -> bool {
   return true;
 }
 
-// printing: the keys are cut into ranges by their first bytes, each range is
-// written as text on any core into its own buffer, and the buffers go out in
-// key order, the same bytes one core writes.
+// printing cuts the keys into ranges by first bytes, writes each range on any
+// core into its own buffer and sends the buffers out in key order.
 var g_print_trie: MercTrie*;
 var g_print_pref: MercBuf;
 var g_print_at: MercBuf;
@@ -174,6 +169,7 @@ fn print_cut(t: MercTrie*) -> int64 {
     merc_buf_add(&g_print_at, at.data, at.len);
     if (!grew) { break; }
   }
+
   merc_zip_free(&z);
   merc_buf_free(&bytes);
   merc_buf_free(&at);
@@ -198,6 +194,7 @@ export fn merc_wide_print(t: MercTrie*, emit: fn(uint8*, int64) -> void) {
     e[1] = 0;
     merc_buf_add(&g_print_at, (uint8*)&e[0], 16);
   }
+
   g_print_emit = emit;
   merc_buf_clear(&g_print_lo);
   for i: int64 in 0..(ranges + 1) {
@@ -206,16 +203,21 @@ export fn merc_wide_print(t: MercTrie*, emit: fn(uint8*, int64) -> void) {
   }
   g_print_trie = t;
   g_print_out = (MercBuf*)calloc(ranges, sizeof(MercBuf));
-  if (ranges > 1) { wide_each(ranges, &print_range); } else { print_range(0); }
+  if (ranges > 1) {
+    wide_each(ranges, &print_range);
+  } else {
+    print_range(0);
+  }
   for i2: int64 in 0..ranges {
-    if (g_print_out[i2].len > 0) { emit(g_print_out[i2].data, g_print_out[i2].len); }
+    if (g_print_out[i2].len > 0) {
+      emit(g_print_out[i2].data, g_print_out[i2].len);
+    }
     merc_buf_free(g_print_out + i2);
   }
   free(g_print_out);
 }
 
-// starts cores less one threads, the calling thread being the last core,
-// and lets r spread its big steps over them.
+// starts cores less one threads, the calling thread is the last core.
 export fn merc_wide_start(r: MercRun*, cores: int64) {
   if (cores < 2) { return; }
   if (g_wide_count == 0) {
@@ -223,7 +225,8 @@ export fn merc_wide_start(r: MercRun*, cores: int64) {
     if (n > WIDE_MAX) { n = WIDE_MAX; }
     alph_atomic_store_sc(&g_wide_quit, 0);
     for i: int64 in 0..n {
-      g_wide_handles[i] = alph_thread_start(&g_wide_threads[i], &wide_worker, i, 1048576);
+      g_wide_handles[i] = alph_thread_start(&g_wide_threads[i], &wide_worker,
+          i, 1048576);
       if (g_wide_handles[i] != 0) { g_wide_count = g_wide_count + 1; }
     }
   }
@@ -239,7 +242,9 @@ export fn merc_wide_stop() {
   alph_atomic_add(&g_wide_gen, 1);
   futex(&g_wide_gen, 129, 1000);
   for i: int64 in 0..g_wide_count {
-    if (g_wide_handles[i] != 0) { alph_thread_join(g_wide_handles[i], &g_wide_threads[i]); }
+    if (g_wide_handles[i] != 0) {
+      alph_thread_join(g_wide_handles[i], &g_wide_threads[i]);
+    }
   }
   g_wide_count = 0;
 }

@@ -1,7 +1,5 @@
-// the window. the trie is drawn as text, one row per expression, with the
-// zipper as a caret in it. commands come from the console, from files, from a
-// file being appended to, or from stdin. alph actors read those on other
-// threads and only the window thread touches the trie.
+// the window. the trie drawn as text, one row per expression, zipper as caret.
+// commands come in on alph actors and only the window thread touches the trie.
 
 import "std/io";
 import "std/mem";
@@ -101,7 +99,10 @@ fn hm_grow(m: HMap*) {
       hm_put(m, old_k[i], old_v[i]);
     }
   }
-  if (old_k != 0) { free(old_k); free(old_v); }
+  if (old_k != 0) {
+    free(old_k);
+    free(old_v);
+  }
 }
 
 fn hm_put(m: HMap*, k0: uint64, v: int64) {
@@ -159,7 +160,10 @@ fn keyh_set(k: KeyH*, s: string) {
   merc_buf_free(&tmp);
   if (k->h == 0) { k->h = (uint64*)malloc((MAX_KEY + 1) * 8); }
   var n: int64 = k->key.len;
-  if (n > MAX_KEY) { n = MAX_KEY; k->key.len = MAX_KEY; }
+  if (n > MAX_KEY) {
+    n = MAX_KEY;
+    k->key.len = MAX_KEY;
+  }
   k->h[0] = FNV0;
   for i: int64 in 0..n {
     k->h[i + 1] = hstep(k->h[i], k->key.data[i]);
@@ -183,18 +187,30 @@ fn fmt_i(v: int64) {
   var digits: uint8[24];
   var n: int32 = 0;
   var u: int64 = v;
-  if (u < 0) { fmt_c(45); u = 0 - u; }
-  if (u == 0) { digits[0] = 48; n = 1; }
+  if (u < 0) {
+    fmt_c(45);
+    u = 0 - u;
+  }
+  if (u == 0) {
+    digits[0] = 48;
+    n = 1;
+  }
   while (u > 0) {
     digits[n] = (uint8)(48 + (int32)(u % 10));
     n = n + 1;
     u = u / 10;
   }
-  while (n > 0) { n = n - 1; merc_buf_push(&g_fmt, digits[n]); }
+  while (n > 0) {
+    n = n - 1;
+    merc_buf_push(&g_fmt, digits[n]);
+  }
 }
 
 fn fmt_group(v: int64) {
-  if (v < 1000) { fmt_i(v); return; }
+  if (v < 1000) {
+    fmt_i(v);
+    return;
+  }
   fmt_group(v / 1000);
   fmt_c(44);
   var r: int64 = v % 1000;
@@ -239,8 +255,13 @@ fn trim(s: string) -> string {
   var p: uint8* = s.chars;
   var n: int64 = (int64)s.length;
   var i: int64 = 0;
-  while (i < n && (p[i] == 32 || p[i] == 9 || p[i] == 13 || p[i] == 10)) { i = i + 1; }
-  while (n > i && (p[n - 1] == 32 || p[n - 1] == 9 || p[n - 1] == 13 || p[n - 1] == 10)) { n = n - 1; }
+  while (i < n && (p[i] == 32 || p[i] == 9 || p[i] == 13 || p[i] == 10)) {
+    i = i + 1;
+  }
+  while (n > i &&
+      (p[n - 1] == 32 || p[n - 1] == 9 || p[n - 1] == 13 || p[n - 1] == 10)) {
+    n = n - 1;
+  }
   var r: string;
   r.chars = p + i;
   r.length = (uint64)(n - i);
@@ -263,7 +284,9 @@ fn fmt_partial(key: string, out: MercBuf*) {
   while (i < n) {
     var tag: uint8 = p[i];
     i = i + 1;
-    if (out->len > 0 && out->data[out->len - 1] != 40) { merc_buf_push(out, 32); }
+    if (out->len > 0 && out->data[out->len - 1] != 40) {
+      merc_buf_push(out, 32);
+    }
     if (depth > 0) {
       left[depth - 1] = left[depth - 1] - 1;
     }
@@ -305,8 +328,11 @@ fn fmt_partial(key: string, out: MercBuf*) {
       depth = depth - 1;
     }
   }
+
   if (depth > 0) {
-    if (out->len > 0 && out->data[out->len - 1] != 40) { merc_buf_push(out, 32); }
+    if (out->len > 0 && out->data[out->len - 1] != 40) {
+      merc_buf_push(out, 32);
+    }
     merc_buf_text(out, "..");
   }
 }
@@ -429,7 +455,9 @@ fn rd_hold(r: Reader*, rec: uint8*) {
 fn rd_flush(r: Reader*) -> bool {
   var sent: int64 = 0;
   while (sent < r->held_n) {
-    if (g_ui_node.send(g_keeper, T_LINE, (Word)r->held[sent]) != ALPH_OK) { break; }
+    if (g_ui_node.send(g_keeper, T_LINE, (Word)r->held[sent]) != ALPH_OK) {
+      break;
+    }
     sent = sent + 1;
   }
   if (sent > 0) {
@@ -631,6 +659,7 @@ fn log_out(b: MercBuf*) {
     fmt_s(" earlier lines not shown)");
     log_s(fmt_view(), LL_NOTE);
   }
+
   var from: int64 = 0;
   var k: int64 = 0;
   for i: int64 in 0..n + 1 {
@@ -892,6 +921,7 @@ fn rows_index() {
     g_rows_n = g_rows_n + 1;
     i = i + 4 + (int64)len32;
   }
+
   if (!g_sh.inside) { return; }
   g_span_at = (int64*)realloc((rawptr)g_span_at, g_rows_cap * 8);
   g_row_id = (int64*)realloc((rawptr)g_row_id, g_rows_cap * 8);
@@ -910,7 +940,11 @@ fn row_of_id(id: int64) -> int64 {
   while (lo <= hi) {
     var mid: int64 = (lo + hi) / 2;
     if (g_row_id[mid] == id) { return mid; }
-    if (g_row_id[mid] < id) { lo = mid + 1; } else { hi = mid - 1; }
+    if (g_row_id[mid] < id) {
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
   }
   return -1;
 }
@@ -969,7 +1003,10 @@ fn lv_set(mode: int32, v: int32, entry: int64) {
   } else if (mode == 2) {
     var mark: uint8* = (uint8*)calloc(g_rows_n + 1, 1);
     for r: int64 in 0..g_vt_rows {
-      if (g_row_entry[r * (int64)VT_MAX + (int64)v] == entry && g_occ_row[r] < g_rows_n) { mark[g_occ_row[r]] = 1; }
+      if (g_row_entry[r * (int64)VT_MAX + (int64)v] == entry &&
+          g_occ_row[r] < g_rows_n) {
+        mark[g_occ_row[r]] = 1;
+      }
     }
     for r2: int64 in 0..g_rows_n {
       if (mark[r2] != 0) { list_push(r2); }
@@ -1058,7 +1095,9 @@ fn vt_note(v3: int32, bind: MercBuf*) {
   e->v = v3;
   e->count = 1;
   e->off = g_vtext.len;
-  if (!merc_format(merc_buf_view(bind), &g_vtext, (MercNames*)0)) { fmt_partial(merc_buf_view(bind), &g_vtext); }
+  if (!merc_format(merc_buf_view(bind), &g_vtext, (MercNames*)0)) {
+    fmt_partial(merc_buf_view(bind), &g_vtext);
+  }
   if (g_vtext.len - e->off > 160) { g_vtext.len = e->off + 160; }
   e->len = g_vtext.len - e->off;
   hm_put(&g_vmap[v3], h, g_ve_n);
@@ -1139,6 +1178,7 @@ fn var_table() {
       }
     }
   }
+
   merc_buf_free(&bind);
   merc_query_free(&q);
   merc_buf_free(&pb);
@@ -1238,7 +1278,9 @@ fn note_result(tl: string) {
     merc_buf_text(&g_step_line, merc_buf_view(&tmp));
     merc_buf_clear(&g_step_took);
     merc_buf_text(&g_step_took, merc_buf_view(&g_took));
-  } else if (kind == MERC_DID_SEARCH && g_sh.inside && (out_line_with(" places in ", &tmp) || out_line_with(" place in ", &tmp))) {
+  } else if (kind == MERC_DID_SEARCH && g_sh.inside &&
+      (out_line_with(" places in ", &tmp) ||
+          out_line_with(" place in ", &tmp))) {
     var at2: int64 = 0;
     var v2: string = merc_buf_view(&tmp);
     g_find_found = first_num(v2, &at2);
@@ -1257,6 +1299,7 @@ fn note_result(tl: string) {
     merc_buf_clear(&g_save_line);
     merc_buf_text(&g_save_line, merc_buf_view(&tmp));
   }
+
   merc_buf_free(&tmp);
 }
 
@@ -1332,9 +1375,12 @@ fn run_end(line: string, animate: bool) {
   if (!g_rl_quiet) {
     var tn: int64 = g_took.len;
     if (tn > 15) { tn = 15; }
-    if (tn > 0) { memcpy((rawptr)&g_log[echo_slot].took[0], (rawptr)g_took.data, tn); }
+    if (tn > 0) {
+      memcpy((rawptr)&g_log[echo_slot].took[0], (rawptr)g_took.data, tn);
+    }
     g_log[echo_slot].took_len = (int32)tn;
   }
+
   note_result(tl);
   if (has_prefix(tl, "load ") && g_sh.kind == MERC_DID_BULK) {
     var path: string = trim(cut(tl, 5));
@@ -1355,6 +1401,7 @@ fn run_end(line: string, animate: bool) {
   } else {
     log_out(&g_sh.out);
   }
+
   merc_buf_clear(&g_sh.out);
   if (has_prefix(trim(line), "help")) {
     log_s("in this window", LL_NOTE);
@@ -1363,10 +1410,13 @@ fn run_end(line: string, animate: bool) {
     log_s("  s runs one rule, g runs them all, esc stops", LL_NOTE);
     log_s("  ctrl+l makes the log tall, then closed, then back", LL_NOTE);
     log_s("  b hides the panel, shift+b moves it to the other side", LL_NOTE);
-    log_s("  drag the lines between parts to resize, double click resets", LL_NOTE);
+    log_s("  drag the lines between parts to resize, double click resets",
+        LL_NOTE);
     log_s("  drag or shift+wheel moves the tree sideways", LL_NOTE);
-    log_s("  click a folded count to open it, click a word to fold it", LL_NOTE);
+    log_s("  click a folded count to open it, click a word to fold it",
+        LL_NOTE);
   }
+
   var kind: int32 = g_sh.kind;
   g_last_kind = kind;
   var touched: string = merc_buf_view(&g_sh.touched);
@@ -1410,6 +1460,7 @@ fn run_end(line: string, animate: bool) {
   } else if (kind == MERC_DID_BULK) {
     if (was_count == 0) { g_fit_wanted = true; }
   }
+
   if (g_anim_kind != AN_NONE) {
     g_anim_t0 = g_now;
     if (!animate) { g_anim_t0 = g_now - 10.0; }
@@ -1451,7 +1502,9 @@ fn rules_scan() {
     if (g_rules_n == 0) { merc_buf_text(&g_first_rule, merc_zip_path(&z)); }
     if (g_rule_shown < 6) {
       var off: int64 = g_rule_txt.len;
-      if (!merc_format(merc_zip_path(&z), &g_rule_txt, (MercNames*)0)) { fmt_partial(merc_zip_path(&z), &g_rule_txt); }
+      if (!merc_format(merc_zip_path(&z), &g_rule_txt, (MercNames*)0)) {
+        fmt_partial(merc_zip_path(&z), &g_rule_txt);
+      }
       if (g_rule_txt.len - off > 200) { g_rule_txt.len = off + 200; }
       g_rule_off[g_rule_shown] = off;
       g_rule_len[g_rule_shown] = g_rule_txt.len - off;
@@ -1464,6 +1517,7 @@ fn rules_scan() {
     }
     more = merc_zip_next_value(&z, 6);
   }
+
   merc_zip_free(&z);
 }
 
@@ -1471,7 +1525,11 @@ fn go_done() {
   g_go = false;
   fmt_reset();
   fmt_group(g_go_ran);
-  if (g_go_ran == 1) { fmt_s(" rule ran"); } else { fmt_s(" rules ran"); }
+  if (g_go_ran == 1) {
+    fmt_s(" rule ran");
+  } else {
+    fmt_s(" rules ran");
+  }
   log_s(fmt_view(), LL_NOTE);
 }
 
@@ -1497,6 +1555,7 @@ fn pump_queue() {
     }
     return;
   }
+
   g_wait_said = false;
   if (g_del_t0 >= 0.0) {
     if (g_now - g_del_t0 < DEL_FLASH_S) { return; }
@@ -1512,6 +1571,7 @@ fn pump_queue() {
     run_line(line_view(r), true);
     free((rawptr)r);
   }
+
   if (g_q_len == 0) { return; }
   var t0: int64 = time_mono_ns();
   var done: int64 = 0;
@@ -1537,7 +1597,8 @@ fn pump_queue() {
         return;
       }
     }
-    if (last && pre_parse(line, &verb) && verb == 2 && merc_has(trie(), merc_buf_view(&g_pbuf))) {
+    if (last && pre_parse(line, &verb) && verb == 2 &&
+        merc_has(trie(), merc_buf_view(&g_pbuf))) {
       keyh_set(&g_del, merc_buf_view(&g_pbuf));
       g_del_t0 = g_now;
       g_del_line = one;
@@ -1665,6 +1726,7 @@ fn count_below(ni: int64, h_end: uint64, cap: int64, capped: bool*) -> int64 {
       return n0;
     }
   }
+
   var budget: int64 = COUNT_WORK;
   if (g_q_len > 0) { budget = COUNT_WORK / 4; }
   if (g_count_work > budget) {
@@ -1693,6 +1755,7 @@ fn count_below(ni: int64, h_end: uint64, cap: int64, capped: bool*) -> int64 {
       b = merc_node_next(t, (uint32)x, b + 1);
     }
   }
+
   var enc: int64 = n * 2;
   if (cut_off) { enc = enc + 1; }
   hm_put(&g_counts, h_end, enc);
@@ -1775,7 +1838,12 @@ fn paren_scan(p: uint8*, n: int64) {
     var hs: bool = g_next_head;
     g_next_head = false;
     if (tag < 64) {
-      if (tag == 0) { paren_close(); } else { paren_push((int32)tag); g_next_head = true; }
+      if (tag == 0) {
+        paren_close();
+      } else {
+        paren_push((int32)tag);
+        g_next_head = true;
+      }
     } else if (tag > 0xC0) {
       var len: int64 = (int64)(tag & 63);
       if (i + len > n) {
@@ -1791,7 +1859,8 @@ fn paren_scan(p: uint8*, n: int64) {
   }
 }
 
-fn add_cell(vn: int32, kind: int32, d0: int64, d1: int64, h0: uint64, h1: uint64, toff: int64) {
+fn add_cell(vn: int32, kind: int32, d0: int64, d1: int64, h0: uint64,
+    h1: uint64, toff: int64) {
   var c: VCell* = &g_cells[g_nc];
   c->vn = vn;
   c->kind = kind;
@@ -1812,7 +1881,8 @@ fn prefix_hash(upto: int64) -> uint64 {
   return h;
 }
 
-fn tokenize(vn: int32, seg: uint8*, n: int64, start: int64, raw_in: int32, pend_in: int64, h_in: uint64, h_out: uint64*, pend_out: int64*) -> int32 {
+fn tokenize(vn: int32, seg: uint8*, n: int64, start: int64, raw_in: int32,
+    pend_in: int64, h_in: uint64, h_out: uint64*, pend_out: int64*) -> int32 {
   var raw: int32 = raw_in;
   var pend: int64 = pend_in;
   var pend_h: uint64 = 0;
@@ -1823,7 +1893,11 @@ fn tokenize(vn: int32, seg: uint8*, n: int64, start: int64, raw_in: int32, pend_
   while (i < n) {
     if (g_nc >= CELL_HARD) {
       g_truncated = true;
-      while (i < n) { h = hstep(h, seg[i]); merc_buf_push(&g_walk, seg[i]); i = i + 1; }
+      while (i < n) {
+        h = hstep(h, seg[i]);
+        merc_buf_push(&g_walk, seg[i]);
+        i = i + 1;
+      }
       break;
     }
     var d0: int64 = start + i;
@@ -1863,7 +1937,9 @@ fn tokenize(vn: int32, seg: uint8*, n: int64, start: int64, raw_in: int32, pend_
         paren_push((int32)tag);
         if (first && g_alt_first) {
           merc_buf_push(&g_txt, 40);
-          if (tag >= 10) { merc_buf_push(&g_txt, (uint8)(48 + (int32)tag / 10)); }
+          if (tag >= 10) {
+            merc_buf_push(&g_txt, (uint8)(48 + (int32)tag / 10));
+          }
           merc_buf_push(&g_txt, (uint8)(48 + (int32)tag % 10));
           add_cell(vn, CK_ARITY, d0, start + i, h0, h, toff);
         }
@@ -1899,6 +1975,7 @@ fn tokenize(vn: int32, seg: uint8*, n: int64, start: int64, raw_in: int32, pend_
     }
     first = false;
   }
+
   *h_out = h;
   *pend_out = pend;
   return raw;
@@ -1914,7 +1991,9 @@ fn want_open(ni: int64, h_end: uint64, on_focus: bool, level: int32) -> bool {
   if (g_results && g_nc < CELL_SOFT) { return true; }
   if (g_nc > CELL_SOFT || g_nv > MAX_V - 200) { return false; }
   if (level == 0) { return true; }
-  if (merc_node_children(vtrie(), (uint32)ni) == 1 && g_nc < CELL_SOFT / 2) { return true; }
+  if (merc_node_children(vtrie(), (uint32)ni) == 1 && g_nc < CELL_SOFT / 2) {
+    return true;
+  }
   var small: int64 = 40;
   if (focus_on()) {
     small = 6;
@@ -1942,8 +2021,12 @@ fn add_ghost(vi: int32, level: int32) {
   g_ghost_vn = (int64)gi;
 }
 
-fn build(ni: int64, edge: int32, parent: int32, start: int64, raw_in: int32, pend_in: int64, h_in: uint64, on_focus_in: bool, level: int32) {
-  if (g_nv >= MAX_V - 3) { g_truncated = true; return; }
+fn build(ni: int64, edge: int32, parent: int32, start: int64, raw_in: int32,
+    pend_in: int64, h_in: uint64, on_focus_in: bool, level: int32) {
+  if (g_nv >= MAX_V - 3) {
+    g_truncated = true;
+    return;
+  }
   var t: MercTrie* = vtrie();
   var vi: int32 = new_vnode(VK_NODE, parent, level);
   g_vn[vi].ni = ni;
@@ -1959,7 +2042,8 @@ fn build(ni: int64, edge: int32, parent: int32, start: int64, raw_in: int32, pen
   g_alt_first = parent >= 0 && g_vn[parent].nkids > 1;
   var h_end: uint64 = h_in;
   var pend: int64 = -1;
-  var raw: int32 = tokenize(vi, seg.data, seg.len, start, raw_in, pend_in, h_in, &h_end, &pend);
+  var raw: int32 = tokenize(vi, seg.data, seg.len, start, raw_in, pend_in,
+      h_in, &h_end, &pend);
   var end: int64 = start + seg.len;
   merc_buf_free(&seg);
   var v: VNode* = &g_vn[vi];
@@ -1971,11 +2055,16 @@ fn build(ni: int64, edge: int32, parent: int32, start: int64, raw_in: int32, pen
   v->value = val;
   v->nkids = merc_node_children(t, (uint32)ni);
   var on_focus: bool = on_focus_in && keyh_has(&g_focus, end, h_end);
-  var zip_here: bool = g_ghost_vn < 0 && g_zip_m < g_zip.key.len && start <= g_zip_m && g_zip_m <= end && keyh_has(&g_zip, start, h_in);
-  if (zip_here && edge >= 0 && (int32)g_zip.key.data[start] != edge) { zip_here = false; }
+  var zip_here: bool = g_ghost_vn < 0 && g_zip_m < g_zip.key.len &&
+      start <= g_zip_m && g_zip_m <= end && keyh_has(&g_zip, start, h_in);
+  if (zip_here && edge >= 0 && (int32)g_zip.key.data[start] != edge) {
+    zip_here = false;
+  }
   if (zip_here && g_zip_m == end && g_zip_m < g_zip.key.len) {
     var nb: int32 = (int32)g_zip.key.data[g_zip_m];
-    if (v->nkids > 0 && merc_node_child(t, (uint32)ni, (uint8)nb) >= 0) { zip_here = false; }
+    if (v->nkids > 0 && merc_node_child(t, (uint32)ni, (uint8)nb) >= 0) {
+      zip_here = false;
+    }
   }
   if (v->nkids > 0) {
     v->expanded = want_open(ni, h_end, on_focus, level);
@@ -1989,9 +2078,13 @@ fn build(ni: int64, edge: int32, parent: int32, start: int64, raw_in: int32, pen
       var extra: int64 = 0;
       if (hm_get(&g_more, h_end, &extra)) { limit = limit + extra; }
       var fb: int32 = -1;
-      if (on_focus && g_focus.key.len > end) { fb = (int32)g_focus.key.data[end]; }
+      if (on_focus && g_focus.key.len > end) {
+        fb = (int32)g_focus.key.data[end];
+      }
       var zb: int32 = -1;
-      if (keyh_has(&g_zip, end, h_end) && g_zip.key.len > end) { zb = (int32)g_zip.key.data[end]; }
+      if (keyh_has(&g_zip, end, h_end) && g_zip.key.len > end) {
+        zb = (int32)g_zip.key.data[end];
+      }
       var shown: int64 = 0;
       var b: int32 = merc_node_next(t, (uint32)ni, 0);
       var fb_seen: bool = false;
@@ -2008,7 +2101,9 @@ fn build(ni: int64, edge: int32, parent: int32, start: int64, raw_in: int32, pen
             shown = shown + 1;
           }
         }
-        if (shown >= limit && (fb < 0 || fb_seen) && (zb < 0 || b >= zb)) { break; }
+        if (shown >= limit && (fb < 0 || fb_seen) && (zb < 0 || b >= zb)) {
+          break;
+        }
         b = merc_node_next(t, (uint32)ni, b + 1);
       }
       var hidden: int64 = (int64)g_vn[vi].nkids - shown;
@@ -2042,6 +2137,7 @@ fn build(ni: int64, edge: int32, parent: int32, start: int64, raw_in: int32, pen
       g_vn[si].h_end = hstep(h_end, 0x53);
     }
   }
+
   if (zip_here && g_ghost_vn < 0) { add_ghost(vi, level); }
   g_walk.len = walk0;
 }
@@ -2075,7 +2171,9 @@ fn step_size(step: int32) -> float32 {
   return 15.0;
 }
 
-fn is_junction(v: VNode*) -> bool { return v->kind == VK_NODE && v->ncells == 0 && v->parent >= 0; }
+fn is_junction(v: VNode*) -> bool {
+  return v->kind == VK_NODE && v->ncells == 0 && v->parent >= 0;
+}
 
 fn adv_of(size: float32) -> float32 { return g_adv * size / 12.0; }
 
@@ -2152,7 +2250,9 @@ fn sort_kids(vi: int32) {
       sorted = c;
     } else {
       var at: int32 = sorted;
-      while (g_vn[at].next >= 0 && kid_rank(&g_vn[g_vn[at].next]) >= rk) { at = g_vn[at].next; }
+      while (g_vn[at].next >= 0 && kid_rank(&g_vn[g_vn[at].next]) >= rk) {
+        at = g_vn[at].next;
+      }
       g_vn[c].next = g_vn[at].next;
       g_vn[at].next = c;
     }
@@ -2181,6 +2281,7 @@ fn measure(vi: int32) {
     }
     c2 = g_vn[c2].next;
   }
+
   v->vkids = vk;
   sort_kids(vi);
   if (v->kind == VK_STUB) {
@@ -2200,6 +2301,7 @@ fn measure(vi: int32) {
   } else {
     if (v->has_value) { est = est + 1; }
   }
+
   v->est = est;
   v->step = 0;
   if (est >= 2) { v->step = 1; }
@@ -2218,6 +2320,7 @@ fn measure(vi: int32) {
     x = x + c->tw;
     c->closers = 0;
   }
+
   v->w = x + value_w(v);
 }
 
@@ -2226,7 +2329,10 @@ fn bare_open(c: VCell*) -> bool { return c->kind == CK_ARITY && c->tlen == 1; }
 fn child_gap(v: VNode*) -> float32 {
   if (is_junction(v)) { return 0.0; }
   if (v->vkids > 1) { return 26.0; }
-  if (v->ncells > 0 && v->vkids == 1 && bare_open(&g_cells[v->cell0 + v->ncells - 1])) { return 0.0; }
+  if (v->ncells > 0 && v->vkids == 1 &&
+      bare_open(&g_cells[v->cell0 + v->ncells - 1])) {
+    return 0.0;
+  }
   if (v->ncells == 0) { return 0.0; }
   return adv_of(step_size(v->step));
 }
@@ -2303,11 +2409,17 @@ fn ease_positions(dt: float32) {
       if (mythic_absf(v->dx - v->x) < 0.3) { v->dx = v->x; }
       if (mythic_absf(v->dy - v->y) < 0.3) { v->dy = v->y; }
       var bt: int64 = 0;
-      if (hm_get(&g_born, key, &bt)) { v->born = (float64)bt / 1000.0; } else { v->born = -100.0; }
+      if (hm_get(&g_born, key, &bt)) {
+        v->born = (float64)bt / 1000.0;
+      } else {
+        v->born = -100.0;
+      }
     } else {
       v->dx = v->x;
       v->dy = v->y;
-      if (v->parent >= 0 && !g_reduced && g_cam_set) { v->dy = g_vn[v->parent].dy; }
+      if (v->parent >= 0 && !g_reduced && g_cam_set) {
+        v->dy = g_vn[v->parent].dy;
+      }
       v->born = -100.0;
       if (g_cam_set) { v->born = g_now; }
       if (!changed && g_cam_set) { v->born = g_now - 50.0; }
@@ -2325,6 +2437,7 @@ fn ease_positions(dt: float32) {
     hm_put(&g_pos2, key, pack_xy(v->dx, v->dy));
     hm_put(&g_born2, key, (int64)(v->born * 1000.0));
   }
+
   var tp: HMap = g_pos;
   g_pos = g_pos2;
   g_pos2 = tp;
@@ -2389,12 +2502,14 @@ fn layout() {
     }
     v->veiled = true;
     g_prefix_vn = (int64)pv;
-    if (v->first >= 0 && v->first == v->last && g_vn[v->first].kind == VK_NODE) {
+    if (v->first >= 0 && v->first == v->last &&
+        g_vn[v->first].kind == VK_NODE) {
       pv = v->first;
     } else {
       break;
     }
   }
+
   if (syms == 0 || g_vn[g_prefix_vn].vkids < 2) {
     var u: int32 = 0;
     while (u >= 0 && (int64)u <= g_prefix_vn) {
@@ -2421,6 +2536,7 @@ fn layout() {
       q = g_vn[q].first;
     }
   }
+
   g_layout_ms = (float64)(time_mono_ns() - t0) / 1000000.0;
   if (g_layout_ms > g_layout_max) { g_layout_max = g_layout_ms; }
 }
@@ -2468,7 +2584,8 @@ fn cam_fit() {
   var w: float32 = 0.0;
   var h: float32 = 0.0;
   tree_extent(&w, &h);
-  var z: float32 = mythic_minf(g_canvas.w / (w + 60.0), g_canvas.h / (h + 40.0));
+  var z: float32 = mythic_minf(g_canvas.w / (w + 60.0),
+      g_canvas.h / (h + 40.0));
   g_zoom = mythic_clampf(z, MIN_ZOOM, 1.25);
   if (z < MIN_ZOOM) { g_zoom = 1.0; }
   g_cam_x = -LEFT_PAD / g_zoom;
@@ -2510,9 +2627,13 @@ fn cam_focus() {
   var vh: float32 = g_canvas.h / g_zoom;
   var tx: float32 = g_cam_x;
   var ty: float32 = g_cam_y;
-  if (wx > g_cam_x + vw - 160.0 / g_zoom || wx < g_cam_x + 40.0 / g_zoom) { tx = wx - vw * 0.5; }
+  if (wx > g_cam_x + vw - 160.0 / g_zoom || wx < g_cam_x + 40.0 / g_zoom) {
+    tx = wx - vw * 0.5;
+  }
   if (wend > tx + vw - 60.0 / g_zoom) { tx = wend - vw + 80.0 / g_zoom; }
-  if (wy < g_cam_y + ROW_H || wy > g_cam_y + vh - ROW_H * 2.0) { ty = wy - vh * 0.35; }
+  if (wy < g_cam_y + ROW_H || wy > g_cam_y + vh - ROW_H * 2.0) {
+    ty = wy - vh * 0.35;
+  }
   if (tx < -LEFT_PAD / g_zoom) { tx = -LEFT_PAD / g_zoom; }
   if (ty < -36.0 / g_zoom) { ty = -36.0 / g_zoom; }
   g_cam_tx = tx;
@@ -2526,7 +2647,8 @@ fn cam_step(dt: float32) {
   if (g_reduced) { k = 1.0; }
   g_cam_x = g_cam_x + (g_cam_tx - g_cam_x) * k;
   g_cam_y = g_cam_y + (g_cam_ty - g_cam_y) * k;
-  if (mythic_absf(g_cam_tx - g_cam_x) < 0.5 && mythic_absf(g_cam_ty - g_cam_y) < 0.5) {
+  if (mythic_absf(g_cam_tx - g_cam_x) < 0.5 &&
+      mythic_absf(g_cam_ty - g_cam_y) < 0.5) {
     g_cam_x = g_cam_tx;
     g_cam_y = g_cam_ty;
     g_cam_moving = false;
@@ -2538,7 +2660,10 @@ fn click_at(mx: float32, my: float32) {
   var wy: float32 = g_cam_y + (my - g_canvas.y) / g_zoom;
   for i: int64 in 0..g_nv {
     var v: VNode* = &g_vn[i];
-    if (wy < v->dy || wy > v->dy + ROW_H || wx < v->dx - 4.0 || wx > v->dx + v->w + 4.0) { continue; }
+    if (wy < v->dy || wy > v->dy + ROW_H || wx < v->dx - 4.0 ||
+        wx > v->dx + v->w + 4.0) {
+      continue;
+    }
     if (v->kind == VK_STUB) {
       hm_put(&g_user, g_vn[v->parent].h_end, 1);
       return;
@@ -2568,7 +2693,8 @@ fn alpha(c: uint32, a: float32) -> uint32 {
 fn mono(size: float32) -> MythicTextStyle {
   var lh: float32 = 16.0;
   if (size > 12.0) { lh = mythic_roundf(size * 1.4); }
-  var st: MythicTextStyle = { font: MYTHIC_FONT_MONO, size: size, line_height: lh, tracking: 0.0, flags: 0 };
+  var st: MythicTextStyle = { font: MYTHIC_FONT_MONO, size: size,
+      line_height: lh, tracking: 0.0, flags: 0 };
   return st;
 }
 
@@ -2592,14 +2718,16 @@ fn vline(p: MythicPainter*, x: float32, y0: float32, y1: float32, col: uint32) {
   mythic_paint_fill(p, rect(x, y0, 1.0, y1 - y0), mythic_radius(0.0), col);
 }
 
-fn text_at(p: MythicPainter*, s: string, st: MythicTextStyle, x: float32, top: float32, h: float32, col: uint32) {
+fn text_at(p: MythicPainter*, s: string, st: MythicTextStyle, x: float32,
+    top: float32, h: float32, col: uint32) {
   var bl: float32 = mythic_paint_control_baseline(p, st, top, h);
   mythic_paint_text_baseline(p, s, st, x, bl, col);
 }
 
 fn anim_p() -> float32 {
   if (g_anim_kind == AN_NONE) { return 1.0; }
-  return (float32)mythic_clampf((float32)((g_now - g_anim_t0) / ANIM_S), 0.0, 1.0);
+  return (float32)mythic_clampf(
+      (float32)((g_now - g_anim_t0) / ANIM_S), 0.0, 1.0);
 }
 
 fn anim_age() -> float64 { return g_now - g_anim_t0; }
@@ -2608,7 +2736,9 @@ fn anim_live() -> bool { return g_anim_kind != AN_NONE && anim_age() < 2.2; }
 
 fn reveal_depth() -> float32 {
   var n: float32 = (float32)g_anim.key.len;
-  if (g_anim_kind == AN_MISS || g_anim_kind == AN_REMOVE) { n = (float32)g_anim_match; }
+  if (g_anim_kind == AN_MISS || g_anim_kind == AN_REMOVE) {
+    n = (float32)g_anim_match;
+  }
   return anim_p() * n;
 }
 
@@ -2626,7 +2756,9 @@ fn row_mid(v: VNode*) -> float32 { return sy(v->dy + ROW_H / 2.0); }
 fn word_color(v: VNode*, c: VCell*) -> uint32 {
   if (c->kind == CK_ARITY) { return C_MUTED; }
   if (c->head) { return C_MUTED; }
-  if (c->kind == CK_VAR || c->kind == CK_REF || c->kind == CK_RAW) { return C_TEXT2; }
+  if (c->kind == CK_VAR || c->kind == CK_REF || c->kind == CK_RAW) {
+    return C_TEXT2;
+  }
   if (v->step == 0) { return C_TEXT2; }
   return C_TEXT;
 }
@@ -2640,7 +2772,9 @@ fn del_exclusive() {
     var v: VNode* = &g_vn[i];
     if (v->kind != VK_NODE || v->end >= g_del.key.len) { continue; }
     if (!keyh_has(&g_del, v->end, v->h_end)) { continue; }
-    if (v->nkids > 1 || v->has_value) { g_del_excl = mythic_maxi64(g_del_excl, v->end); }
+    if (v->nkids > 1 || v->has_value) {
+      g_del_excl = mythic_maxi64(g_del_excl, v->end);
+    }
   }
 }
 
@@ -2687,7 +2821,10 @@ fn draw_node(p: MythicPainter*, v: VNode*, lab: bool) {
     } else if (hits) {
       if (hm_has(&g_hits_set, c->h1)) {
         if (c->kind == CK_SYM) { col = C_TEXT; }
-        if (hm_has(&g_hitvar_set, c->h1) || (g_hitvar_set.n == 0 && c->d0 >= fixed)) { under = C_AMBER; }
+        if (hm_has(&g_hitvar_set, c->h1) ||
+            (g_hitvar_set.n == 0 && c->d0 >= fixed)) {
+          under = C_AMBER;
+        }
       } else {
         col = mythic_color_lerp(col, C_BG, 0.45);
       }
@@ -2695,23 +2832,29 @@ fn draw_node(p: MythicPainter*, v: VNode*, lab: bool) {
     if (live && keyh_has(&g_anim, c->d1, c->h1)) {
       if (g_anim_kind == AN_ADD) {
         if (c->d1 > g_anim_new_from) {
-          var appear: float32 = mythic_clampf((rd - (float32)c->d0) / 2.0, 0.0, 1.0);
+          var appear: float32 =
+              mythic_clampf((rd - (float32)c->d0) / 2.0, 0.0, 1.0);
           a = a * appear;
-          var settle: float32 = mythic_clampf((age - (float32)ANIM_S) / 1.2, 0.0, 1.0);
+          var settle: float32 =
+              mythic_clampf((age - (float32)ANIM_S) / 1.2, 0.0, 1.0);
           col = mythic_color_lerp(C_GREEN, col, settle);
         }
       } else if ((float32)c->d1 <= rd + 0.01 && g_anim_kind != AN_REMOVE) {
         under = alpha(C_AMBER, mythic_clampf(2.2 - age, 0.0, 1.0));
       }
     }
-    if (g_del_t0 >= 0.0 && keyh_has(&g_del, c->d1, c->h1) && c->d1 > g_del_excl) {
+    if (g_del_t0 >= 0.0 && keyh_has(&g_del, c->d1, c->h1) &&
+        c->d1 > g_del_excl) {
       col = C_RED;
       strike = true;
     }
     if (bulk > 0.0) { col = mythic_color_lerp(col, C_GREEN, bulk); }
-    if (c->d0 == zd && keyh_has(&g_zip, c->d0, c->h0)) { col = mythic_color_lerp(col, C_VIOLET, 0.45); }
+    if (c->d0 == zd && keyh_has(&g_zip, c->d0, c->h0)) {
+      col = mythic_color_lerp(col, C_VIOLET, 0.45);
+    }
     var focus_under: bool = false;
-    if (under == 0 && !hits && g_follow && keyh_has(&g_focus, c->d1, c->h1) && c->d1 <= g_focus.key.len) {
+    if (under == 0 && !hits && g_follow && keyh_has(&g_focus, c->d1, c->h1) &&
+        c->d1 <= g_focus.key.len) {
       under = alpha(C_VIOLET, 0.4);
       focus_under = true;
     }
@@ -2733,14 +2876,17 @@ fn draw_node(p: MythicPainter*, v: VNode*, lab: bool) {
       hline(p, x - 1.0, x + uw + 1.0, top + h / 2.0, C_RED);
     }
   }
+
   if (v->has_value && v->ncells > 0) {
     var ex: float32 = sx(v->dx + v->w - value_w(v));
     var cy: float32 = top + h / 2.0;
-    mythic_paint_circle(p, vec(ex + 6.0 * g_zoom, cy), 2.5 * g_zoom, alpha(C_GREEN, fade));
+    mythic_paint_circle(p, vec(ex + 6.0 * g_zoom, cy), 2.5 * g_zoom,
+        alpha(C_GREEN, fade));
     if (lab && v->value != (uint64)1) {
       fmt_reset();
       fmt_i((int64)v->value);
-      text_at(p, fmt_view(), mono(12.0 * g_zoom), ex + 12.0 * g_zoom, top, h, alpha(C_MUTED, fade));
+      text_at(p, fmt_view(), mono(12.0 * g_zoom), ex + 12.0 * g_zoom, top, h,
+          alpha(C_MUTED, fade));
     }
   }
 }
@@ -2750,7 +2896,8 @@ fn draw_fold(p: MythicPainter*, v: VNode*, lab: bool) {
   var h: float32 = ROW_H * g_zoom;
   if (top > g_canvas.y + g_canvas.h || top + h < g_canvas.y || !lab) { return; }
   fold_text(v);
-  text_at(p, fmt_view(), mono(13.0 * g_zoom), sx(v->dx), top, h, alpha(C_MUTED, v->fade));
+  text_at(p, fmt_view(), mono(13.0 * g_zoom), sx(v->dx), top, h,
+      alpha(C_MUTED, v->fade));
 }
 
 fn draw_lines(p: MythicPainter*) {
@@ -2811,7 +2958,8 @@ fn blink() -> float32 {
 
 fn caret(p: MythicPainter*, x: float32, top: float32, col: uint32) {
   var h: float32 = ROW_H * g_zoom;
-  mythic_paint_fill(p, rect(x, top + h * 0.14, 2.0, h * 0.72), mythic_radius(0.0), col);
+  mythic_paint_fill(p, rect(x, top + h * 0.14, 2.0, h * 0.72),
+      mythic_radius(0.0), col);
 }
 
 fn caret_x_for(c: VCell*, v: VNode*, d: int64) -> float32 {
@@ -2842,10 +2990,12 @@ fn draw_zipper(p: MythicPainter*, lab: bool) {
       merc_buf_clear(&g_gbuf);
       ghost_text(gv, &g_gbuf);
       var st: MythicTextStyle = mono(13.0 * g_zoom);
-      text_at(p, merc_buf_view(&g_gbuf), st, gx + 4.0, top, h, alpha(C_VIOLET, 0.6));
+      text_at(p, merc_buf_view(&g_gbuf), st, gx + 4.0, top, h,
+          alpha(C_VIOLET, 0.6));
     }
     return;
   }
+
   if (d == 0) {
     if (g_nv > 0) { caret(p, sx(g_vn[0].dx) - 7.0, sy(g_vn[0].dy), col); }
     return;
@@ -2860,7 +3010,10 @@ fn draw_zipper(p: MythicPainter*, lab: bool) {
       for q: int64 in c->d0 + 1..d {
         var want: uint8 = g_zip.key.data[q];
         if (want < 33 || want > 126) { want = 63; }
-        if (q - c->d0 - 1 >= c->tlen || g_txt.data[c->toff + q - c->d0 - 1] != want) { same = false; }
+        if (q - c->d0 - 1 >= c->tlen ||
+            g_txt.data[c->toff + q - c->d0 - 1] != want) {
+          same = false;
+        }
       }
       if (!same) { continue; }
     }
@@ -2888,22 +3041,26 @@ fn draw_miss(p: MythicPainter*) {
     return;
   }
   var h: float32 = ROW_H * g_zoom;
-  mythic_paint_fill(p, rect(x, top + h * 0.1, 2.0, h * 0.8), mythic_radius(0.0), alpha(C_RED, f));
+  mythic_paint_fill(p, rect(x, top + h * 0.1, 2.0, h * 0.8),
+      mythic_radius(0.0), alpha(C_RED, f));
   hline(p, x + 2.0, x + 12.0, top + h - 3.0 * g_zoom, alpha(C_RED, f));
 }
 
 fn eyebrow_style() -> MythicTextStyle {
-  var st: MythicTextStyle = { font: MYTHIC_FONT_SEMIBOLD, size: 11.5, line_height: 16.0, tracking: 1.6, flags: 0 };
+  var st: MythicTextStyle = { font: MYTHIC_FONT_SEMIBOLD, size: 11.5,
+      line_height: 16.0, tracking: 1.6, flags: 0 };
   return st;
 }
 
 fn serif(size: float32) -> MythicTextStyle {
-  var st: MythicTextStyle = { font: MYTHIC_FONT_REGULAR, size: size, line_height: mythic_roundf(size * 1.25), tracking: 0.0, flags: 0 };
+  var st: MythicTextStyle = { font: MYTHIC_FONT_REGULAR, size: size,
+      line_height: mythic_roundf(size * 1.25), tracking: 0.0, flags: 0 };
   return st;
 }
 
 fn sans(size: float32) -> MythicTextStyle {
-  var st: MythicTextStyle = { font: MYTHIC_FONT_MEDIUM, size: size, line_height: mythic_roundf(size * 1.6), tracking: 0.0, flags: 0 };
+  var st: MythicTextStyle = { font: MYTHIC_FONT_MEDIUM, size: size,
+      line_height: mythic_roundf(size * 1.6), tracking: 0.0, flags: 0 };
   return st;
 }
 
@@ -2912,20 +3069,25 @@ fn draw_empty(p: MythicPainter*, box: MythicRect) {
   var y: float32 = box.y + 56.0;
   text_at(p, "AN EMPTY TRIE", eyebrow_style(), x, y, 16.0, C_MUTED);
   text_at(p, "Nothing stored yet.", serif(32.0), x, y + 28.0, 40.0, C_TEXT);
-  text_at(p, "Type an expression in the console below to store it, or open a file of them. Help lists the commands.", sans(15.0), x, y + 84.0, 24.0, C_TEXT2);
+  text_at(p,
+      "Type an expression in the console below to store it, or open a file of them. Help lists the commands.",
+      sans(15.0), x, y + 84.0, 24.0, C_TEXT2);
   text_at(p, "add (parent tom bob)", mono(14.0), x, y + 132.0, 22.0, C_TEXT);
-  text_at(p, "load test_data/scholarly_tree.mm2", mono(14.0), x, y + 160.0, 22.0, C_TEXT);
+  text_at(p, "load test_data/scholarly_tree.mm2", mono(14.0), x, y + 160.0,
+      22.0, C_TEXT);
 }
 
 fn draw_gutter(p: MythicPainter*, box: MythicRect) {
   var gw: float32 = 88.0;
   if (sx(0.0) < box.x + gw) {
-    mythic_paint_fill(p, rect(box.x, box.y, gw, box.h), mythic_radius(0.0), C_BG);
+    mythic_paint_fill(p, rect(box.x, box.y, gw, box.h), mythic_radius(0.0),
+        C_BG);
   }
   var st: MythicTextStyle = mono(13.0 * g_zoom);
   if (g_prefix.len > 0) {
     var px: float32 = mythic_maxf(sx(0.0), box.x + gw);
-    text_at(p, merc_buf_view(&g_prefix), st, px, sy(0.0), ROW_H * g_zoom, C_MUTED);
+    text_at(p, merc_buf_view(&g_prefix), st, px, sy(0.0), ROW_H * g_zoom,
+        C_MUTED);
   }
   for i: int64 in 0..g_nv {
     var v: VNode* = &g_vn[i];
@@ -2941,8 +3103,10 @@ fn draw_gutter(p: MythicPainter*, box: MythicRect) {
     } else {
       fmt_group(v->count);
     }
-    var tw: float32 = mythic_text_width(p->fonts, mythic_paint_text_spec(p->scale, st), fmt_view()) / p->scale;
-    text_at(p, fmt_view(), st, box.x + gw - 20.0 - tw, top, ROW_H * g_zoom, alpha(C_MUTED, v->fade));
+    var tw: float32 = mythic_text_width(p->fonts,
+        mythic_paint_text_spec(p->scale, st), fmt_view()) / p->scale;
+    text_at(p, fmt_view(), st, box.x + gw - 20.0 - tw, top, ROW_H * g_zoom,
+        alpha(C_MUTED, v->fade));
   }
 }
 
@@ -2955,18 +3119,23 @@ fn draw_edges_hint(p: MythicPainter*, box: MythicRect) {
   if (w > right_world) {
     var fp0: MythicVec2 = { x: box.x + box.w - 28.0, y: 0.0 };
     var fp1: MythicVec2 = { x: box.x + box.w, y: 0.0 };
-    mythic_paint_gradient(p, rect(box.x + box.w - 28.0, box.y, 28.0, box.h), mythic_radius(0.0), fp0, fp1, 0x00131217, C_BG);
+    mythic_paint_gradient(p, rect(box.x + box.w - 28.0, box.y, 28.0, box.h),
+        mythic_radius(0.0), fp0, fp1, 0x00131217, C_BG);
   }
   if (g_cam_x > -40.0 / g_zoom) {
     var gp0: MythicVec2 = { x: box.x, y: 0.0 };
     var gp1: MythicVec2 = { x: box.x + 20.0, y: 0.0 };
-    mythic_paint_gradient(p, rect(box.x, box.y, 20.0, box.h), mythic_radius(0.0), gp0, gp1, C_BG, 0x00131217);
+    mythic_paint_gradient(p, rect(box.x, box.y, 20.0, box.h),
+        mythic_radius(0.0), gp0, gp1, C_BG, 0x00131217);
   }
   if (content > box.w + 2.0) {
     var frac_w: float32 = mythic_clampf(box.w / content, 0.04, 1.0);
-    var pos: float32 = mythic_clampf((g_cam_x + 48.0) * g_zoom / content, 0.0, 1.0 - frac_w);
+    var pos: float32 =
+        mythic_clampf((g_cam_x + 48.0) * g_zoom / content, 0.0, 1.0 - frac_w);
     var bx: float32 = box.x + 8.0 + pos * (box.w - 16.0);
-    mythic_paint_fill(p, rect(bx, box.y + box.h - 5.0, frac_w * (box.w - 16.0), 2.0), mythic_radius(1.0), alpha(C_MUTED, 0.7));
+    mythic_paint_fill(p,
+        rect(bx, box.y + box.h - 5.0, frac_w * (box.w - 16.0), 2.0),
+        mythic_radius(1.0), alpha(C_MUTED, 0.7));
   }
 }
 
@@ -3014,7 +3183,11 @@ fn flags_at(key: uint8*, kn: int64, from: int64, base: uint8) {
       var span: int64 = merc_span(key + j, kn - j);
       if (span <= 0) { return; }
       var vid: int32 = vno;
-      if (t < 0xC0) { vid = (int32)(t & 63); } else { vno = vno + 1; }
+      if (t < 0xC0) {
+        vid = (int32)(t & 63);
+      } else {
+        vno = vno + 1;
+      }
       var mark: uint8 = (uint8)(1 + vid % 8);
       if (base != 0) { mark = base | 0x10 | (uint8)(vid % 2); }
       for q: int64 in 0..span { if (j + q < n) { g_rb[j + q] = mark; } }
@@ -3060,7 +3233,9 @@ fn flat_row(key: uint8*, kn: int64, skip: int64) {
     if (head) { hf = f | 0x40; }
     head = false;
     if (depth > 0) { left[depth - 1] = left[depth - 1] - 1; }
-    if (show && g_rt.len > 0 && g_rt.data[g_rt.len - 1] != 40) { flat_put(32, 0); }
+    if (show && g_rt.len > 0 && g_rt.data[g_rt.len - 1] != 40) {
+      flat_put(32, 0);
+    }
     if (tag < 64) {
       if (tag == 0) {
         if (show) {
@@ -3116,7 +3291,11 @@ fn list_prefix() {
     if (t > 0xC0) {
       var len: int64 = (int64)(t & 63);
       if (g_lpre.len > 0) { merc_buf_text(&g_lpre, "  ›  "); }
-      for k: int64 in 0..len { if (i + k < g_hit_fixed) { merc_buf_push(&g_lpre, pat[i + k]); } }
+      for k: int64 in 0..len {
+        if (i + k < g_hit_fixed) {
+          merc_buf_push(&g_lpre, pat[i + k]);
+        }
+      }
       i = i + len;
     }
   }
@@ -3152,7 +3331,8 @@ fn run_color(f: uint8) -> uint32 {
   return col;
 }
 
-fn draw_runs(p: MythicPainter*, st: MythicTextStyle, x0: float32, top: float32, h: float32, adv: float32) {
+fn draw_runs(p: MythicPainter*, st: MythicTextStyle, x0: float32, top: float32,
+    h: float32, adv: float32) {
   var n: int64 = g_rt.len;
   var a: int64 = 0;
   while (a < n) {
@@ -3173,7 +3353,8 @@ fn draw_list(p: MythicPainter*, box: MythicRect) {
   var gst: MythicTextStyle = mono(13.0);
   list_prefix();
   if (g_lpre.len > 0 && g_lv_mode != 1) {
-    text_at(p, merc_buf_view(&g_lpre), mono(13.0), box.x + LV_GUT + 16.0, box.y + 10.0, 24.0, C_MUTED);
+    text_at(p, merc_buf_view(&g_lpre), mono(13.0), box.x + LV_GUT + 16.0,
+        box.y + 10.0, 24.0, C_MUTED);
   }
   lv_clamp();
   var first: int64 = (int64)g_lv_top;
@@ -3197,8 +3378,10 @@ fn draw_list(p: MythicPainter*, box: MythicRect) {
       g_flag_row = row;
       flat_row(g_sh.hits.data + g_rows_off[row], g_rows_len[row], g_hit_fixed);
     }
-    var gw: float32 = mythic_text_width(p->fonts, mythic_paint_text_spec(p->scale, gst), fmt_view()) / p->scale;
-    mythic_dl_push_clip(p->dl, mythic_paint_dev_rect(p, rect(box.x + LV_GUT + 8.0, box.y, box.w - LV_GUT - 8.0, box.h)), 0.0);
+    var gw: float32 = mythic_text_width(p->fonts,
+        mythic_paint_text_spec(p->scale, gst), fmt_view()) / p->scale;
+    mythic_dl_push_clip(p->dl, mythic_paint_dev_rect(p,
+        rect(box.x + LV_GUT + 8.0, box.y, box.w - LV_GUT - 8.0, box.h)), 0.0);
     draw_runs(p, st, x0, y, LV_ROW, adv);
     mythic_dl_pop_clip(p->dl);
     widest = mythic_maxf(widest, (float32)g_rt.len * adv);
@@ -3206,31 +3389,41 @@ fn draw_list(p: MythicPainter*, box: MythicRect) {
     y = y + LV_ROW;
     r = r + 1;
   }
+
   g_lv_widest = widest;
   var view: float32 = box.w - LV_GUT - 16.0;
   if (widest - g_lv_x > view) {
     var fp0: MythicVec2 = { x: box.x + box.w - 28.0, y: 0.0 };
     var fp1: MythicVec2 = { x: box.x + box.w, y: 0.0 };
-    mythic_paint_gradient(p, rect(box.x + box.w - 28.0, box.y, 28.0, box.h), mythic_radius(0.0), fp0, fp1, 0x00131217, C_BG);
+    mythic_paint_gradient(p, rect(box.x + box.w - 28.0, box.y, 28.0, box.h),
+        mythic_radius(0.0), fp0, fp1, 0x00131217, C_BG);
   }
   if (widest > view) {
     var fw: float32 = mythic_clampf(view / widest, 0.05, 1.0);
     var pos: float32 = mythic_clampf(g_lv_x / widest, 0.0, 1.0 - fw);
     var bw: float32 = box.w - LV_GUT - 24.0;
-    mythic_paint_fill(p, rect(box.x + LV_GUT + 16.0 + pos * bw, box.y + box.h - 5.0, fw * bw, 2.0), mythic_radius(1.0), alpha(C_MUTED, 0.7));
+    mythic_paint_fill(p,
+        rect(box.x + LV_GUT + 16.0 + pos * bw, box.y + box.h - 5.0,
+            fw * bw, 2.0),
+        mythic_radius(1.0), alpha(C_MUTED, 0.7));
   }
+
   if (total > lv_rows_visible()) {
     var vh: float32 = box.h - LV_TOP - 8.0;
-    var fh: float32 = mythic_clampf((float32)lv_rows_visible() / (float32)total, 0.03, 1.0);
+    var fh: float32 = mythic_clampf(
+        (float32)lv_rows_visible() / (float32)total, 0.03, 1.0);
     var vp: float32 = mythic_clampf(g_lv_top / (float32)total, 0.0, 1.0 - fh);
-    mythic_paint_fill(p, rect(box.x + box.w - 5.0, box.y + LV_TOP + vp * vh, 2.0, fh * vh), mythic_radius(1.0), alpha(C_MUTED, 0.7));
+    mythic_paint_fill(p,
+        rect(box.x + box.w - 5.0, box.y + LV_TOP + vp * vh, 2.0, fh * vh),
+        mythic_radius(1.0), alpha(C_MUTED, 0.7));
   }
 }
 
 var g_lv_widest: float32 = 0.0;
 
 fn lv_click(mx: float32, my: float32) {
-  var idx: int64 = (int64)g_lv_top + (int64)((my - g_canvas.y - LV_TOP) / LV_ROW);
+  var idx: int64 = (int64)g_lv_top +
+      (int64)((my - g_canvas.y - LV_TOP) / LV_ROW);
   if (my < g_canvas.y + LV_TOP || idx < 0 || idx >= lv_count()) { return; }
   if (g_lv_mode == 1) {
     lv_set(2, g_lv_var, g_list[idx]);
@@ -3250,7 +3443,8 @@ fn lv_click(mx: float32, my: float32) {
 
 var g_lv_sel: int64 = -1;
 
-fn canvas_paint_cb(ui: MythicUi*, p: MythicPainter*, box: MythicRect, ud: rawptr) {
+fn canvas_paint_cb(ui: MythicUi*, p: MythicPainter*, box: MythicRect,
+    ud: rawptr) {
   g_canvas = box;
   mythic_paint_fill(p, box, mythic_radius(0.0), C_BG);
   mythic_dl_push_clip(p->dl, mythic_paint_dev_rect(p, box), 0.0);
@@ -3276,6 +3470,7 @@ fn canvas_paint_cb(ui: MythicUi*, p: MythicPainter*, box: MythicRect, ud: rawptr
       draw_fold(p, v, lab);
     }
   }
+
   draw_miss(p);
   draw_zipper(p, lab);
   draw_gutter(p, box);
@@ -3319,12 +3514,14 @@ fn log_paint_cb(ui: MythicUi*, p: MythicPainter*, box: MythicRect, ud: rawptr) {
       var ts: string;
       ts.chars = &l->took[0];
       ts.length = (uint64)l->took_len;
-      var tw: float32 = mythic_text_width(p->fonts, mythic_paint_text_spec(p->scale, m), ts) / p->scale;
+      var tw: float32 = mythic_text_width(p->fonts,
+          mythic_paint_text_spec(p->scale, m), ts) / p->scale;
       text_at(p, ts, m, box.x + box.w - tw, y, lh, C_MUTED);
     }
     y = y - lh;
     i = i - 1;
   }
+
   mythic_dl_pop_clip(p->dl);
 }
 
@@ -3366,8 +3563,10 @@ fn clamp_pan() {
 
 fn canvas(ui: MythicUi*) {
   var id: uint64 = mythic_id(ui, "canvas");
-  mythic_box_begin(ui, { id: id, width: mythic_grow(), height: mythic_grow(), clip: true });
-  var r: MythicResp = mythic_interact(ui, id, MYTHIC_SENSE_CLICK | MYTHIC_SENSE_DRAG);
+  mythic_box_begin(ui,
+      { id: id, width: mythic_grow(), height: mythic_grow(), clip: true });
+  var r: MythicResp = mythic_interact(ui, id,
+      MYTHIC_SENSE_CLICK | MYTHIC_SENSE_DRAG);
   mythic_end(ui);
   mythic_node_paint(ui, &canvas_paint_cb, (rawptr)0);
   if (ui->pass != 0) { return; }
@@ -3398,6 +3597,7 @@ fn canvas(ui: MythicUi*) {
     lv_clamp();
     return;
   }
+
   if (r.pressed) {
     if (!g_drag) {
       g_drag = true;
@@ -3417,6 +3617,7 @@ fn canvas(ui: MythicUi*) {
     g_drag = false;
     if (g_drag_dist <= 3.0 && !g_engine_busy) { click_at(mouse.x, mouse.y); }
   }
+
   g_last_mouse = mouse;
   if (r.hovered && (ui->in.wheel.y != 0.0 || ui->in.wheel.x != 0.0)) {
     if ((ui->in.mods & MYTHIC_MOD_CTRL) != 0) {
@@ -3434,7 +3635,8 @@ fn canvas(ui: MythicUi*) {
 
 fn log_panel(ui: MythicUi*, h: float32) {
   var id: uint64 = mythic_id(ui, "log");
-  mythic_box_begin(ui, { id: id, width: mythic_grow(), height: mythic_fixed(h), clip: true });
+  mythic_box_begin(ui,
+      { id: id, width: mythic_grow(), height: mythic_fixed(h), clip: true });
   var r: MythicResp = mythic_interact(ui, id, MYTHIC_SENSE_HOVER);
   mythic_end(ui);
   mythic_node_paint(ui, &log_paint_cb, (rawptr)0);
@@ -3500,7 +3702,9 @@ fn clipped(ui: MythicUi*, s: string, st0: MythicTextStyle, col: uint32) {
 fn link(ui: MythicUi*, label: string, idl: string, on: bool) -> bool {
   var id: uint64 = mythic_id(ui, idl);
   var st: MythicTextStyle = sans(14.0);
-  mythic_box_begin(ui, { id: id, dir: MYTHIC_DIR_ROW, height: mythic_fixed(28.0), align_y: MYTHIC_ALIGN_CENTER });
+  mythic_box_begin(ui,
+      { id: id, dir: MYTHIC_DIR_ROW, height: mythic_fixed(28.0),
+      align_y: MYTHIC_ALIGN_CENTER });
   var r: MythicResp = mythic_interact(ui, id, MYTHIC_SENSE_CLICK);
   var col: uint32 = C_TEXT2;
   if (on) { col = C_VIOLET; }
@@ -3511,7 +3715,9 @@ fn link(ui: MythicUi*, label: string, idl: string, on: bool) -> bool {
 }
 
 fn topbar(ui: MythicUi*) {
-  mythic_row_begin(ui, { width: mythic_grow(), height: mythic_fixed(60.0), pad: mythic_pad_xy(32.0, 0.0), gap: 28, align_y: MYTHIC_ALIGN_CENTER });
+  mythic_row_begin(ui,
+      { width: mythic_grow(), height: mythic_fixed(60.0),
+      pad: mythic_pad_xy(32.0, 0.0), gap: 28, align_y: MYTHIC_ALIGN_CENTER });
     txt(ui, "merc", serif(24.0), C_TEXT);
     mythic_spacer(ui);
     if (link(ui, "Open file", "open", false)) {
@@ -3528,7 +3734,9 @@ fn topbar(ui: MythicUi*) {
       q_text("help");
       g_console_big = true;
     }
-    if (link(ui, "Panel", "panel", !g_side_hidden)) { g_side_hidden = !g_side_hidden; }
+    if (link(ui, "Panel", "panel", !g_side_hidden)) {
+      g_side_hidden = !g_side_hidden;
+    }
     var fl: string = "Follow";
     if (g_follow) { fl = "Following"; }
     if (link(ui, fl, "follow", g_follow)) {
@@ -3540,12 +3748,14 @@ fn topbar(ui: MythicUi*) {
 }
 
 fn rule_h(ui: MythicUi*) {
-  mythic_box_begin(ui, { width: mythic_grow(), height: mythic_fixed(1.0), bg: C_BORDER });
+  mythic_box_begin(ui,
+      { width: mythic_grow(), height: mythic_fixed(1.0), bg: C_BORDER });
   mythic_end(ui);
 }
 
 fn rule_v(ui: MythicUi*) {
-  mythic_box_begin(ui, { width: mythic_fixed(1.0), height: mythic_grow(), bg: C_BORDER });
+  mythic_box_begin(ui,
+      { width: mythic_fixed(1.0), height: mythic_grow(), bg: C_BORDER });
   mythic_end(ui);
 }
 
@@ -3643,13 +3853,17 @@ fn side_rules(ui: MythicUi*) {
     fmt_s(merc_buf_view(&g_step_took));
     wrap(ui, fmt_view(), mono(12.0), C_MUTED);
   }
+
   gap(ui, 14.0);
   for ri: int32 in 0..g_rule_shown {
     rule_h(ui);
-    mythic_row_begin(ui, { width: mythic_grow(), height: mythic_fixed(32.0), align_y: MYTHIC_ALIGN_CENTER, gap: 10, clip: true });
+    mythic_row_begin(ui,
+        { width: mythic_grow(), height: mythic_fixed(32.0),
+        align_y: MYTHIC_ALIGN_CENTER, gap: 10, clip: true });
       var mark: uint32 = 0;
       if (ri == 0) { mark = C_VIOLET; }
-      mythic_box_begin(ui, { width: mythic_fixed(2.0), height: mythic_fixed(18.0), bg: mark });
+      mythic_box_begin(ui,
+          { width: mythic_fixed(2.0), height: mythic_fixed(18.0), bg: mark });
       mythic_end(ui);
       var rst: MythicTextStyle = mono(13.0);
       rst.flags = MYTHIC_TEXT_ELLIPSIS;
@@ -3660,6 +3874,7 @@ fn side_rules(ui: MythicUi*) {
       mythic_end(ui);
     mythic_end(ui);
   }
+
   if (g_rule_shown > 0) { rule_h(ui); }
 }
 
@@ -3677,10 +3892,23 @@ fn side_find(ui: MythicUi*) {
   txt(ui, fmt_view(), serif(34.0), C_TEXT);
   fmt_reset();
   if (g_sh.inside) {
-    if (g_find_found == 1) { fmt_s("place in "); } else { fmt_s("places in "); }
+    if (g_find_found == 1) {
+      fmt_s("place in ");
+    } else {
+      fmt_s("places in ");
+    }
     fmt_group(g_find_rows);
-    if (g_find_rows == 1) { fmt_s(" sentence"); } else { fmt_s(" sentences"); }
-  } else if (g_find_found == 1) { fmt_s("match"); } else { fmt_s("matches"); }
+    if (g_find_rows == 1) {
+      fmt_s(" sentence");
+    } else {
+      fmt_s(" sentences");
+    }
+  } else if (g_find_found == 1) {
+    fmt_s("match");
+  } else {
+    fmt_s("matches");
+  }
+
   if (!hits_live() && g_hit_n > 0) { fmt_s(" before the trie changed"); }
   txt(ui, fmt_view(), sans(14.0), C_TEXT2);
   gap(ui, 4.0);
@@ -3697,18 +3925,26 @@ fn side_find(ui: MythicUi*) {
     for v: int32 in 0..g_vars {
       rule_h(ui);
       gap(ui, 10.0);
-      mythic_row_begin(ui, { width: mythic_grow(), align_y: MYTHIC_ALIGN_CENTER, gap: 10 });
-        txt(ui, bview(&g_vname, g_vname_off[v], g_vname_len[v]), mono(14.0), C_AMBER);
+      mythic_row_begin(ui,
+          { width: mythic_grow(), align_y: MYTHIC_ALIGN_CENTER, gap: 10 });
+        txt(ui, bview(&g_vname, g_vname_off[v], g_vname_len[v]), mono(14.0),
+            C_AMBER);
         mythic_spacer(ui);
         fmt_reset();
         fmt_group(g_vdistinct[v]);
-        if (g_vdistinct[v] == 1) { fmt_s(" value"); } else { fmt_s(" values"); }
+        if (g_vdistinct[v] == 1) {
+          fmt_s(" value");
+        } else {
+          fmt_s(" values");
+        }
         txt(ui, fmt_view(), sans(13.0), C_TEXT2);
       mythic_end(ui);
       gap(ui, 6.0);
       for k: int32 in 0..g_vtop_n[v] {
         var e: VEntry* = &g_ve[g_vtop[v * 3 + k]];
-        mythic_row_begin(ui, { width: mythic_grow(), height: mythic_fixed(22.0), align_y: MYTHIC_ALIGN_CENTER, gap: 10, clip: true });
+        mythic_row_begin(ui,
+            { width: mythic_grow(), height: mythic_fixed(22.0),
+            align_y: MYTHIC_ALIGN_CENTER, gap: 10, clip: true });
           var est: MythicTextStyle = mono(13.0);
           est.flags = MYTHIC_TEXT_ELLIPSIS;
           mythic_box_begin(ui, { width: mythic_grow(), clip: true });
@@ -3727,10 +3963,15 @@ fn side_find(ui: MythicUi*) {
       fmt_reset();
       fmt_s("Counted over the first ");
       fmt_group(VT_CAP);
-      if (g_sh.inside) { fmt_s(" places."); } else { fmt_s(" matches."); }
+      if (g_sh.inside) {
+        fmt_s(" places.");
+      } else {
+        fmt_s(" matches.");
+      }
       txt(ui, fmt_view(), sans(12.0), C_MUTED);
     }
   }
+
   if (next_link(ui, "Find a pattern", "find")) { prime("match "); }
 }
 
@@ -3749,8 +3990,11 @@ var g_stat_nodes: int64 = 0;
 var g_stat_mem: int64 = 0;
 
 fn side(ui: MythicUi*, w: float32) {
-  mythic_box_begin(ui, { width: mythic_fixed(w), height: mythic_grow(), clip: true });
-  mythic_scroll_begin(ui, "side", { width: mythic_grow(), height: mythic_grow(), pad: mythic_pad_xy(32.0, 36.0), gap: 0 });
+  mythic_box_begin(ui,
+      { width: mythic_fixed(w), height: mythic_grow(), clip: true });
+  mythic_scroll_begin(ui, "side",
+      { width: mythic_grow(), height: mythic_grow(),
+      pad: mythic_pad_xy(32.0, 36.0), gap: 0 });
     if (!g_engine_busy) {
       rules_scan();
       g_stat_n = merc_count(trie());
@@ -3766,11 +4010,19 @@ fn side(ui: MythicUi*, w: float32) {
     fmt_reset();
     fmt_group(n);
     txt(ui, fmt_view(), serif(34.0), C_TEXT);
-    if (n == 1) { txt(ui, "expression", sans(14.0), C_TEXT2); } else { txt(ui, "expressions", sans(14.0), C_TEXT2); }
+    if (n == 1) {
+      txt(ui, "expression", sans(14.0), C_TEXT2);
+    } else {
+      txt(ui, "expressions", sans(14.0), C_TEXT2);
+    }
     gap(ui, 6.0);
     fmt_reset();
     fmt_group(g_stat_nodes);
-    if (g_stat_nodes == 1) { fmt_s(" node · "); } else { fmt_s(" nodes · "); }
+    if (g_stat_nodes == 1) {
+      fmt_s(" node · ");
+    } else {
+      fmt_s(" nodes · ");
+    }
     fmt_mem(g_stat_mem);
     if (n > 0) {
       fmt_s(" · ");
@@ -3811,13 +4063,16 @@ fn side(ui: MythicUi*, w: float32) {
 
 fn run_button(ui: MythicUi*, label: string) -> bool {
   var id: uint64 = mythic_id(ui, label);
-  mythic_box_begin(ui, { id: id, dir: MYTHIC_DIR_ROW, width: mythic_fixed(72.0), height: mythic_fixed(36.0),
-                         align_x: MYTHIC_ALIGN_CENTER, align_y: MYTHIC_ALIGN_CENTER, radius: mythic_radius(4.0) });
+  mythic_box_begin(ui,
+      { id: id, dir: MYTHIC_DIR_ROW, width: mythic_fixed(72.0),
+      height: mythic_fixed(36.0), align_x: MYTHIC_ALIGN_CENTER,
+      align_y: MYTHIC_ALIGN_CENTER, radius: mythic_radius(4.0) });
   var r: MythicResp = mythic_interact(ui, id, MYTHIC_SENSE_CLICK);
   var n: MythicNode* = ui->cur;
   n->box.bg = C_VIOLET;
   if (r.hovered) { n->box.bg = 0xFFB9A2FB; }
-  var st: MythicTextStyle = { font: MYTHIC_FONT_SEMIBOLD, size: 14.0, line_height: 20.0, tracking: 0.0, flags: 0 };
+  var st: MythicTextStyle = { font: MYTHIC_FONT_SEMIBOLD, size: 14.0,
+      line_height: 20.0, tracking: 0.0, flags: 0 };
   txt(ui, label, st, C_BG);
   mythic_end(ui);
   return r.clicked;
@@ -3862,7 +4117,10 @@ fn complete_update(ui: MythicUi*, cid: uint64, focused: bool) {
   var text: string = mythic_textbuf_str(&g_input);
   var cur: int64 = input_cursor(ui, cid);
   var same: bool = cur == g_cp_cursor && g_cp_text.len == (int64)text.length;
-  if (same && text.length > (uint64)0) { same = memcmp((rawptr)g_cp_text.data, (rawptr)text.chars, (int64)text.length) == 0; }
+  if (same && text.length > (uint64)0) {
+    same = memcmp((rawptr)g_cp_text.data, (rawptr)text.chars,
+        (int64)text.length) == 0;
+  }
   if (!same && !g_engine_busy) {
     merc_buf_clear(&g_cp_text);
     merc_buf_text(&g_cp_text, text);
@@ -3878,15 +4136,21 @@ fn complete_update(ui: MythicUi*, cid: uint64, focused: bool) {
     g_cp_closed = false;
     g_cp_forced = false;
   }
+
   g_cp_show = false;
   if (!focused || g_cp_closed || g_cm.n == 0) { return; }
   if (text.length == (uint64)0 && !g_cp_forced) { return; }
   var c0: MercCand* = &g_cm.c[0];
   var word: int64 = c0->to - c0->from;
-  if (word >= 1 || g_cp_forced || c0->kind == MERC_CK_MOVE || c0->kind == MERC_CK_PATH) { g_cp_show = true; }
+  if (word >= 1 || g_cp_forced || c0->kind == MERC_CK_MOVE ||
+      c0->kind == MERC_CK_PATH) {
+    g_cp_show = true;
+  }
   if (g_cm.n == 1 && word == c0->text_len && c0->kind != MERC_CK_PATH) {
     var t: string = merc_complete_text(&g_cm, 0);
-    if (memcmp((rawptr)t.chars, (rawptr)(text.chars + c0->from), word) == 0) { g_cp_show = false; }
+    if (memcmp((rawptr)t.chars, (rawptr)(text.chars + c0->from), word) == 0) {
+      g_cp_show = false;
+    }
   }
 }
 
@@ -3896,7 +4160,9 @@ fn cp_common(word: int64) -> int64 {
   for i in 1..g_cm.n {
     var t: string = merc_complete_text(&g_cm, i);
     var k: int64 = 0;
-    while (k < n && k < (int64)t.length && t.chars[k] == t0.chars[k]) { k = k + 1; }
+    while (k < n && k < (int64)t.length && t.chars[k] == t0.chars[k]) {
+      k = k + 1;
+    }
     n = k;
   }
   return n;
@@ -3945,6 +4211,7 @@ fn complete_keys(ui: MythicUi*) {
     g_focused_once = false;
     return;
   }
+
   if (!g_cp_show) { return; }
   var shown: int32 = g_cm.n;
   if (shown > 8) { shown = 8; }
@@ -3962,7 +4229,9 @@ fn complete_keys(ui: MythicUi*) {
     g_cp_show = false;
     g_esc_eaten = true;
   }
-  if (g_cp_moved && mythic_key_consume(ui, MYTHIC_KEY_ENTER, -1)) { cp_accept(ui, g_cp_sel, false); }
+  if (g_cp_moved && mythic_key_consume(ui, MYTHIC_KEY_ENTER, -1)) {
+    cp_accept(ui, g_cp_sel, false);
+  }
 }
 
 var g_esc_eaten: bool = false;
@@ -3990,7 +4259,10 @@ fn cp_paint_cb(ui: MythicUi*, p: MythicPainter*, box: MythicRect, ud: rawptr) {
   var y: float32 = box.y + 4.0;
   for i in 0..shown {
     var c: MercCand* = &g_cm.c[i];
-    if (i == g_cp_sel) { mythic_paint_fill(p, rect(box.x + 1.0, y + 5.0, 2.0, 16.0), mythic_radius(0.0), C_VIOLET); }
+    if (i == g_cp_sel) {
+      mythic_paint_fill(p, rect(box.x + 1.0, y + 5.0, 2.0, 16.0),
+          mythic_radius(0.0), C_VIOLET);
+    }
     var col: uint32 = C_TEXT2;
     if (i == g_cp_sel) { col = C_TEXT; }
     text_at(p, merc_complete_text(&g_cm, i), st, box.x + 12.0, y, 26.0, col);
@@ -4001,17 +4273,22 @@ fn cp_paint_cb(ui: MythicUi*, p: MythicPainter*, box: MythicRect, ud: rawptr) {
     } else {
       fmt_s(merc_complete_note(&g_cm, i));
     }
-    var nw: float32 = mythic_text_width(p->fonts, mythic_paint_text_spec(p->scale, nst), fmt_view()) / p->scale;
-    var nx: float32 = mythic_maxf(box.x + box.w - 12.0 - nw, box.x + 12.0 + (float32)c->text_len * adv_of(14.0) + 16.0);
-    mythic_dl_push_clip(p->dl, mythic_paint_dev_rect(p, rect(box.x, box.y, box.w - 8.0, box.h)), 0.0);
+    var nw: float32 = mythic_text_width(p->fonts,
+        mythic_paint_text_spec(p->scale, nst), fmt_view()) / p->scale;
+    var nx: float32 = mythic_maxf(box.x + box.w - 12.0 - nw,
+        box.x + 12.0 + (float32)c->text_len * adv_of(14.0) + 16.0);
+    mythic_dl_push_clip(p->dl,
+        mythic_paint_dev_rect(p, rect(box.x, box.y, box.w - 8.0, box.h)), 0.0);
     text_at(p, fmt_view(), nst, nx, y, 26.0, C_MUTED);
     mythic_dl_pop_clip(p->dl);
     y = y + 26.0;
   }
+
   if (g_cm.more) { text_at(p, "more", nst, box.x + 12.0, y, 20.0, C_MUTED); }
 }
 
-fn ghost_paint_cb(ui: MythicUi*, p: MythicPainter*, box: MythicRect, ud: rawptr) {
+fn ghost_paint_cb(ui: MythicUi*, p: MythicPainter*, box: MythicRect,
+    ud: rawptr) {
   var c0: MercCand* = &g_cm.c[g_cp_sel];
   var t: string = merc_complete_text(&g_cm, g_cp_sel);
   var word: int64 = c0->to - c0->from;
@@ -4031,7 +4308,8 @@ fn complete_overlay(ui: MythicUi*, cid: uint64) {
   var h: float32 = (float32)shown * 26.0 + 8.0;
   if (g_cm.more) { h = h + 20.0; }
   var lid: uint64 = mythic_id(ui, "cplist");
-  var b: MythicBox = { id: lid, width: mythic_fixed(cp_row_w()), height: mythic_fixed(h) };
+  var b: MythicBox = { id: lid, width: mythic_fixed(cp_row_w()),
+      height: mythic_fixed(h) };
   b.floating.attach = MYTHIC_ATTACH_ELEMENT;
   b.floating.target = cid;
   b.floating.self_anchor = 6;
@@ -4051,10 +4329,12 @@ fn complete_overlay(ui: MythicUi*, cid: uint64) {
       g_focused_once = false;
     }
   }
+
   var cur: int64 = input_cursor(ui, cid);
   if (cur == (int64)mythic_textbuf_str(&g_input).length && c0->to == cur) {
     var gid: uint64 = mythic_id(ui, "cpghost");
-    var gb: MythicBox = { id: gid, width: mythic_fixed(360.0), height: mythic_fixed(36.0) };
+    var gb: MythicBox = { id: gid, width: mythic_fixed(360.0),
+        height: mythic_fixed(36.0) };
     gb.floating.attach = MYTHIC_ATTACH_ELEMENT;
     gb.floating.target = cid;
     gb.floating.self_anchor = 0;
@@ -4069,13 +4349,15 @@ fn complete_overlay(ui: MythicUi*, cid: uint64) {
 }
 
 fn console(ui: MythicUi*, log_h: float32) {
-  mythic_column_begin(ui, { width: mythic_grow(), pad: mythic_pad_xy(32.0, 0.0), bg: C_RAISED });
+  mythic_column_begin(ui,
+      { width: mythic_grow(), pad: mythic_pad_xy(32.0, 0.0), bg: C_RAISED });
     if (log_h > 0.0) {
       log_panel(ui, log_h);
     } else {
       gap(ui, 12.0);
     }
-    mythic_row_begin(ui, { width: mythic_grow(), gap: 12, align_y: MYTHIC_ALIGN_CENTER });
+    mythic_row_begin(ui,
+        { width: mythic_grow(), gap: 12, align_y: MYTHIC_ALIGN_CENTER });
       var cid: uint64 = mythic_id(ui, "##cmd");
       if (!g_focused_once) {
         mythic_focus_set(ui, cid);
@@ -4089,7 +4371,8 @@ fn console(ui: MythicUi*, log_h: float32) {
           g_open_end = 0;
         }
       }
-      mythic_text_input_ex(ui, "##cmd", &g_input, { placeholder: "", width: mythic_grow() });
+      mythic_text_input_ex(ui, "##cmd", &g_input,
+          { placeholder: "", width: mythic_grow() });
       var lr: MythicResp = mythic_last(ui);
       if (ui->pass == 0) { g_input_focused = lr.focused; }
       complete_update(ui, cid, lr.focused);
@@ -4098,9 +4381,14 @@ fn console(ui: MythicUi*, log_h: float32) {
         submit();
       } else if (lr.focused && ui->pass == 0 && g_hist_n > 0) {
         if (mythic_key_pressed(ui, MYTHIC_KEY_UP, -1)) {
-          if (g_hist_at < 0) { g_hist_at = g_hist_n - 1; } else if (g_hist_at > 0) { g_hist_at = g_hist_at - 1; }
+          if (g_hist_at < 0) {
+            g_hist_at = g_hist_n - 1;
+          } else if (g_hist_at > 0) {
+            g_hist_at = g_hist_at - 1;
+          }
           mythic_textbuf_set(&g_input, line_view((uint8*)g_hist[g_hist_at]));
-        } else if (mythic_key_pressed(ui, MYTHIC_KEY_DOWN, -1) && g_hist_at >= 0) {
+        } else if (mythic_key_pressed(ui, MYTHIC_KEY_DOWN, -1) &&
+            g_hist_at >= 0) {
           g_hist_at = g_hist_at + 1;
           if (g_hist_at >= g_hist_n) {
             g_hist_at = -1;
@@ -4123,7 +4411,9 @@ fn console(ui: MythicUi*, log_h: float32) {
         g_focused_once = false;
       }
     mythic_end(ui);
-    mythic_row_begin(ui, { width: mythic_grow(), height: mythic_fixed(40.0), align_y: MYTHIC_ALIGN_CENTER, gap: 16 });
+    mythic_row_begin(ui,
+        { width: mythic_grow(), height: mythic_fixed(40.0),
+        align_y: MYTHIC_ALIGN_CENTER, gap: 16 });
       mythic_spacer(ui);
       fmt_reset();
       if (g_q_len > 0) {
@@ -4163,11 +4453,13 @@ fn keys(ui: MythicUi*) {
       g_console_big = true;
     }
   }
+
   if (g_go && mythic_key_pressed(ui, MYTHIC_KEY_ESCAPE, -1)) {
     g_go = false;
     log_s("stopped", LL_NOTE);
   }
-  if (g_results && !g_go && !g_esc_eaten && mythic_key_pressed(ui, MYTHIC_KEY_ESCAPE, -1)) {
+  if (g_results && !g_go && !g_esc_eaten &&
+      mythic_key_pressed(ui, MYTHIC_KEY_ESCAPE, -1)) {
     if (mythic_textbuf_str(&g_input).length > (uint64)0) {
       mythic_textbuf_set(&g_input, "");
     } else if (g_lv_mode == 2) {
@@ -4179,15 +4471,22 @@ fn keys(ui: MythicUi*) {
   }
   if (g_results) {
     var page: float32 = (float32)(lv_rows_visible() - 1);
-    if (mythic_key_pressed(ui, MYTHIC_KEY_PAGE_DOWN, -1)) { g_lv_top = g_lv_top + page; }
-    if (mythic_key_pressed(ui, MYTHIC_KEY_PAGE_UP, -1)) { g_lv_top = g_lv_top - page; }
+    if (mythic_key_pressed(ui, MYTHIC_KEY_PAGE_DOWN, -1)) {
+      g_lv_top = g_lv_top + page;
+    }
+    if (mythic_key_pressed(ui, MYTHIC_KEY_PAGE_UP, -1)) {
+      g_lv_top = g_lv_top - page;
+    }
     var empty_line: bool = mythic_textbuf_str(&g_input).length == (uint64)0;
     if (empty_line || !g_input_focused) {
       if (mythic_key_pressed(ui, MYTHIC_KEY_HOME, -1)) { g_lv_top = 0.0; }
-      if (mythic_key_pressed(ui, MYTHIC_KEY_END, -1)) { g_lv_top = (float32)lv_count(); }
+      if (mythic_key_pressed(ui, MYTHIC_KEY_END, -1)) {
+        g_lv_top = (float32)lv_count();
+      }
     }
     lv_clamp();
   }
+
   if (g_input_focused) { return; }
   if (mythic_key_pressed(ui, 70, 0)) { g_fit_all = true; }
   if (mythic_key_pressed(ui, 72, 0)) {
@@ -4199,7 +4498,10 @@ fn keys(ui: MythicUi*) {
     g_follow = !g_follow;
     if (g_follow) { g_focus_new = true; }
   }
-  if (mythic_key_pressed(ui, MYTHIC_KEY_ENTER, -1) || mythic_key_pressed(ui, 73, 0)) { g_focused_once = false; }
+  if (mythic_key_pressed(ui, MYTHIC_KEY_ENTER, -1) ||
+      mythic_key_pressed(ui, 73, 0)) {
+    g_focused_once = false;
+  }
   if (mythic_key_pressed(ui, 83, 0)) { q_text("step"); }
   if (mythic_key_pressed(ui, 66, 0)) { g_side_hidden = !g_side_hidden; }
   if (mythic_key_pressed(ui, 66, MYTHIC_MOD_SHIFT)) {
@@ -4210,8 +4512,10 @@ fn keys(ui: MythicUi*) {
 }
 
 fn busy() -> bool {
-  return g_go || g_engine_busy || g_shot_pan || g_q_len > 0 || g_del_t0 >= 0.0 || g_cam_moving || g_drag || g_count_pending ||
-         (g_anim_kind != AN_NONE && anim_age() < 2.7) || (hits_live() && g_now - g_hit_t0 < 1.3) || moving();
+  return g_go || g_engine_busy || g_shot_pan || g_q_len > 0 ||
+      g_del_t0 >= 0.0 || g_cam_moving || g_drag || g_count_pending ||
+      (g_anim_kind != AN_NONE && anim_age() < 2.7) ||
+      (hits_live() && g_now - g_hit_t0 < 1.3) || moving();
 }
 
 var g_side_w: float32 = -1.0;
@@ -4246,7 +4550,9 @@ fn clamp_layout(ui: MythicUi*) {
   var maxw: float32 = mythic_maxf(240.0, mythic_floorf(ui->size.x * 0.5));
   g_side_w = mythic_clampf(g_side_w, 240.0, maxw);
   var maxh: float32 = mythic_floorf((ui->size.y - 60.0) * 0.66);
-  if (g_log_h > 0.0) { g_log_h = mythic_clampf(g_log_h, log_min(), mythic_maxf(log_min(), maxh)); }
+  if (g_log_h > 0.0) {
+    g_log_h = mythic_clampf(g_log_h, log_min(), mythic_maxf(log_min(), maxh));
+  }
 }
 
 fn prefs_path(out: MercBuf*) -> bool {
@@ -4297,11 +4603,22 @@ fn prefs_save() {
   fmt_c(32);
   fmt_i((int64)g_log_h);
   fmt_c(32);
-  if (g_side_hidden) { fmt_c(49); } else { fmt_c(48); }
+  if (g_side_hidden) {
+    fmt_c(49);
+  } else {
+    fmt_c(48);
+  }
   fmt_c(32);
-  if (g_side_left) { fmt_c(49); } else { fmt_c(48); }
+  if (g_side_left) {
+    fmt_c(49);
+  } else {
+    fmt_c(48);
+  }
   fmt_c(10);
-  if (g_prefs_saved.len == g_fmt.len && memcmp((rawptr)g_prefs_saved.data, (rawptr)g_fmt.data, g_fmt.len) == 0) { return; }
+  if (g_prefs_saved.len == g_fmt.len &&
+      memcmp((rawptr)g_prefs_saved.data, (rawptr)g_fmt.data, g_fmt.len) == 0) {
+    return;
+  }
   merc_buf_clear(&g_prefs_saved);
   merc_buf_add(&g_prefs_saved, g_fmt.data, g_fmt.len);
   var path: MercBuf;
@@ -4313,14 +4630,19 @@ fn prefs_save() {
   syscall(3, fd);
 }
 
-fn divider_paint_cb(ui: MythicUi*, p: MythicPainter*, box: MythicRect, ud: rawptr) {
+fn divider_paint_cb(ui: MythicUi*, p: MythicPainter*, box: MythicRect,
+    ud: rawptr) {
   var which: int32 = (int32)(int64)ud;
   var col: uint32 = C_BORDER;
   if (g_div_hot == which || g_div_drag == which) { col = C_VIOLET; }
   if (which == 1) {
-    mythic_paint_fill(p, rect(box.x + mythic_floorf(box.w / 2.0), box.y, 1.0, box.h), mythic_radius(0.0), col);
+    mythic_paint_fill(p,
+        rect(box.x + mythic_floorf(box.w / 2.0), box.y, 1.0, box.h),
+        mythic_radius(0.0), col);
   } else {
-    mythic_paint_fill(p, rect(box.x, box.y + mythic_floorf(box.h / 2.0), box.w, 1.0), mythic_radius(0.0), col);
+    mythic_paint_fill(p,
+        rect(box.x, box.y + mythic_floorf(box.h / 2.0), box.w, 1.0),
+        mythic_radius(0.0), col);
   }
 }
 
@@ -4328,18 +4650,31 @@ fn divider(ui: MythicUi*, which: int32) {
   var id: uint64 = mythic_id(ui, "divider");
   if (which == 2) { id = mythic_id(ui, "divider2"); }
   if (which == 1) {
-    mythic_box_begin(ui, { id: id, width: mythic_fixed(9.0), height: mythic_grow() });
+    mythic_box_begin(ui,
+        { id: id, width: mythic_fixed(9.0), height: mythic_grow() });
   } else {
-    mythic_box_begin(ui, { id: id, width: mythic_grow(), height: mythic_fixed(9.0) });
+    mythic_box_begin(ui,
+        { id: id, width: mythic_grow(), height: mythic_fixed(9.0) });
   }
-  var r: MythicResp = mythic_interact(ui, id, MYTHIC_SENSE_CLICK | MYTHIC_SENSE_DRAG);
+
+  var r: MythicResp = mythic_interact(ui, id,
+      MYTHIC_SENSE_CLICK | MYTHIC_SENSE_DRAG);
   mythic_end(ui);
   mythic_node_paint(ui, &divider_paint_cb, (rawptr)(int64)which);
   if (r.hovered || g_div_drag == which) {
-    if (which == 1) { mythic_set_cursor(ui, MYTHIC_CURSOR_RESIZE_H); } else { mythic_set_cursor(ui, MYTHIC_CURSOR_RESIZE_V); }
+    if (which == 1) {
+      mythic_set_cursor(ui, MYTHIC_CURSOR_RESIZE_H);
+    } else {
+      mythic_set_cursor(ui, MYTHIC_CURSOR_RESIZE_V);
+    }
   }
+
   if (ui->pass != 0) { return; }
-  if (r.hovered) { g_div_hot = which; } else if (g_div_hot == which) { g_div_hot = 0; }
+  if (r.hovered) {
+    g_div_hot = which;
+  } else if (g_div_hot == which) {
+    g_div_hot = 0;
+  }
   var m: MythicVec2 = ui->in.mouse;
   if (r.pressed) {
     if (g_div_drag != which) {
@@ -4358,21 +4693,36 @@ fn divider(ui: MythicUi*, which: int32) {
       }
     } else if (which == 1) {
       var dx: float32 = m.x - g_div_from;
-      if (g_side_left) { g_side_w = g_div_start + dx; } else { g_side_w = g_div_start - dx; }
+      if (g_side_left) {
+        g_side_w = g_div_start + dx;
+      } else {
+        g_side_w = g_div_start - dx;
+      }
     } else {
       var nh: float32 = g_div_start - (m.y - g_div_from);
-      if (nh < log_min() * 0.6) { g_log_h = 0.0; } else { g_log_h = mythic_maxf(nh, log_min()); }
+      if (nh < log_min() * 0.6) {
+        g_log_h = 0.0;
+      } else {
+        g_log_h = mythic_maxf(nh, log_min());
+      }
     }
   } else if (g_div_drag == which) {
     g_div_drag = 0;
   }
+
   if (r.clicked && r.click_count >= 2) {
-    if (which == 1) { g_side_w = side_default(ui); } else { g_log_h = log_default(ui); }
+    if (which == 1) {
+      g_side_w = side_default(ui);
+    } else {
+      g_log_h = log_default(ui);
+    }
   }
 }
 
 fn results_bar(ui: MythicUi*) {
-  mythic_row_begin(ui, { width: mythic_grow(), height: mythic_fixed(52.0), pad: mythic_pad_xy(48.0, 0.0), gap: 18, align_y: MYTHIC_ALIGN_CENTER });
+  mythic_row_begin(ui,
+      { width: mythic_grow(), height: mythic_fixed(52.0),
+      pad: mythic_pad_xy(48.0, 0.0), gap: 18, align_y: MYTHIC_ALIGN_CENTER });
     var pst: MythicTextStyle = mono(15.0);
     var shown: int64 = g_find_found;
     fmt_reset();
@@ -4385,10 +4735,22 @@ fn results_bar(ui: MythicUi*) {
     fmt_reset();
     fmt_group(g_find_found);
     if (g_sh.inside) {
-      if (g_find_found == 1) { fmt_s(" place in "); } else { fmt_s(" places in "); }
+      if (g_find_found == 1) {
+        fmt_s(" place in ");
+      } else {
+        fmt_s(" places in ");
+      }
       fmt_group(g_find_rows);
-      if (g_find_rows == 1) { fmt_s(" sentence"); } else { fmt_s(" sentences"); }
-    } else if (g_find_found == 1) { fmt_s(" match"); } else { fmt_s(" matches"); }
+      if (g_find_rows == 1) {
+        fmt_s(" sentence");
+      } else {
+        fmt_s(" sentences");
+      }
+    } else if (g_find_found == 1) {
+      fmt_s(" match");
+    } else {
+      fmt_s(" matches");
+    }
     txt(ui, fmt_view(), sans(14.0), C_TEXT2);
     txt(ui, merc_buf_view(&g_find_took), mono(13.0), C_MUTED);
     if (shown > merc_count(&g_res)) {
@@ -4401,13 +4763,16 @@ fn results_bar(ui: MythicUi*) {
     mythic_spacer(ui);
     if (link(ui, "Show all", "showall", true)) { g_results = false; }
   mythic_end(ui);
-  mythic_row_begin(ui, { width: mythic_grow(), height: mythic_fixed(36.0), pad: mythic_pad_xy(48.0, 0.0), gap: 22, align_y: MYTHIC_ALIGN_CENTER });
+  mythic_row_begin(ui,
+      { width: mythic_grow(), height: mythic_fixed(36.0),
+      pad: mythic_pad_xy(48.0, 0.0), gap: 22, align_y: MYTHIC_ALIGN_CENTER });
     if (g_lv_mode == 2) {
       if (link(ui, "Back", "lvback", true)) { lv_set(1, g_lv_var, 0); }
       var e: VEntry* = &g_ve[g_lv_entry];
       var vst: MythicTextStyle = mono(14.0);
       vst.flags = MYTHIC_TEXT_ELLIPSIS;
-      txt(ui, bview(&g_vname, g_vname_off[g_lv_var], g_vname_len[g_lv_var]), mono(14.0), C_AMBER);
+      txt(ui, bview(&g_vname, g_vname_off[g_lv_var], g_vname_len[g_lv_var]),
+          mono(14.0), C_AMBER);
       mythic_box_begin(ui, { width: mythic_grow(), clip: true });
         txt(ui, bview(&g_vtext, e->off, e->len), vst, C_TEXT);
       mythic_end(ui);
@@ -4422,7 +4787,9 @@ fn results_bar(ui: MythicUi*) {
         fmt_s("by ");
         fmt_s(bview(&g_vname, g_vname_off[v], g_vname_len[v]));
         mythic_push_id_int(ui, (int64)v);
-        if (link(ui, fmt_view(), "lvby", g_lv_mode == 1 && g_lv_var == v)) { lv_set(1, v, 0); }
+        if (link(ui, fmt_view(), "lvby", g_lv_mode == 1 && g_lv_var == v)) {
+          lv_set(1, v, 0);
+        }
         mythic_pop_id(ui);
       }
       mythic_spacer(ui);
@@ -4495,6 +4862,7 @@ fn frame(ui: MythicUi*, ud: rawptr) {
     if (fm > g_frame_ms_max) { g_frame_ms_max = fm; }
     g_frame_n = g_frame_n + 1;
   }
+
   if (!g_prefs_loaded) {
     g_prefs_loaded = true;
     if (g_shot.length == (uint64)0) { prefs_load(); }
@@ -4502,13 +4870,16 @@ fn frame(ui: MythicUi*, ud: rawptr) {
   clamp_layout(ui);
   var log_h: float32 = g_log_h;
   if (g_console_big) { log_h = mythic_floorf((ui->size.y - 60.0) * 0.66); }
-  mythic_column_begin(ui, { width: mythic_grow(), height: mythic_grow(), bg: C_BG });
+  mythic_column_begin(ui,
+      { width: mythic_grow(), height: mythic_grow(), bg: C_BG });
     topbar(ui);
     tree_row(ui);
     divider(ui, 2);
     console(ui, log_h);
   mythic_end(ui);
-  if (ui->pass == 0 && g_div_drag == 0 && g_shot.length == (uint64)0) { prefs_save(); }
+  if (ui->pass == 0 && g_div_drag == 0 && g_shot.length == (uint64)0) {
+    prefs_save();
+  }
   if (busy()) {
     mythic_request_frame_in(ui, 16);
   } else if (merc_zip_depth(&g_sh.zip) > 0 && !g_reduced) {
@@ -4566,6 +4937,7 @@ fn run_act(plat: MythicPlatform*, a: string) {
     mythic_headless_push(plat, ev);
     return;
   }
+
   if (a == "key:tab") {
     push_key(plat, MYTHIC_KEY_TAB);
     return;
@@ -4594,6 +4966,7 @@ fn run_act(plat: MythicPlatform*, a: string) {
     mythic_headless_push(plat, sb);
     return;
   }
+
   if (a == "key:esc") {
     push_key(plat, MYTHIC_KEY_ESCAPE);
     return;
@@ -4622,6 +4995,7 @@ fn run_act(plat: MythicPlatform*, a: string) {
     g_dg_phase = 1;
     return;
   }
+
   if (has_prefix(a, "click:") || has_prefix(a, "wheel:")) {
     var nums: int64[3];
     var k: int32 = 0;
@@ -4629,7 +5003,13 @@ fn run_act(plat: MythicPlatform*, a: string) {
     var neg: bool = false;
     for j: int64 in 6..(int64)a.length + 1 {
       if (j == (int64)a.length || a.chars[j] == 44) {
-        if (k < 3) { if (neg) { nums[k] = 0 - v; } else { nums[k] = v; } }
+        if (k < 3) {
+          if (neg) {
+            nums[k] = 0 - v;
+          } else {
+            nums[k] = v;
+          }
+        }
         k = k + 1;
         v = 0;
         neg = false;
@@ -4658,6 +5038,7 @@ fn run_act(plat: MythicPlatform*, a: string) {
     g_click_y = mv.y;
     return;
   }
+
   for i: int64 in 0..(int64)a.length {
     var ev: MythicEvent;
     ev.kind = MYTHIC_EV_TEXT;
@@ -4665,6 +5046,7 @@ fn run_act(plat: MythicPlatform*, a: string) {
     mythic_headless_push(plat, ev);
   }
 }
+
 var g_step_sum: float64 = 0.0;
 var g_step_max: float64 = 0.0;
 var g_step_n: int64 = 0;
@@ -4676,7 +5058,8 @@ var g_busy_slow: int64 = 0;
 var g_layout_max: float64 = 0.0;
 
 fn shot_run() -> int32 {
-  var app: MythicApp* = mythic_app_create_headless({ title: "merc", width: g_shot_w, height: g_shot_h, dark: true }, 1.0);
+  var app: MythicApp* = mythic_app_create_headless({ title: "merc",
+      width: g_shot_w, height: g_shot_h, dark: true }, 1.0);
   if (app == 0) {
     println("could not create the headless app");
     return 1;
@@ -4742,7 +5125,8 @@ fn shot_run() -> int32 {
       upv.y = g_click_y;
       mythic_headless_push(plat, upv);
     }
-    if (drained_at >= 0 && g_dg_phase == 0 && g_act_i < g_act_n && guard % 6 == 0) {
+    if (drained_at >= 0 && g_dg_phase == 0 && g_act_i < g_act_n &&
+        guard % 6 == 0) {
       run_act(plat, g_acts[g_act_i]);
       g_act_i = g_act_i + 1;
       drained_at = vt;
@@ -4761,7 +5145,8 @@ fn shot_run() -> int32 {
       g_step_n = g_step_n + 1;
       if (step_ms > g_step_max) { g_step_max = step_ms; }
     }
-    var idle: bool = g_q_len == 0 && g_del_t0 < 0.0 && !g_count_pending && vt > g_shot_settle;
+    var idle: bool = g_q_len == 0 && g_del_t0 < 0.0 && !g_count_pending &&
+        vt > g_shot_settle;
     if (idle && drained_at < 0) {
       drained_at = vt;
       g_frame_ms_sum = 0.0;
@@ -4775,19 +5160,26 @@ fn shot_run() -> int32 {
       if (fm > pan_max) { pan_max = fm; }
     }
     if (g_shot_at > 0 && vt >= g_shot_at) { break; }
-    if (g_shot_at <= 0 && drained_at >= 0 && vt - drained_at >= g_shot_wait) { break; }
+    if (g_shot_at <= 0 && drained_at >= 0 && vt - drained_at >= g_shot_wait) {
+      break;
+    }
   }
+
   var ok: bool = mythic_app_save_png(app, g_shot);
   var frames: int64 = mythic_app_frames(app);
   var avg10: int64 = 0;
-  if (g_frame_n > 0) { avg10 = (int64)(g_frame_ms_sum / (float64)g_frame_n * 100.0); }
-  var last10: int64 = (int64)((float64)mythic_frame_ms(mythic_app_ui(app)) * 100.0);
+  if (g_frame_n > 0) {
+    avg10 = (int64)(g_frame_ms_sum / (float64)g_frame_n * 100.0);
+  }
+  var last10: int64 =
+      (int64)((float64)mythic_frame_ms(mythic_app_ui(app)) * 100.0);
   var lay10: int64 = (int64)(g_layout_ms * 100.0);
   println("wrote {g_shot}: frames={frames} expressions={merc_count(trie())} nodes={merc_node_count(trie())} vnodes={g_nv} cells={g_nc} layout_ms_x100={lay10} frame_ms_x100_last={last10} frame_ms_x100_avg={avg10}");
   if (g_step_n > 0) {
     var sa: int64 = (int64)(g_step_sum / (float64)g_step_n * 100.0);
     var sm: int64 = (int64)(g_step_max * 100.0);
-    println("whole frame (layout, ui, raster): frames={g_step_n} ms_x100_avg={sa} ms_x100_max={sm}");
+    println(
+        "whole frame (layout, ui, raster): frames={g_step_n} ms_x100_avg={sa} ms_x100_max={sm}");
   }
   if (g_busy_n > 0) {
     var bm: int64 = (int64)(g_busy_max * 100.0);
@@ -4804,7 +5196,8 @@ fn shot_run() -> int32 {
   if (pan_frames > 0) {
     var pa: int64 = (int64)(pan_sum / (float64)pan_frames * 100.0);
     var pm: int64 = (int64)(pan_max * 100.0);
-    println("pan: frames={pan_frames} frame_ms_x100_avg={pa} frame_ms_x100_max={pm}");
+    println(
+        "pan: frames={pan_frames} frame_ms_x100_avg={pa} frame_ms_x100_max={pm}");
   }
   mythic_app_destroy(app);
   if (!ok) { return 1; }
@@ -4877,22 +5270,30 @@ export fn merc_view(argc: int32, argv: cstring*) -> int32 {
       return 0;
     } else {
       fmt_reset();
-      if (ends_with(a, ".mm2") || ends_with(a, ".metta")) { fmt_s("load "); } else { fmt_s("run "); }
+      if (ends_with(a, ".mm2") || ends_with(a, ".metta")) {
+        fmt_s("load ");
+      } else {
+        fmt_s("run ");
+      }
       fmt_s(a);
       q_text(fmt_view());
       i = i + 1;
     }
   }
+
   io_start();
   var rc: int32 = 0;
   if (g_shot.length > (uint64)0) {
     rc = shot_run();
   } else {
-    rc = mythic_run({ title: "merc viewer", width: g_shot_w, height: g_shot_h, dark: true }, &frame, (rawptr)0);
+    rc = mythic_run({ title: "merc viewer", width: g_shot_w, height: g_shot_h,
+        dark: true }, &frame, (rawptr)0);
     if (rc != 0) {
-      println("could not open the window (is DISPLAY set, and is an X server running?)");
+      println(
+          "could not open the window (is DISPLAY set, and is an X server running?)");
     }
   }
+
   io_stop();
   merc_shell_free(&g_sh);
   return rc;

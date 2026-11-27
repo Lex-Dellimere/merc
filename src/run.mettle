@@ -1,9 +1,5 @@
-// running rules. a rule is an expression stored like any other:
-//   (exec place (, pattern pattern) (, shape shape))
-// one step takes the first rule in key order out of the trie, finds every
-// way all its patterns match at once, and stores each shape with the
-// variables filled in. a rule can see itself while it runs, and nothing it
-// stores is seen until the step is over. same meaning as MORK.
+// runs rules of the form (exec place (, patterns) (, shapes)), first in key
+// order. writes show up only after the step, same as MORK.
 
 import "std/mem";
 import "trie";
@@ -53,7 +49,7 @@ struct Seek {
   astart: int64[257];
   nadds: int64;
   batch: bool;
-  pstate: int32;        // 0 take the next kept prefix, 1 search below it, 2 walk below it
+  pstate: int32;        // 0 next prefix, 1 search below it, 2 walk below it
   pfloor: int64;
   matches: int64;
   unifies: int64;
@@ -110,11 +106,12 @@ export struct MercRun {
   order: MercBuf;
   spare: MercBuf;
   extra: MercBuf;
-  // when set, runs merc_run_part for parts 0 to n on any cores and returns once all are done.
+  // runs merc_run_part on parts 0 to n across cores and waits for all
   spread: fn(MercRun*, int64) -> bool;
   wide_min: int64;
   used: int64;
-  phase: int32;         // what merc_run_part does: 0 search, 1 sort into ranges, 2 build a range, 3 count below prefixes
+  // 0 search, 1 sort into ranges, 2 build a range, 3 count below prefixes
+  phase: int32;
   by_prefix: bool;
   tail_walk: bool;
   floor0: int64;
@@ -171,8 +168,7 @@ fn run_view(p: uint8*, n: int64) -> string {
   return s;
 }
 
-// adds e to out with its variables numbered from first. gives how many
-// variables e has, or -1 past 64.
+// gives the variable count of e, or -1 past 64
 fn run_shift(e: string, first: int32, out: MercBuf*) -> int32 {
   var p: uint8* = e.chars;
   var n: int64 = (int64)e.length;
@@ -220,13 +216,13 @@ fn run_unify_all(r: Seek*, pats: uint8*, pat_end: int64*, upto: int64) -> bool {
   return merc_unify(r->u, merc_buf_view(&r->ptup), merc_buf_view(&r->dtup));
 }
 
-// the patterns and what each one found, as two lists unified one item at a
-// time. the items below a level stay while only that level moves on.
 fn run_unify(r: Seek*, pl: Plan*, upto: int64) -> bool {
   r->unifies = r->unifies + 1;
   var u: MercUnify* = r->u;
   var pats: uint8* = r->pats;
-  if (3 + pl->pat_end[upto - 1] > (int64)MERC_UNIFY_CAP) { return run_unify_all(r, pats, &pl->pat_end[0], upto); }
+  if (3 + pl->pat_end[upto - 1] > (int64)MERC_UNIFY_CAP) {
+    return run_unify_all(r, pats, &pl->pat_end[0], upto);
+  }
   var keep: int64 = r->inc_done;
   if (keep > upto - 1) { keep = upto - 1; }
   if (keep == 0) {
@@ -247,9 +243,12 @@ fn run_unify(r: Seek*, pl: Plan*, upto: int64) -> bool {
     merc_unify_undo(u, r->tmark[keep], pl->before[keep], r->dvars[keep]);
     r->dtup.len = r->dlen[keep];
   }
+
   for i: int64 in keep..upto {
     var got: int32 = run_shift(merc_buf_view(&r->found[i]), r->dvars[i], &r->dtup);
-    if (got < 0 || r->dtup.len > (int64)MERC_UNIFY_CAP) { return run_unify_all(r, pats, &pl->pat_end[0], upto); }
+    if (got < 0 || r->dtup.len > (int64)MERC_UNIFY_CAP) {
+      return run_unify_all(r, pats, &pl->pat_end[0], upto);
+    }
     var pv: string = run_view(r->ptup.data, 3 + pl->pat_end[i]);
     var ok: bool = merc_unify_item(u, pv, 3 + pl->pat_at[i], merc_buf_view(&r->dtup), r->dlen[i]);
     r->dlen[i + 1] = r->dtup.len;
@@ -260,6 +259,7 @@ fn run_unify(r: Seek*, pl: Plan*, upto: int64) -> bool {
       return false;
     }
   }
+
   r->inc_done = upto;
   return true;
 }
@@ -281,16 +281,46 @@ fn run_is(p: uint8*, arity: uint8, name: string) -> bool {
 }
 
 fn run_sink(s: uint8*, n: int64, skip: int64*) -> uint8 {
-  if (n >= 4 && s[0] == 2 && s[1] == 0xC1 && s[2] == 43) { *skip = 3; return K_ADD; }
-  if (n >= 4 && s[0] == 2 && s[1] == 0xC1 && s[2] == 45) { *skip = 3; return K_DEL; }
-  if (n > 7 && run_is(s, 4, "count")) { *skip = 7; return K_COUNT; }
-  if (n > 5 && run_is(s, 4, "sum")) { *skip = 5; return K_SUM; }
-  if (n > 5 && run_is(s, 4, "and")) { *skip = 5; return K_AND; }
-  if (n > 6 && run_is(s, 4, "pure")) { *skip = 6; return K_PURE; }
-  if (n > 6 && run_is(s, 4, "fsum")) { *skip = 6; return K_FSUM; }
-  if (n > 6 && run_is(s, 4, "fmin")) { *skip = 6; return K_FMIN; }
-  if (n > 6 && run_is(s, 4, "fmax")) { *skip = 6; return K_FMAX; }
-  if (n > 7 && run_is(s, 4, "fprod")) { *skip = 7; return K_FPROD; }
+  if (n >= 4 && s[0] == 2 && s[1] == 0xC1 && s[2] == 43) {
+    *skip = 3;
+    return K_ADD;
+  }
+  if (n >= 4 && s[0] == 2 && s[1] == 0xC1 && s[2] == 45) {
+    *skip = 3;
+    return K_DEL;
+  }
+  if (n > 7 && run_is(s, 4, "count")) {
+    *skip = 7;
+    return K_COUNT;
+  }
+  if (n > 5 && run_is(s, 4, "sum")) {
+    *skip = 5;
+    return K_SUM;
+  }
+  if (n > 5 && run_is(s, 4, "and")) {
+    *skip = 5;
+    return K_AND;
+  }
+  if (n > 6 && run_is(s, 4, "pure")) {
+    *skip = 6;
+    return K_PURE;
+  }
+  if (n > 6 && run_is(s, 4, "fsum")) {
+    *skip = 6;
+    return K_FSUM;
+  }
+  if (n > 6 && run_is(s, 4, "fmin")) {
+    *skip = 6;
+    return K_FMIN;
+  }
+  if (n > 6 && run_is(s, 4, "fmax")) {
+    *skip = 6;
+    return K_FMAX;
+  }
+  if (n > 7 && run_is(s, 4, "fprod")) {
+    *skip = 7;
+    return K_FPROD;
+  }
   var head: bool = run_is(s, 3, "head");
   if (n > 7 && (head || run_is(s, 3, "tail"))) {
     var tag: uint8 = s[6];
@@ -351,15 +381,14 @@ fn bits(x: uint64) -> int64 {
   return n;
 }
 
-// the set of matches does not depend on the order the patterns run in, so
-// each next pattern is the one with the fewest new variables, then the most
-// fixed parts. variables are numbered again for that order, in the patterns
-// and in the shapes, and every write comes out the same.
+// match order does not change the result, so the pattern with the fewest new
+// variables goes next and variables are renumbered to fit
 fn run_reorder(r: MercRun*, pl: Plan*, tpl: int64, tpl_n: int64) {
   var k: int64 = pl->k;
   var p: uint8* = r->pats.data;
   var uses: uint64[16];
   var fixed: int64[16];
+
   for i: int64 in 0..k {
     uses[i] = 0;
     fixed[i] = 0;
@@ -368,16 +397,23 @@ fn run_reorder(r: MercRun*, pl: Plan*, tpl: int64, tpl_n: int64) {
     while (at < pl->pat_end[i]) {
       var tag: uint8 = p[at];
       at = at + 1;
-      if (tag > 0xC0) { fixed[i] = fixed[i] + 1; at = at + (int64)(tag & 63); }
-      else if (tag == 0xC0) { uses[i] = uses[i] | ((uint64)1 << (uint64)cnt); cnt = cnt + 1; }
+      if (tag > 0xC0) {
+        fixed[i] = fixed[i] + 1;
+        at = at + (int64)(tag & 63);
+      } else if (tag == 0xC0) {
+        uses[i] = uses[i] | ((uint64)1 << (uint64)cnt);
+        cnt = cnt + 1;
+      }
       else if (tag >= 0x80) { uses[i] = uses[i] | ((uint64)1 << (uint64)(tag & 63)); }
     }
   }
+
   var perm: int64[16];
   var taken: bool[16];
   for i2: int64 in 0..k { taken[i2] = false; }
   var bound: uint64 = 0;
   var moved: bool = false;
+
   for step: int64 in 0..k {
     var best: int64 = -1;
     var best_new: int64 = 0;
@@ -397,6 +433,7 @@ fn run_reorder(r: MercRun*, pl: Plan*, tpl: int64, tpl_n: int64) {
     bound = bound | uses[best];
     if (best != step) { moved = true; }
   }
+
   pl->moved = moved;
   if (!moved) { return; }
   var newid: int32[64];
@@ -406,6 +443,7 @@ fn run_reorder(r: MercRun*, pl: Plan*, tpl: int64, tpl_n: int64) {
   merc_buf_clear(out);
   var at2: int64[16];
   var end2: int64[16];
+
   for s2: int64 in 0..k {
     var i3: int64 = perm[s2];
     at2[s2] = out->len;
@@ -437,23 +475,33 @@ fn run_reorder(r: MercRun*, pl: Plan*, tpl: int64, tpl_n: int64) {
     }
     end2[s2] = out->len;
   }
+
   merc_buf_clear(&r->pats);
   merc_buf_add(&r->pats, out->data, out->len);
+
   for s3: int64 in 0..k {
     pl->pat_at[s3] = at2[s3];
     pl->pat_end[s3] = end2[s3];
   }
+
   var q: uint8* = r->pats.data;
+
   for i4: int64 in 0..k {
-    pl->before[i4 + 1] = pl->before[i4] + run_newvars(q + pl->pat_at[i4], pl->pat_end[i4] - pl->pat_at[i4]);
+    pl->before[i4 + 1] = pl->before[i4] +
+      run_newvars(q + pl->pat_at[i4], pl->pat_end[i4] - pl->pat_at[i4]);
   }
+
   merc_buf_clear(&r->same);
   merc_buf_add(&r->same, r->rule.data, r->rule.len);
   var t: uint8* = r->same.data;
   var b: int64 = tpl + 3;
+
   while (b < tpl + tpl_n) {
     var tag3: uint8 = t[b];
-    if (tag3 > 0xC0) { b = b + 1 + (int64)(tag3 & 63); continue; }
+    if (tag3 > 0xC0) {
+      b = b + 1 + (int64)(tag3 & 63);
+      continue;
+    }
     if (tag3 >= 0x80 && tag3 < 0xC0 && (int32)(tag3 & 63) < pl->pat_vars) {
       t[b] = (uint8)(0x80 + newid[(int32)(tag3 & 63)]);
     }
@@ -461,9 +509,9 @@ fn run_reorder(r: MercRun*, pl: Plan*, tpl: int64, tpl_n: int64) {
   }
 }
 
-// one rule. gives 1 when it ran, 2 when merc cannot run its kind, 0 when the
-// expression is not a rule at all.
+// 1 ran, 2 merc cannot run this kind, 0 not a rule
 fn run_plan(r: MercRun*, pl: Plan*) -> int32 {
+
   var e: uint8* = r->rule.data;
   var n: int64 = r->rule.len;
   var at: int64 = 6;
@@ -485,11 +533,11 @@ fn run_plan(r: MercRun*, pl: Plan*) -> int32 {
   var m: int64 = (int64)e[tpl] - 1;
   if (m > RUN_SHAPES) { return 2; }
 
-  // the patterns one after another. a source's wrapper holds no variables,
-  // so taking it off keeps the numbering.
+  // a source wrapper holds no variables, so taking it off keeps the numbering
   merc_buf_clear(&r->pats);
   var k: int64 = 0;
   var p_at: int64 = pat + 3;
+
   for i: int64 in 0..items {
     var s_n: int64 = merc_span(e + p_at, n - p_at);
     if (!src) {
@@ -506,7 +554,8 @@ fn run_plan(r: MercRun*, pl: Plan*) -> int32 {
       merc_buf_add(&r->pats, e + p_at + 5, s_n - 5);
       pl->pat_end[k] = r->pats.len;
       k = k + 1;
-    } else if (s_n > 4 && e[p_at] == 3 && e[p_at + 1] == 0xC2 && (e[p_at + 2] == 33 || e[p_at + 2] == 61) && e[p_at + 3] == 61) {
+    } else if (s_n > 4 && e[p_at] == 3 && e[p_at + 1] == 0xC2 &&
+      (e[p_at + 2] == 33 || e[p_at + 2] == 61) && e[p_at + 3] == 61) {
       if (k + 2 > RUN_MAX) { return 2; }
       var a_at: int64 = p_at + 4;
       var a_n: int64 = merc_span(e + a_at, n - a_at);
@@ -526,17 +575,22 @@ fn run_plan(r: MercRun*, pl: Plan*) -> int32 {
     }
     p_at = p_at + s_n;
   }
+
   pl->k = k;
   var pats: uint8* = r->pats.data;
   pl->before[0] = 0;
+
   for i2: int64 in 0..k {
-    pl->before[i2 + 1] = pl->before[i2] + run_newvars(pats + pl->pat_at[i2], pl->pat_end[i2] - pl->pat_at[i2]);
+    pl->before[i2 + 1] = pl->before[i2] +
+      run_newvars(pats + pl->pat_at[i2], pl->pat_end[i2] - pl->pat_at[i2]);
   }
+
   pl->pat_vars = pl->before[k];
 
   pl->m = m;
   var t_at: int64 = tpl + 3;
   var base: int32 = pl->pat_vars;
+
   for j: int64 in 0..m {
     var t_n: int64 = merc_span(e + t_at, n - t_at);
     pl->tpl_at[j] = t_at;
@@ -566,16 +620,20 @@ fn run_plan(r: MercRun*, pl: Plan*) -> int32 {
     base = base + run_newvars(e + t_at, t_n);
     t_at = t_at + t_n;
   }
+
   for j2: int64 in 0..m {
     pl->root[j2] = j2;
     for c: int64 in 0..m {
       var cn: int64 = pl->req_n[c];
       var best: int64 = pl->root[j2];
-      if (cn <= pl->req_n[j2] && memcmp(e + pl->req_at[c], e + pl->req_at[j2], cn) == 0 && cn < pl->req_n[best]) {
+      if (cn <= pl->req_n[j2] &&
+        memcmp(e + pl->req_at[c], e + pl->req_at[j2], cn) == 0 &&
+        cn < pl->req_n[best]) {
         pl->root[j2] = c;
       }
     }
   }
+
   pl->moved = false;
   if (!src && k >= 2) { run_reorder(r, pl, tpl, tpl_n); }
   return 1;
@@ -593,6 +651,7 @@ fn fast_fill(b: Binds*, shape: uint8*, n: int64, base: int32, bound: int32, out:
   b->fresh = 0;
   var next: int32 = base;
   var i: int64 = 0;
+
   while (i < n) {
     var tag: uint8 = shape[i];
     i = i + 1;
@@ -607,7 +666,11 @@ fn fast_fill(b: Binds*, shape: uint8*, n: int64, base: int32, bound: int32, out:
       merc_buf_push(out, tag);
     } else {
       var id: int32 = next;
-      if (tag == 0xC0) { next = next + 1; } else { id = (int32)(tag & 63); }
+      if (tag == 0xC0) {
+        next = next + 1;
+      } else {
+        id = (int32)(tag & 63);
+      }
       if (id < bound) {
         merc_buf_add(out, b->at[id], b->len[id]);
       } else if (b->extra[id] < 0) {
@@ -656,11 +719,10 @@ fn run_ask(r: Seek*, level: int64, ask: string) {
   }
 }
 
-// a pattern that is plain keys, maybe ending in new variables, is
-// walked straight down the trie. gives false when a stored variable sits
-// where the walk would pass, and then the search has to do it. stored
-// variables below the new ones are fine, such a match is not exact.
+// walks a plain key pattern straight down the trie. false when a stored
+// variable sits on the path, and the search takes over
 fn probe_start(r: Seek*, level: int64, ask: string) -> bool {
+
   if (r->zlive[level] == 0) {
     r->zips[level] = merc_zip(r->trie);
     r->zlive[level] = 1;
@@ -675,6 +737,7 @@ fn probe_start(r: Seek*, level: int64, ask: string) -> bool {
   r->ztail[level] = (int32)(n - end);
   var i: int64 = 0;
   var gone: bool = false;
+
   while (i < end) {
     var tag: uint8 = p[i];
     if (tag >= 0x80 && tag <= 0xC0) { return false; }
@@ -690,6 +753,7 @@ fn probe_start(r: Seek*, level: int64, ask: string) -> bool {
       i = i + len;
     }
   }
+
   r->zfloor[level] = merc_zip_depth(z);
   r->zstate[level] = 0;
   if (tail) { r->zstate[level] = 1; }
@@ -793,6 +857,7 @@ fn prefix_next(s: Seek*, r: MercRun*, pat0: string, at: int64*, hi: int64) -> bo
     *at = *at + 1;
     s->pstate = 1;
   }
+
   return false;
 }
 
@@ -826,6 +891,7 @@ fn cut_prefixes(r: MercRun*, s: Seek*) -> int64 {
   merc_buf_text(&r->first, start);
   merc_buf_add(&r->first_at, (uint8*)&pe[0], 16);
   var n: int64 = 1;
+
   for round in 0..12 {
     if (n >= 2048) { break; }
     merc_buf_clear(&r->extra);
@@ -865,12 +931,11 @@ fn cut_prefixes(r: MercRun*, s: Seek*) -> int64 {
     merc_buf_add(&r->first_at, r->spare.data, r->spare.len);
     if (!grew) { break; }
   }
+
   merc_zip_reset(z);
   return n;
 }
 
-// true when every key below the fixed start of p is a match to try, so
-// counting keys says how much work a prefix holds.
 fn all_new(p: uint8*, n: int64) -> bool {
   for i: int64 in run_prefix(p, n, 0)..n {
     if (p[i] != 0xC0) { return false; }
@@ -910,7 +975,9 @@ fn count_prefixes(r: MercRun*, s: Seek*, lo: int64, hi: int64) {
     if (w[i] >= 0) { continue; }
     merc_zip_reset(z);
     w[i] = 0;
-    if (merc_zip_descend(z, run_view(r->first.data + rec[2 * i], rec[2 * i + 1]))) { w[i] = count_below(z); }
+    if (merc_zip_descend(z, run_view(r->first.data + rec[2 * i], rec[2 * i + 1]))) {
+      w[i] = count_below(z);
+    }
   }
 }
 
@@ -929,9 +996,8 @@ fn count_all(r: MercRun*, n: int64) {
   r->phase = 0;
 }
 
-// how many keys sit below each prefix, counted on the cores. a prefix with
-// too many is cut at the next place its keys part ways, so the parts come
-// out about the same size however the keys bunch up.
+// a prefix with too many keys is cut where its keys part ways, so the parts
+// come out about even
 fn balance_prefixes(r: MercRun*, s: Seek*, n0: int64) -> int64 {
   var n: int64 = n0;
   merc_buf_clear(&r->weights);
@@ -943,10 +1009,14 @@ fn balance_prefixes(r: MercRun*, s: Seek*, n0: int64) -> int64 {
   for i2: int64 in 0..n { total = total + ((int64*)r->weights.data)[i2]; }
   var limit: int64 = total / 256 + 1;
   var z: MercZip* = s->zips;
+
   for round in 0..6 {
     var heavy: bool = false;
     for i3: int64 in 0..n {
-      if (((int64*)r->weights.data)[i3] > limit) { heavy = true; break; }
+      if (((int64*)r->weights.data)[i3] > limit) {
+        heavy = true;
+        break;
+      }
     }
     if (!heavy) { break; }
     merc_buf_clear(&r->extra);
@@ -961,7 +1031,8 @@ fn balance_prefixes(r: MercRun*, s: Seek*, n0: int64) -> int64 {
       var split: bool = false;
       if (w > limit) {
         merc_zip_reset(z);
-        split = merc_zip_descend(z, run_view(pb, pn)) && !merc_zip_get(z, (uint64*)0) && merc_zip_children(z) > 1;
+        split = merc_zip_descend(z, run_view(pb, pn)) &&
+          !merc_zip_get(z, (uint64*)0) && merc_zip_children(z) > 1;
       }
       if (!split) {
         var ne: int64[2];
@@ -1004,6 +1075,7 @@ fn balance_prefixes(r: MercRun*, s: Seek*, n0: int64) -> int64 {
     if (!grew) { break; }
     count_all(r, n);
   }
+
   merc_zip_reset(z);
   var want: int64 = 64;
   merc_buf_clear(&r->part_lo);
@@ -1011,6 +1083,7 @@ fn balance_prefixes(r: MercRun*, s: Seek*, n0: int64) -> int64 {
   merc_buf_add(&r->part_lo, (uint8*)&zero, 8);
   var parts: int64 = 1;
   var acc: int64 = 0;
+
   for i5: int64 in 0..n {
     acc = acc + ((int64*)r->weights.data)[i5];
     if (i5 + 1 < n && parts < want && acc * want >= total * parts) {
@@ -1019,6 +1092,7 @@ fn balance_prefixes(r: MercRun*, s: Seek*, n0: int64) -> int64 {
       parts = parts + 1;
     }
   }
+
   merc_buf_add(&r->part_lo, (uint8*)&n, 8);
   return parts;
 }
@@ -1047,6 +1121,7 @@ fn run_match(r: Seek*, pl: Plan*, list: MercRun*, lo: int64, hi: int64) {
     if (!probe[0]) { run_ask(r, 0, run_view(pats, pl->pat_end[0])); }
   }
   var going: bool = true;
+
   while (going) {
     var whole: bool = k == 0;
     var quick: bool = k == 0;
@@ -1191,6 +1266,7 @@ fn run_match(r: Seek*, pl: Plan*, list: MercRun*, lo: int64, hi: int64) {
 }
 
 fn gather_first(r: MercRun*, s: Seek*, pl: Plan*) -> int64 {
+
   merc_buf_clear(&r->first);
   merc_buf_clear(&r->first_at);
   var pats: uint8* = s->pats;
@@ -1201,6 +1277,7 @@ fn gather_first(r: MercRun*, s: Seek*, pl: Plan*) -> int64 {
   var n: int64 = 0;
   var one: int32[64];
   var end: int32[64];
+
   while (true) {
     var exact: bool = false;
     if (probe) {
@@ -1224,6 +1301,7 @@ fn gather_first(r: MercRun*, s: Seek*, pl: Plan*) -> int64 {
     }
     n = n + 1;
   }
+
   return n;
 }
 
@@ -1233,7 +1311,11 @@ fn range_of(r: MercRun*, k: uint8*, n: int64) -> int64 {
   var cut: int64* = (int64*)r->cut_at.data;
   while (lo < hi) {
     var mid: int64 = (lo + hi) / 2;
-    if (bcmp(r->cut_bytes.data + cut[2 * mid], cut[2 * mid + 1], k, n) <= 0) { lo = mid + 1; } else { hi = mid; }
+    if (bcmp(r->cut_bytes.data + cut[2 * mid], cut[2 * mid + 1], k, n) <= 0) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
   }
   return lo;
 }
@@ -1295,7 +1377,8 @@ export fn merc_run_part(r: MercRun*, i: int64) -> bool {
     return true;
   }
   if (r->phase == 3) {
-    count_prefixes(r, (Seek*)r->parts[i], ((int64*)r->part_lo.data)[i], ((int64*)r->part_lo.data)[i + 1]);
+    count_prefixes(r, (Seek*)r->parts[i], ((int64*)r->part_lo.data)[i],
+      ((int64*)r->part_lo.data)[i + 1]);
     return true;
   }
   var s: Seek* = (Seek*)r->parts[i];
@@ -1305,7 +1388,7 @@ export fn merc_run_part(r: MercRun*, i: int64) -> bool {
   return true;
 }
 
-// what the parts store goes in as one set, their other writes in part order.
+// stores from all parts go in as one set, other writes in part order
 fn run_search(r: MercRun*, s: Seek*, pl: Plan*) {
   if (r->spread == 0 || pl->k < 1) {
     run_match(s, pl, (MercRun*)0, 0, 0);
@@ -1353,6 +1436,7 @@ fn run_search(r: MercRun*, s: Seek*, pl: Plan*) {
       merc_buf_add(&r->part_lo, (uint8*)&lo, 8);
     }
   }
+
   for i2: int64 in 0..parts {
     var ps: Seek* = (Seek*)r->parts[i2];
     ps->rule = s->rule;
@@ -1368,12 +1452,14 @@ fn run_search(r: MercRun*, s: Seek*, pl: Plan*) {
     ps->matches = 0;
     ps->unifies = 0;
   }
+
   r->plan = (rawptr)pl;
   r->used = parts;
   r->phase = 0;
   if (!r->spread(r, parts)) {
     for i3: int64 in 0..parts { merc_run_part(r, i3); }
   }
+
   for i4: int64 in 0..parts {
     var ps2: Seek* = (Seek*)r->parts[i4];
     merc_buf_add(&s->made, ps2->made.data, ps2->made.len);
@@ -1400,9 +1486,11 @@ fn bcmp(a: uint8*, an: int64, b: uint8*, bn: int64) -> int32 {
 }
 
 fn sort_entries(base: uint8*, ent: int64*, tmp: int64*, count: int64) {
+
   var width: int64 = 1;
   var src: int64* = ent;
   var dst: int64* = tmp;
+
   while (width < count) {
     var lo: int64 = 0;
     while (lo < count) {
@@ -1436,6 +1524,7 @@ fn sort_entries(base: uint8*, ent: int64*, tmp: int64*, count: int64) {
     dst = sw;
     width = width * 2;
   }
+
   if (src != ent) { memcpy(ent, src, count * 16); }
 }
 
@@ -1443,6 +1532,7 @@ fn subst(t: uint8*, tn: int64, idx: int32, base: int32, sub: uint8*, sn: int64, 
   var var_count: int32 = 0;
   var m: int32 = 0;
   var i: int64 = 0;
+
   while (i < tn) {
     var tag: uint8 = t[i];
     i = i + 1;
@@ -1515,14 +1605,20 @@ fn put_number(out: MercBuf*, v: uint64) {
   var d: uint8[24];
   var k: int32 = 0;
   var u: uint64 = v;
-  if (u == (uint64)0) { d[0] = 48; k = 1; }
+  if (u == (uint64)0) {
+    d[0] = 48;
+    k = 1;
+  }
   while (u > (uint64)0) {
     d[k] = (uint8)(48 + (int32)(u % (uint64)10));
     u = u / (uint64)10;
     k = k + 1;
   }
   merc_buf_push(out, (uint8)(0xC0 + k));
-  while (k > 0) { k = k - 1; merc_buf_push(out, d[k]); }
+  while (k > 0) {
+    k = k - 1;
+    merc_buf_push(out, d[k]);
+  }
 }
 
 fn sum_term(p: uint8*, n: int64, v: uint32*) -> bool {
@@ -1538,7 +1634,9 @@ fn sum_term(p: uint8*, n: int64, v: uint32*) -> bool {
   return true;
 }
 
-fn fold_group(r: MercRun*, kind: uint8, base: uint8*, ent: int64*, lo: int64, hi: int64, tn: int64, root: uint8*, root_n: int64) -> bool {
+fn fold_group(r: MercRun*, kind: uint8, base: uint8*, ent: int64*, lo: int64,
+
+  hi: int64, tn: int64, root: uint8*, root_n: int64) -> bool {
   var t: uint8* = base + ent[2 * lo];
   if (kind == K_COUNT) {
     var cnt: MercBuf* = &r->extra;
@@ -1563,18 +1661,23 @@ fn fold_group(r: MercRun*, kind: uint8, base: uint8*, ent: int64*, lo: int64, hi
     }
     return true;
   }
-  // sum and and: one total for each distinct number V, then one for a V that refers back.
+  // one total per distinct V, then one for a V that refers back
   var i2: int64 = lo;
   var least2: uint8 = 255;
   var any_new2: bool = false;
+
   for i3: int64 in lo..hi {
     var f: uint8 = base[ent[2 * i3] + tn];
     if (f < least2) { least2 = f; }
     if (f == 0xC0) { any_new2 = true; }
   }
+
   while (i2 < hi) {
     var rp2: uint8* = base + ent[2 * i2] + tn;
-    if (rp2[0] <= 0xC0) { i2 = i2 + 1; continue; }
+    if (rp2[0] <= 0xC0) {
+      i2 = i2 + 1;
+      continue;
+    }
     var vn: int64 = 1 + (int64)(rp2[0] & 63);
     var j: int64 = i2;
     var total: uint32 = 0;
@@ -1594,8 +1697,13 @@ fn fold_group(r: MercRun*, kind: uint8, base: uint8*, ent: int64*, lo: int64, hi
     }
     var want: MercBuf* = &r->extra;
     merc_buf_clear(want);
-    if (kind == K_SUM) { put_number(want, (uint64)total); } else { merc_buf_push(want, 0xC1); merc_buf_push(want, mask); }
-    // this one MORK writes below its write root, so the root's bytes come first.
+    if (kind == K_SUM) {
+      put_number(want, (uint64)total);
+    } else {
+      merc_buf_push(want, 0xC1);
+      merc_buf_push(want, mask);
+    }
+    // as in MORK this goes below the write root, so the root bytes come first
     if (want->len == vn && memcmp(want->data, rp2, vn) == 0) {
       merc_buf_clear(&r->spare);
       merc_buf_add(&r->spare, root, root_n);
@@ -1604,6 +1712,7 @@ fn fold_group(r: MercRun*, kind: uint8, base: uint8*, ent: int64*, lo: int64, hi
     }
     i2 = j;
   }
+
   if (any_new2 && !put(r, t, tn)) { return false; }
   if (least2 >= 0x80 && least2 < 0xC0) {
     var total2: uint32 = 0;
@@ -1624,7 +1733,12 @@ fn fold_group(r: MercRun*, kind: uint8, base: uint8*, ent: int64*, lo: int64, hi
     }
     var w2: MercBuf* = &r->extra;
     merc_buf_clear(w2);
-    if (kind == K_SUM) { put_number(w2, (uint64)total2); } else { merc_buf_push(w2, 0xC1); merc_buf_push(w2, mask2); }
+    if (kind == K_SUM) {
+      put_number(w2, (uint64)total2);
+    } else {
+      merc_buf_push(w2, 0xC1);
+      merc_buf_push(w2, mask2);
+    }
     merc_buf_clear(&r->spare);
     subst(t, tn, (int32)(least2 & 63), 0, w2->data, w2->len, &r->spare);
     if (!put(r, r->spare.data, r->spare.len)) { return false; }
@@ -1658,19 +1772,26 @@ fn float_start(kind: uint8) -> float64 {
   return 0.0;
 }
 
-fn float_group(r: MercRun*, kind: uint8, base: uint8*, ent: int64*, lo: int64, hi: int64, tn: int64, root: uint8*, root_n: int64) -> bool {
+fn float_group(r: MercRun*, kind: uint8, base: uint8*, ent: int64*, lo: int64,
+  hi: int64, tn: int64, root: uint8*, root_n: int64) -> bool {
   var t: uint8* = base + ent[2 * lo];
   var least: uint8 = 255;
   var any_new: bool = false;
+
   for i: int64 in lo..hi {
     var f: uint8 = base[ent[2 * i] + tn];
     if (f < least) { least = f; }
     if (f == 0xC0) { any_new = true; }
   }
+
   var i2: int64 = lo;
+
   while (i2 < hi) {
     var rp: uint8* = base + ent[2 * i2] + tn;
-    if (rp[0] <= 0xC0) { i2 = i2 + 1; continue; }
+    if (rp[0] <= 0xC0) {
+      i2 = i2 + 1;
+      continue;
+    }
     var vn: int64 = 1 + (int64)(rp[0] & 63);
     var j: int64 = i2;
     var total: float64 = float_start(kind);
@@ -1690,6 +1811,7 @@ fn float_group(r: MercRun*, kind: uint8, base: uint8*, ent: int64*, lo: int64, h
     }
     i2 = j;
   }
+
   if (any_new && !put(r, t, tn)) { return false; }
   if (least >= 0x80 && least < 0xC0) {
     var total2: float64 = float_start(kind);
@@ -1738,6 +1860,7 @@ fn pure_group(r: MercRun*, base: uint8*, ent: int64*, lo: int64, hi: int64, tn: 
 }
 
 fn finish_sink(r: MercRun*, pl: Plan*, j: int64) -> bool {
+
   var sk: Seek* = (Seek*)r->main;
   var kind: uint8 = pl->kind[j];
   var count: int64 = sk->cuts.len / 8;
@@ -1757,6 +1880,7 @@ fn finish_sink(r: MercRun*, pl: Plan*, j: int64) -> bool {
   }
   merc_buf_clear(&r->order);
   var at2: int64 = 0;
+
   for i2: int64 in 0..count {
     if ((int64)sk->ops.data[i2] == j) {
       var off: int64 = at2 + skip;
@@ -1766,6 +1890,7 @@ fn finish_sink(r: MercRun*, pl: Plan*, j: int64) -> bool {
     }
     at2 = at2 + sizes[i2];
   }
+
   var n: int64 = r->order.len / 16;
   if (n == 0) { return true; }
   merc_buf_clear(&r->spare);
@@ -1773,12 +1898,17 @@ fn finish_sink(r: MercRun*, pl: Plan*, j: int64) -> bool {
   sort_entries(base, (int64*)r->order.data, (int64*)r->spare.data, n);
   var ent: int64* = (int64*)r->order.data;
   var w: int64 = 0;
+
   for i3: int64 in 0..n {
-    if (w > 0 && bcmp(base + ent[2 * (w - 1)], ent[2 * (w - 1) + 1], base + ent[2 * i3], ent[2 * i3 + 1]) == 0) { continue; }
+    if (w > 0 && bcmp(base + ent[2 * (w - 1)], ent[2 * (w - 1) + 1],
+      base + ent[2 * i3], ent[2 * i3 + 1]) == 0) {
+      continue;
+    }
     ent[2 * w] = ent[2 * i3];
     ent[2 * w + 1] = ent[2 * i3 + 1];
     w = w + 1;
   }
+
   n = w;
   if (kind == K_HEAD || kind == K_TAIL) {
     var max: int64 = 0;
@@ -1787,7 +1917,11 @@ fn finish_sink(r: MercRun*, pl: Plan*, j: int64) -> bool {
     var from: int64 = 0;
     var to: int64 = n;
     if (n > max) {
-      if (kind == K_HEAD) { to = max; } else { from = n - max; }
+      if (kind == K_HEAD) {
+        to = max;
+      } else {
+        from = n - max;
+      }
     }
     for i4: int64 in from..to {
       if (!put(r, base + ent[2 * i4], ent[2 * i4 + 1])) { return false; }
@@ -1795,31 +1929,36 @@ fn finish_sink(r: MercRun*, pl: Plan*, j: int64) -> bool {
     return true;
   }
   var lo: int64 = 0;
+
   while (lo < n) {
     var tn: int64 = merc_span(base + ent[2 * lo], ent[2 * lo + 1]);
     var hi: int64 = lo + 1;
-    while (hi < n && ent[2 * hi + 1] > tn && memcmp(base + ent[2 * hi], base + ent[2 * lo], tn) == 0 && merc_span(base + ent[2 * hi], ent[2 * hi + 1]) == tn) {
+    while (hi < n && ent[2 * hi + 1] > tn &&
+      memcmp(base + ent[2 * hi], base + ent[2 * lo], tn) == 0 &&
+      merc_span(base + ent[2 * hi], ent[2 * hi + 1]) == tn) {
       hi = hi + 1;
     }
     var ok: bool = true;
     if (kind == K_PURE) { ok = pure_group(r, base, ent, lo, hi, tn); }
     else if (kind >= K_FSUM) {
       var fj: int64 = pl->root[j];
-      ok = float_group(r, kind, base, ent, lo, hi, tn, r->rule.data + pl->req_at[fj], pl->req_n[fj]);
+      ok = float_group(r, kind, base, ent, lo, hi, tn,
+        r->rule.data + pl->req_at[fj], pl->req_n[fj]);
     }
     else {
       var rj: int64 = pl->root[j];
-      ok = fold_group(r, kind, base, ent, lo, hi, tn, r->rule.data + pl->req_at[rj], pl->req_n[rj]);
+      ok = fold_group(r, kind, base, ent, lo, hi, tn,
+        r->rule.data + pl->req_at[rj], pl->req_n[rj]);
     }
     if (!ok) { return false; }
     lo = hi;
   }
+
   return true;
 }
 
-// what the parts store. a big batch is cut into ranges of keys by a sample,
-// each range is built into its own small trie on any core, and the ranges
-// are merged into the store in key order, mostly whole branches at a time.
+// a big batch is cut into key ranges, each built into a small trie on its own
+// core, then merged into the store in key order
 fn store_parts(r: MercRun*) -> bool {
   var total: int64 = 0;
   for p: int64 in 0..r->used { total = total + ((Seek*)r->parts[p])->nadds; }
@@ -1829,7 +1968,10 @@ fn store_parts(r: MercRun*) -> bool {
       var s: Seek* = (Seek*)r->parts[p2];
       var at: int64* = (int64*)s->adda.data;
       for e: int64 in 0..s->nadds {
-        if (merc_put(r->trie, run_view(s->addb.data + at[2 * e], at[2 * e + 1]), 1) == MERC_FAILED) { return false; }
+        if (merc_put(r->trie, run_view(s->addb.data + at[2 * e],
+          at[2 * e + 1]), 1) == MERC_FAILED) {
+          return false;
+        }
       }
     }
     return true;
@@ -1841,6 +1983,7 @@ fn store_parts(r: MercRun*) -> bool {
   var want: int64 = RUN_RANGES * 32;
   merc_buf_clear(&r->cut_bytes);
   merc_buf_clear(&r->order);
+
   for p3: int64 in 0..r->used {
     var s3: Seek* = (Seek*)r->parts[p3];
     var take: int64 = s3->nadds * want / total + 1;
@@ -1855,16 +1998,19 @@ fn store_parts(r: MercRun*) -> bool {
       merc_buf_add(&r->order, (uint8*)&se[0], 16);
     }
   }
+
   var got: int64 = r->order.len / 16;
   merc_buf_clear(&r->spare);
   merc_buf_room(&r->spare, got * 16);
   sort_entries(r->cut_bytes.data, (int64*)r->order.data, (int64*)r->spare.data, got);
   merc_buf_clear(&r->cut_at);
   var ent: int64* = (int64*)r->order.data;
+
   for c: int64 in 1..RUN_RANGES {
     var pick: int64 = c * got / RUN_RANGES;
     merc_buf_add(&r->cut_at, (uint8*)&ent[2 * pick], 16);
   }
+
   r->ranges = RUN_RANGES;
   r->phase = 1;
   if (!r->spread(r, r->used)) {
@@ -1875,22 +2021,28 @@ fn store_parts(r: MercRun*) -> bool {
     for w: int64 in 0..RUN_RANGES { merc_run_part(r, w); }
   }
   r->phase = 0;
+
   for w2: int64 in 0..RUN_RANGES {
     if (!merc_merge_in(r->trie, r->range_trie + w2)) { return false; }
   }
+
   return true;
 }
 
-// runs the first rule in the trie. 1 when a rule ran, 0 when none is left,
-// -1 when memory ran out.
+// 1 a rule ran, 0 none left, -1 out of memory
 export fn merc_run_step(r: MercRun*) -> int32 {
   var t: MercTrie* = r->trie;
   var z: MercZip = merc_zip(t);
   var head: uint8[6] = [4, 0xC4, 101, 120, 101, 99];
   var there: bool = true;
+
   for i in 0..6 {
-    if (!merc_zip_step(&z, head[i])) { there = false; break; }
+    if (!merc_zip_step(&z, head[i])) {
+      there = false;
+      break;
+    }
   }
+
   if (!there || !merc_zip_next_value(&z, 6)) {
     merc_zip_free(&z);
     return 0;
@@ -1921,12 +2073,12 @@ export fn merc_run_step(r: MercRun*) -> int32 {
   if (kind == 2) { r->skipped = r->skipped + 1; }
   if (kind != 1) { return 1; }
 
-  // what + and a plain shape store goes in while the matching runs in MORK,
-  // and the other sinks finish after it, in the order they are written.
+  // as in MORK, + and plain shapes store during the match, other sinks after
   if (r->used > 0 && !store_parts(r)) { return -1; }
   var count: int64 = w->cuts.len / 8;
   var sizes: int64* = (int64*)w->cuts.data;
   var at: int64 = 0;
+
   for i2: int64 in 0..count {
     var j: int64 = (int64)w->ops.data[i2];
     if (pl.kind[j] == K_ADD) {
@@ -1934,9 +2086,11 @@ export fn merc_run_step(r: MercRun*) -> int32 {
     }
     at = at + sizes[i2];
   }
+
   for j2: int64 in 0..pl.m {
     if (pl.kind[j2] != K_ADD && !finish_sink(r, &pl, j2)) { return -1; }
   }
+
   return 1;
 }
 
@@ -1950,8 +2104,8 @@ export fn merc_run(r: MercRun*, limit: int64) -> int64 {
   return ran;
 }
 
-// mork run --steps N. MORK checks the count after it runs a rule, so it runs
-// one more than N when that many are there. gives the count MORK prints.
+// matches mork run --steps N, which runs one rule past N when there are that
+// many, and gives the count MORK prints
 export fn merc_run_steps(r: MercRun*, steps: int64) -> int64 {
   var ran: int64 = 0;
   while (true) {

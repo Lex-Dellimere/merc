@@ -20,16 +20,16 @@ the program is `build/linux/release/merc`. it builds and runs on linux.
 ./build/linux/release/merc
 ```
 
-opens the window. type `help` in the line at the bottom, or press tab on an empty line.
+that opens the window. type `help` in the line at the bottom, or press tab on an empty line.
 
 ```
 ./build/linux/release/merc run program.mm2
 ```
 
-runs a program of rules like `mork run` and prints what is left.
+that runs a program of rules like `mork run` and prints what is left.
 
 ```
 ./build/linux/release/merc shell
 ```
 
-is the same command line in a terminal.
+that gives you the same command line in a terminal.

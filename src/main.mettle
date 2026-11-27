@@ -1,6 +1,5 @@
-// merc. with nothing after it, it opens the window.
-// merc run FILE runs a program of rules and prints what is left, like mork run.
-// merc shell is the command line in a terminal.
+// merc opens the window. merc run FILE runs rules and prints what is left,
+// like mork run. merc shell is the command line in a terminal.
 
 import "std/io";
 import "std/mem";
@@ -110,8 +109,6 @@ fn emit(p: uint8*, n: int64) {
   print(s);
 }
 
-// merc run IN [--aux-path FILE]... [--steps N] [--cores N] [OUT]. loads, runs the
-// rules and prints what is left, or writes it to OUT one expression a line.
 fn run_program(argc: int32, argv: cstring*) -> int32 {
   var steps: int64 = 1000000000000000;
   var cores: int64 = 8;
@@ -151,6 +148,7 @@ fn run_program(argc: int32, argv: cstring*) -> int32 {
     loaded = true;
     i = i + 1;
   }
+
   if (!loaded) {
     println("merc run IN [--aux-path FILE] [--steps N] [--cores N] [OUT]");
     return 1;
@@ -165,10 +163,14 @@ fn run_program(argc: int32, argv: cstring*) -> int32 {
   var line: MercBuf;
   merc_buf_text(&line, "executing {ran} steps took ");
   add_time(&line, time_mono_ns() - t0);
-  merc_buf_text(&line, " ({r.matches} matches, {r.unifies} unifications, {r.writes} writes)");
+  merc_buf_text(&line,
+      " ({r.matches} matches, {r.unifies} unifications, {r.writes} writes)");
   println(merc_buf_view(&line));
   merc_buf_free(&line);
-  if (r.skipped > 0) { println("{r.skipped} rules use a source or sink merc does not have yet and were dropped"); }
+  if (r.skipped > 0) {
+    println(
+        "{r.skipped} rules use a source or sink merc does not have yet and were dropped");
+  }
   println("dumping {merc_count(t)} expressions");
   var fd: int64 = -1;
   if (out_path.length > 0) {
@@ -182,6 +184,7 @@ fn run_program(argc: int32, argv: cstring*) -> int32 {
   } else {
     println("result:");
   }
+
   g_out_fd = fd;
   g_out_at = 0;
   merc_wide_print(t, &emit);
@@ -193,7 +196,7 @@ fn run_program(argc: int32, argv: cstring*) -> int32 {
 
 var g_argv: cstring[256];
 
-// --no-gpu anywhere keeps every search on the trie. it is taken out before
+// a no gpu flag keeps every search on the trie and is taken out of argv.
 fn main(argc_in: int32, argv_in: cstring*) -> int32 {
   var argc: int32 = 0;
   var gpu: bool = true;
@@ -205,10 +208,13 @@ fn main(argc_in: int32, argv_in: cstring*) -> int32 {
       argc = argc + 1;
     }
   }
+
   g_argv[argc] = (cstring)0;
   var argv: cstring* = &g_argv[0];
   merc_shell_init(&g_shell);
-  if (argc > 1 && is_word(arg(argv, 1), "run")) { return run_program(argc, argv); }
+  if (argc > 1 && is_word(arg(argv, 1), "run")) {
+    return run_program(argc, argv);
+  }
   if (gpu) { merc_scan_start(); }
   if (argc < 2 || !is_word(arg(argv, 1), "shell")) {
     var spare: MercRun;
@@ -218,6 +224,7 @@ fn main(argc_in: int32, argv_in: cstring*) -> int32 {
     merc_scan_stop();
     return shown;
   }
+
   merc_wide_start(&g_shell.rules, 8);
   var worst: int32 = 0;
   for i in 2..argc {
@@ -232,6 +239,7 @@ fn main(argc_in: int32, argv_in: cstring*) -> int32 {
     merc_buf_free(&name);
     flush();
   }
+
   var prompt: bool = is_terminal();
   var line: MercBuf;
   var chunk: uint8[4096];
@@ -249,10 +257,14 @@ fn main(argc_in: int32, argv_in: cstring*) -> int32 {
       if (r2 > worst) { worst = r2; }
       merc_buf_clear(&line);
       flush();
-      if (g_shell.quit) { done = true; break; }
+      if (g_shell.quit) {
+        done = true;
+        break;
+      }
       if (prompt) { print("> "); }
     }
   }
+
   if (!g_shell.quit && line.len > 0) {
     var r3: int32 = merc_shell_run(&g_shell, merc_buf_view(&line));
     if (r3 > worst) { worst = r3; }

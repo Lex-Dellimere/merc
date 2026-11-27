@@ -1,8 +1,5 @@
-// the flat scan through alph. a search is one job for each million rows,
-// done on the gpu when there is one, where the rows stay between searches,
-// or on a core. alph starts on the first search that wants it and stays
-// for the rest of the process, so the gpu keeps one context. only
-// main.mettle imports this, the rest of merc never needs alph or a gpu.
+// the flat scan through alph, one job per million rows on the gpu or a core.
+// only main.mettle imports this, the rest of merc never needs alph or a gpu.
 
 import "std/mem";
 import "std/time";
@@ -32,11 +29,13 @@ var g_dev_gen: int64 = -1;
 var g_dev_search: int64 = -1;
 var g_job_ns: int64 = 0;
 
-kernel(block = 256) merc_scan_k(rows: int32*, pat: int32*, plen: int32, k: int32, outs: uint32*, total: int32) {
+kernel(block = 256) merc_scan_k(rows: int32*, pat: int32*, plen: int32,
+    k: int32, outs: uint32*, total: int32) {
   var i: int32 = block.x * block_dim.x + thread.x;
   var ok: bool = false;
   if (i < total) {
-    ok = merc_flat_row_ok(rows + (int64)(i >> 6) * (int64)k * 64, i & 63, 64, k, pat, plen);
+    ok = merc_flat_row_ok(rows + (int64)(i >> 6) * (int64)k * 64, i & 63, 64,
+        k, pat, plen);
   }
   var m: uint32 = subgroup_ballot(ok, 0);
   if ((thread.x & 31) == 0 && i < total) {
@@ -71,6 +70,7 @@ fn on_gpu(job: AlphJob*) -> Word {
     }
     merc_flat_set_gpu(g_gpu);
   }
+
   if (g_gpu != 1) { return 1; }
   var f: MercFlat* = g_f;
   if (g_dev_gen != f->gen) {
@@ -78,20 +78,30 @@ fn on_gpu(job: AlphJob*) -> Word {
     var size: int64 = f->blocks * 64 * (int64)f->k * 4;
     g_dev_rows = gpu_malloc(size);
     g_dev_gen = -1;
-    if (g_dev_rows == 0 || gpu_to_device(g_dev_rows, (uint8*)f->rows, size) != 0) { return 1; }
+    if (g_dev_rows == 0 ||
+        gpu_to_device(g_dev_rows, (uint8*)f->rows, size) != 0) {
+      return 1;
+    }
     g_dev_gen = f->gen;
     g_dev_search = -1;
   }
+
   if (g_dev_search != g_search) {
-    if (gpu_to_device(g_dev_pat, (uint8*)&f->pat[0], (int64)f->plen * 4) != 0) { return 1; }
+    if (gpu_to_device(g_dev_pat, (uint8*)&f->pat[0], (int64)f->plen * 4) != 0) {
+      return 1;
+    }
     g_dev_search = g_search;
   }
   var t0: int64 = time_mono_ns();
   var first: int64 = 0;
   var n: int64 = chunk_of(job, &first);
   var total: int32 = (int32)(n * 64);
-  dispatch merc_scan_k[work: total](g_dev_rows + first * (int64)f->k * 256, g_dev_pat, f->plen, f->k, g_dev_out, total);
-  if (gpu_sync() != 0 || gpu_to_host((uint8*)(g_masks + (first - g_first)), g_dev_out, n * 8) != 0) { return 1; }
+  dispatch merc_scan_k[work: total](g_dev_rows + first * (int64)f->k * 256,
+      g_dev_pat, f->plen, f->k, g_dev_out, total);
+  if (gpu_sync() != 0 ||
+      gpu_to_host((uint8*)(g_masks + (first - g_first)), g_dev_out, n * 8) != 0) {
+    return 1;
+  }
   g_job_ns = g_job_ns + time_mono_ns() - t0;
   return 0;
 }
@@ -103,9 +113,14 @@ fn fill(b: AlphBatch*, job: AlphJob*, piece: Word) {
 }
 
 fn took(b: AlphBatch*, job: AlphJob*, piece: Word) {
-  if (job->way == ALPH_GPU) { g_on_gpu = g_on_gpu + 1; } else { g_on_cores = g_on_cores + 1; }
+  if (job->way == ALPH_GPU) {
+    g_on_gpu = g_on_gpu + 1;
+  } else {
+    g_on_cores = g_on_cores + 1;
+  }
 }
 
+// alph starts on the first search and stays up, so the gpu keeps one context.
 fn scan(f: MercFlat*, first: int64, count: int64, masks: uint64*) -> int32 {
   if (g_state == 0) {
     g_state = 2;
